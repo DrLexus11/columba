@@ -8,6 +8,7 @@ import network.columba.app.rns.api.RnsCore
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
@@ -83,7 +84,13 @@ class AutoAnnounceManager
                         identityRepository.activeIdentity,
                     ) { enabled, intervalHours, activeIdentity ->
                         Triple(enabled, intervalHours, activeIdentity?.displayName)
-                    }.collect { (enabled, intervalHours, displayName) ->
+                    // collectLatest, not collect: startAnnounceLoop never
+                    // returns, so a plain collect took the first settings value
+                    // and never saw another. Disabling auto-announce, changing
+                    // the interval, or renaming the identity had no effect until
+                    // the app restarted -- and the settings screen showed the new
+                    // value as though it had taken.
+                    }.collectLatest { (enabled, intervalHours, displayName) ->
                         Log.d(TAG, "Settings changed: enabled=$enabled, interval=${intervalHours}h")
 
                         if (enabled) {

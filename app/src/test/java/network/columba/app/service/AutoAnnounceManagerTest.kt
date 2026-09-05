@@ -6,6 +6,8 @@ import network.columba.app.data.repository.IdentityRepository
 import network.columba.app.repository.SettingsRepository
 import network.columba.app.rns.api.RnsCore
 import io.mockk.clearAllMocks
+import io.mockk.coEvery
+import io.mockk.coVerify
 import io.mockk.every
 import io.mockk.mockk
 import kotlinx.coroutines.Dispatchers
@@ -346,5 +348,54 @@ class AutoAnnounceManagerTest {
             }
 
             manager.stop()
+        }
+
+    // ========== Settings reactivity ==========
+
+    /**
+     * The announce loop never returns, so observing settings with a plain
+     * collect takes the first value and never sees another: disabling
+     * auto-announce, or changing the interval, does nothing until the app is
+     * restarted -- while the settings screen shows the new value as though it
+     * had taken. Nothing else in this suite would notice, because every other
+     * test only ever supplies one settings value.
+     */
+    @Test
+    fun disablingAfterStart_isObserved() =
+        runTest(testDispatcher) {
+            val enabledFlow = MutableStateFlow(true)
+            every { mockSettingsRepository.autoAnnounceEnabledFlow } returns enabledFlow
+            every { mockSettingsRepository.autoAnnounceIntervalHoursFlow } returns flowOf(3)
+            every { mockSettingsRepository.networkChangeAnnounceTimeFlow } returns flowOf(null)
+            every { mockIdentityRepository.activeIdentity } returns flowOf(null)
+            coEvery { mockRnsCore.triggerAutoAnnounce(any()) } returns Result.success(Unit)
+            coEvery { mockSettingsRepository.saveLastAutoAnnounceTime(any()) } returns Unit
+            coEvery { mockSettingsRepository.saveNextAutoAnnounceTime(any()) } returns Unit
+
+            val reactive =
+                AutoAnnounceManager(
+                    mockSettingsRepository,
+                    mockIdentityRepository,
+                    mockRnsCore,
+                    testScope,
+                )
+            reactive.start()
+            // runCurrent, not advanceUntilIdle: the announce loop delays
+            // forever, so "advance until there is nothing left to run" never
+            // returns -- it just keeps moving virtual time. runCurrent executes
+            // what is ready and leaves the loop parked in its delay.
+            testDispatcher.scheduler.runCurrent()
+
+            // The loop is running and has announced at least once.
+            coVerify(atLeast = 1) { mockRnsCore.triggerAutoAnnounce(any()) }
+
+            enabledFlow.value = false
+            testDispatcher.scheduler.runCurrent()
+
+            // Reaching the disabled branch is the whole point: it only runs if
+            // the running loop was cancelled when the setting changed.
+            coVerify { mockSettingsRepository.saveNextAutoAnnounceTime(null) }
+
+            reactive.stop()
         }
 }
