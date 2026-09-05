@@ -61,6 +61,7 @@ import network.columba.app.util.GITHUB_NEW_ISSUE_URL
 import network.columba.app.util.safeOpenUrl
 import network.columba.app.ui.screens.settings.cards.AdvancedCard
 import network.columba.app.ui.screens.settings.cards.AutoAnnounceCard
+import network.columba.app.ui.screens.settings.cards.TimeAuthorityCard
 import network.columba.app.ui.screens.settings.cards.BatteryOptimizationCard
 import network.columba.app.ui.screens.settings.cards.DataMigrationCard
 import network.columba.app.ui.screens.settings.cards.IdentityCard
@@ -364,6 +365,24 @@ fun SettingsScreen(
                     onToggle = { viewModel.toggleAutoAnnounce(it) },
                     onIntervalChange = { viewModel.setAnnounceInterval(it) },
                     onManualAnnounce = { viewModel.triggerManualAnnounce() },
+                )
+
+                TimeAuthorityCard(
+                    isExpanded = state.cardExpansionStates[SettingsCardId.TIME_AUTHORITY.name] ?: false,
+                    onExpandedChange = { viewModel.toggleCardExpanded(SettingsCardId.TIME_AUTHORITY, it) },
+                    enabled = state.timeAuthorityEnabled,
+                    intervalMinutes = state.timeAuthorityIntervalMinutes,
+                    lastAssertionTime = state.lastTimeAssertionTime,
+                    identityHash = state.identityHash,
+                    onToggle = { viewModel.setTimeAuthorityEnabled(it) },
+                    onIntervalChange = { viewModel.setTimeAuthorityInterval(it) },
+                    onAssertNow = { viewModel.assertTimeNow() },
+                    onCopyIdentityHash = { hash ->
+                        // Not marked sensitive: this is the public half, and it
+                        // has to be pasted onto a node to be of any use.
+                        val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                        clipboard.setPrimaryClip(ClipData.newPlainText("Time authority identity", hash))
+                    },
                 )
 
                 LocationSharingCard(

@@ -91,6 +91,9 @@ class SettingsViewModelTest {
     private val shareInstanceHostingEnabledFlow = MutableStateFlow(false)
     private val rpcKeyFlow = MutableStateFlow<String?>(null)
     private val autoAnnounceEnabledFlow = MutableStateFlow(true)
+    private val timeAuthorityEnabledFlow = MutableStateFlow(false)
+    private val timeAuthorityIntervalMinutesFlow = MutableStateFlow(30)
+    private val lastTimeAssertionTimeFlow = MutableStateFlow<Long?>(null)
     private val autoAnnounceIntervalHoursFlow = MutableStateFlow(3)
     private val lastAutoAnnounceTimeFlow = MutableStateFlow<Long?>(null)
     private val nextAutoAnnounceTimeFlow = MutableStateFlow<Long?>(null)
@@ -175,6 +178,9 @@ class SettingsViewModelTest {
         coEvery { settingsRepository.saveShareInstanceHostingEnabled(any()) } returns Unit
         every { settingsRepository.rpcKeyFlow } returns rpcKeyFlow
         every { settingsRepository.autoAnnounceEnabledFlow } returns autoAnnounceEnabledFlow
+        every { settingsRepository.timeAuthorityEnabledFlow } returns timeAuthorityEnabledFlow
+        every { settingsRepository.timeAuthorityIntervalMinutesFlow } returns timeAuthorityIntervalMinutesFlow
+        every { settingsRepository.lastTimeAssertionTimeFlow } returns lastTimeAssertionTimeFlow
         every { settingsRepository.autoAnnounceIntervalHoursFlow } returns autoAnnounceIntervalHoursFlow
         every { settingsRepository.lastAutoAnnounceTimeFlow } returns lastAutoAnnounceTimeFlow
         every { settingsRepository.nextAutoAnnounceTimeFlow } returns nextAutoAnnounceTimeFlow
@@ -306,6 +312,7 @@ class SettingsViewModelTest {
             interfaceRepository = interfaceRepository,
             mapTileSourceManager = mapTileSourceManager,
             telemetryCollectorManager = telemetryCollectorManager,
+            timeAuthorityManager = mockk(relaxed = true),
             contactRepository = contactRepository,
             updateChecker = updateChecker,
             crashReportManager = crashReportManager,
@@ -1664,6 +1671,7 @@ class SettingsViewModelTest {
                     interfaceRepository = interfaceRepository,
                     mapTileSourceManager = mapTileSourceManager,
                     telemetryCollectorManager = telemetryCollectorManager,
+            timeAuthorityManager = mockk(relaxed = true),
                     contactRepository = contactRepository,
                     updateChecker = updateChecker,
                     crashReportManager = crashReportManager,
@@ -1717,6 +1725,7 @@ class SettingsViewModelTest {
                     interfaceRepository = interfaceRepository,
                     mapTileSourceManager = mapTileSourceManager,
                     telemetryCollectorManager = telemetryCollectorManager,
+            timeAuthorityManager = mockk(relaxed = true),
                     contactRepository = contactRepository,
                     updateChecker = updateChecker,
                     crashReportManager = crashReportManager,
@@ -2380,6 +2389,7 @@ class SettingsViewModelTest {
                     interfaceRepository = interfaceRepository,
                     mapTileSourceManager = mapTileSourceManager,
                     telemetryCollectorManager = telemetryCollectorManager,
+            timeAuthorityManager = mockk(relaxed = true),
                     contactRepository = contactRepository,
                     updateChecker = updateChecker,
                     crashReportManager = crashReportManager,
@@ -2549,6 +2559,7 @@ class SettingsViewModelTest {
                     interfaceRepository = interfaceRepository,
                     mapTileSourceManager = mapTileSourceManager,
                     telemetryCollectorManager = telemetryCollectorManager,
+            timeAuthorityManager = mockk(relaxed = true),
                     contactRepository = contactRepository,
                     updateChecker = updateChecker,
                     crashReportManager = crashReportManager,

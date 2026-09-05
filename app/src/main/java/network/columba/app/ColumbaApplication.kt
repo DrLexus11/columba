@@ -86,6 +86,9 @@ class ColumbaApplication : Application() {
     lateinit var autoAnnounceManager: network.columba.app.service.AutoAnnounceManager
 
     @Inject
+    lateinit var timeAuthorityManager: network.columba.app.service.TimeAuthorityManager
+
+    @Inject
     lateinit var identityRepository: IdentityRepository
 
     @Inject
@@ -396,6 +399,7 @@ class ColumbaApplication : Application() {
                         // Identity matches - reconnect collectors and managers
                         messageCollector.startCollecting()
                         autoAnnounceManager.start()
+                        timeAuthorityManager.start()
                         identityResolutionManager.start(applicationScope)
                         propagationNodeManager.start()
                         telemetryCollectorManager.start()
@@ -574,6 +578,7 @@ class ColumbaApplication : Application() {
                         // Start the message collector service after Reticulum is ready
                         messageCollector.startCollecting()
                         autoAnnounceManager.start()
+                        timeAuthorityManager.start()
                         identityResolutionManager.start(applicationScope)
                         propagationNodeManager.start()
                         telemetryCollectorManager.start()
@@ -602,6 +607,7 @@ class ColumbaApplication : Application() {
 
         // Stop auto-announce manager, message collection, and identity resolution
         autoAnnounceManager.stop()
+        timeAuthorityManager.stop()
         messageCollector.stopCollecting()
         identityResolutionManager.stop()
         interfaceTransportObserver.stop()

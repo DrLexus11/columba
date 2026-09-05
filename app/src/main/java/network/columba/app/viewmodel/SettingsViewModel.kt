@@ -59,6 +59,7 @@ enum class SettingsCardId {
     NOTIFICATIONS,
     VOICE_CALL_PERMISSIONS,
     AUTO_ANNOUNCE,
+    TIME_AUTHORITY,
     LOCATION_SHARING,
     MAP_SOURCES,
     MESSAGE_DELIVERY,
@@ -87,6 +88,9 @@ data class SettingsState(
     val isLoading: Boolean = true,
     val showSaveSuccess: Boolean = false,
     val autoAnnounceEnabled: Boolean = true,
+    val timeAuthorityEnabled: Boolean = false,
+    val timeAuthorityIntervalMinutes: Int = 30,
+    val lastTimeAssertionTime: Long? = null,
     val autoAnnounceIntervalHours: Int = 3,
     val lastAutoAnnounceTime: Long? = null,
     val nextAutoAnnounceTime: Long? = null,
@@ -229,6 +233,7 @@ class SettingsViewModel
         private val interfaceRepository: InterfaceRepository,
         private val mapTileSourceManager: MapTileSourceManager,
         private val telemetryCollectorManager: TelemetryCollectorManager,
+        private val timeAuthorityManager: network.columba.app.service.TimeAuthorityManager,
         private val contactRepository: ContactRepository,
         private val updateChecker: network.columba.app.service.UpdateChecker,
         private val crashReportManager: network.columba.app.util.CrashReportManager,
@@ -290,6 +295,7 @@ class SettingsViewModel
             // Load protocol versions for About screen
             fetchProtocolVersions()
             loadTelemetryCollectorSettings()
+            observeTimeAuthoritySettings()
             // Load contacts for allowed requesters picker
             loadContacts()
             // Load update checker settings and maybe check on startup
@@ -904,6 +910,61 @@ class SettingsViewModel
             viewModelScope.launch {
                 settingsRepository.saveAutoAnnounceEnabled(enabled)
                 Log.d(TAG, "Auto-announce ${if (enabled) "enabled" else "disabled"}")
+            }
+        }
+
+        /**
+         * Observe the time-authority settings.
+         *
+         * Deliberately its own collector rather than another arm of the large
+         * combine above: that one already destructures a positional array, and
+         * adding to it shifts every index after the insertion point.
+         */
+        private fun observeTimeAuthoritySettings() {
+            viewModelScope.launch {
+                combine(
+                    settingsRepository.timeAuthorityEnabledFlow,
+                    settingsRepository.timeAuthorityIntervalMinutesFlow,
+                    settingsRepository.lastTimeAssertionTimeFlow,
+                ) { enabled, intervalMinutes, lastAssertion ->
+                    Triple(enabled, intervalMinutes, lastAssertion)
+                }.collect { (enabled, intervalMinutes, lastAssertion) ->
+                    _state.value =
+                        _state.value.copy(
+                            timeAuthorityEnabled = enabled,
+                            timeAuthorityIntervalMinutes = intervalMinutes,
+                            lastTimeAssertionTime = lastAssertion,
+                        )
+                }
+            }
+        }
+
+        /** Turn this device into a time authority for the mesh, or stop being one. */
+        fun setTimeAuthorityEnabled(enabled: Boolean) {
+            viewModelScope.launch {
+                settingsRepository.saveTimeAuthorityEnabled(enabled)
+                Log.d(TAG, "Time authority ${if (enabled) "enabled" else "disabled"}")
+            }
+        }
+
+        /** Change how often this device asserts the time. */
+        fun setTimeAuthorityInterval(minutes: Int) {
+            viewModelScope.launch {
+                settingsRepository.saveTimeAuthorityIntervalMinutes(minutes)
+            }
+        }
+
+        /**
+         * Assert the time immediately.
+         *
+         * The reason this exists as a button: arriving somewhere and wanting
+         * every node in range to have the time now is the actual use case, and
+         * waiting out the interval defeats it.
+         */
+        fun assertTimeNow() {
+            viewModelScope.launch {
+                val asserted = timeAuthorityManager.assertNow()
+                Log.d(TAG, "Manual time assertion ${if (asserted) "sent" else "failed"}")
             }
         }
 
