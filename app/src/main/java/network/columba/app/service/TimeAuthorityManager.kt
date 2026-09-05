@@ -13,6 +13,7 @@ import org.msgpack.core.MessagePack
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.launch
 import java.nio.ByteBuffer
@@ -158,7 +159,13 @@ class TimeAuthorityManager
                         settingsRepository.timeAuthorityEnabledFlow,
                         settingsRepository.timeAuthorityIntervalMinutesFlow,
                     ) { enabled, intervalMinutes -> enabled to intervalMinutes }
-                        .collect { (enabled, intervalMinutes) ->
+                        // collectLatest, not collect: runAuthorityLoop never
+                        // returns, so a plain collect would consume the first
+                        // settings value and then never see another. Switching
+                        // the feature off, or changing the interval, would have
+                        // had no effect until the app was restarted -- while the
+                        // card showed the new value as if it had taken.
+                        .collectLatest { (enabled, intervalMinutes) ->
                             if (enabled) {
                                 Log.d(TAG, "Time authority enabled, asserting every ${intervalMinutes}min")
                                 runAuthorityLoop(intervalMinutes)
