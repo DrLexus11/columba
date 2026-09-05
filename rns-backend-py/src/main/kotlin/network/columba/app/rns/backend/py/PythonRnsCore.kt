@@ -230,6 +230,13 @@ class PythonRnsCore(
             runtime.localIdentity?.callAttr("get_private_key")?.toJava(ByteArray::class.java)
         }
 
+    override suspend fun signWithIdentity(data: ByteArray): ByteArray? =
+        pyCall {
+            runtime.localIdentity
+                ?.callAttr("sign", data.toPyBytes())
+                ?.toJava(ByteArray::class.java)
+        }
+
     // ==================== Destination management ====================
 
     // Spread is required: RNS.Destination(identity, dir, type, app_name, *aspects)

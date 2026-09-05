@@ -69,6 +69,10 @@ oneway interface IRnsCore {
     // Returns nullable byte[] via IRnsByteArrayCallback.onSuccess(@nullable byte[]).
     void getFullIdentityKey(in IRnsByteArrayCallback cb);
 
+    // Returns the 64-byte Ed25519 signature, or null when no private key is
+    // loaded. Nullable byte[] via IRnsByteArrayCallback.onSuccess.
+    void signWithIdentity(in byte[] data, in IRnsByteArrayCallback cb);
+
     // ==================== Destination management ====================
 
     void createDestination(

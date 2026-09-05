@@ -84,6 +84,17 @@ interface RnsCore {
      */
     suspend fun getFullIdentityKey(): ByteArray?
 
+    /**
+     * Sign [data] with this node's identity, returning a 64-byte Ed25519
+     * signature, or null when no identity with a private key is loaded.
+     *
+     * The identity is the one that owns this node's destinations, so anything
+     * signed here can be verified by a peer that knows the announced identity
+     * -- which is what lets a payload carried in announce app data be trusted
+     * on its own, independently of the announce that happened to carry it.
+     */
+    suspend fun signWithIdentity(data: ByteArray): ByteArray?
+
     // ==================== Destination management ====================
 
     suspend fun createDestination(

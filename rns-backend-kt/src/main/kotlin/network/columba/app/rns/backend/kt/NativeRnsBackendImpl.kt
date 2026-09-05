@@ -1137,6 +1137,13 @@ class NativeRnsBackendImpl(
             null
         }
 
+    override suspend fun signWithIdentity(data: ByteArray): ByteArray? =
+        try {
+            deliveryIdentity?.takeIf { it.hasPrivateKey }?.sign(data)
+        } catch (_: Exception) {
+            null
+        }
+
     override suspend fun getLxmfIdentity(): Result<ColumbaIdentity> =
         runCatching {
             val identity = deliveryIdentity ?: error("Delivery identity not initialized")

@@ -142,6 +142,9 @@ internal class ClientRnsCore(
     override suspend fun getFullIdentityKey(): ByteArray? =
         awaitNullableByteArray { cb -> remote.getFullIdentityKey(cb) }
 
+    override suspend fun signWithIdentity(data: ByteArray): ByteArray? =
+        awaitNullableByteArray { cb -> remote.signWithIdentity(data, cb) }
+
     override suspend fun createDestination(
         identity: Identity,
         direction: Direction,
