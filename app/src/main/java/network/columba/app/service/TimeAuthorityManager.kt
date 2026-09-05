@@ -247,8 +247,8 @@ class TimeAuthorityManager
                         Log.w(TAG, "No LXMF identity yet; not asserting time")
                         false
                     }
-                    // No identity, or a backend that cannot sign. Say nothing
-                    // rather than announce an assertion nobody can verify.
+                    // A backend that cannot sign. Say nothing rather than
+                    // announce an assertion nobody can verify.
                     signature == null || signature.size != SIGNATURE_LENGTH -> {
                         Log.w(TAG, "No signature available; not asserting time")
                         false
