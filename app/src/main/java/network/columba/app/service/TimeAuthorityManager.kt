@@ -5,8 +5,10 @@ import network.columba.app.di.ApplicationScope
 import network.columba.app.repository.SettingsRepository
 import network.columba.app.rns.api.RnsCore
 import network.columba.app.rns.api.RnsLxmf
-import network.columba.app.rns.api.model.Direction
+import network.columba.app.rns.api.model.Destination
 import network.columba.app.rns.api.model.DestinationType
+import network.columba.app.rns.api.model.Direction
+import network.columba.app.rns.api.model.Identity
 import org.msgpack.core.MessagePack
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
@@ -139,6 +141,14 @@ class TimeAuthorityManager
 
         private var authorityJob: Job? = null
 
+        // Created once and kept. Reticulum refuses to register a destination it
+        // already holds -- Python RNS raises KeyError, "Attempt to register an
+        // already registered destination" -- so building it per assertion means
+        // the first one is announced and every one after it fails. Measured on
+        // a Galaxy A54: assertion 1 sent, assertion 2 onwards `not_sent`.
+        private var cachedDestination: Destination? = null
+        private var cachedForIdentityHash: String? = null
+
         /** Start observing settings and asserting time while enabled. */
         fun start() {
             Log.d(TAG, "Starting TimeAuthorityManager")
@@ -164,6 +174,30 @@ class TimeAuthorityManager
             Log.d(TAG, "Stopping TimeAuthorityManager")
             authorityJob?.cancel()
             authorityJob = null
+        }
+
+        /**
+         * The destination this authority announces under, created once.
+         *
+         * Rebuilt only if the active identity changes, which happens when the
+         * user switches identities -- the destination is derived from the
+         * identity, so a stale one would announce under the wrong key.
+         */
+        private suspend fun timeDestinationFor(identity: Identity): Destination? {
+            val identityHash = identity.hash.joinToString("") { "%02x".format(it) }
+            cachedDestination?.let { existing ->
+                if (cachedForIdentityHash == identityHash) return existing
+            }
+            val created =
+                rnsCore
+                    .createDestination(identity, Direction.IN, DestinationType.SINGLE, APP_NAME, ASPECTS)
+                    .getOrElse { error ->
+                        Log.e(TAG, "Could not create the time destination", error)
+                        return null
+                    }
+            cachedDestination = created
+            cachedForIdentityHash = identityHash
+            return created
         }
 
         /**
@@ -214,12 +248,7 @@ class TimeAuthorityManager
                         return false
                     }
                 val destination =
-                    rnsCore
-                        .createDestination(identity, Direction.IN, DestinationType.SINGLE, APP_NAME, ASPECTS)
-                        .getOrElse { error ->
-                            Log.e(TAG, "Could not create the time destination", error)
-                            return false
-                        }
+                    timeDestinationFor(identity) ?: return false
 
                 val appData =
                     assertionAppData(
