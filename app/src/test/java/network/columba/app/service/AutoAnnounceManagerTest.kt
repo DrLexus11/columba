@@ -370,7 +370,8 @@ class AutoAnnounceManagerTest {
             every { mockIdentityRepository.activeIdentity } returns flowOf(null)
             coEvery { mockRnsCore.triggerAutoAnnounce(any()) } returns Result.success(Unit)
             coEvery { mockSettingsRepository.saveLastAutoAnnounceTime(any()) } returns Unit
-            coEvery { mockSettingsRepository.saveNextAutoAnnounceTime(any()) } returns Unit
+            val scheduledTimes = mutableListOf<Long?>()
+            coEvery { mockSettingsRepository.saveNextAutoAnnounceTime(captureNullable(scheduledTimes)) } returns Unit
 
             val reactive =
                 AutoAnnounceManager(
@@ -389,12 +390,22 @@ class AutoAnnounceManagerTest {
             // The loop is running and has announced at least once.
             coVerify(atLeast = 1) { mockRnsCore.triggerAutoAnnounce(any()) }
 
+            // While running, the loop publishes a real next-announce time.
+            assertTrue(
+                "expected a scheduled next announce, got $scheduledTimes",
+                scheduledTimes.any { it != null },
+            )
+
             enabledFlow.value = false
             testDispatcher.scheduler.runCurrent()
 
-            // Reaching the disabled branch is the whole point: it only runs if
-            // the running loop was cancelled when the setting changed.
-            coVerify { mockSettingsRepository.saveNextAutoAnnounceTime(null) }
+            // Reaching the disabled branch is the whole point: it clears the
+            // scheduled time, and it only runs if the loop was cancelled when
+            // the setting changed. Against a plain collect this stays absent.
+            assertTrue(
+                "disabled branch never ran; scheduled times were $scheduledTimes",
+                scheduledTimes.contains(null),
+            )
 
             reactive.stop()
         }

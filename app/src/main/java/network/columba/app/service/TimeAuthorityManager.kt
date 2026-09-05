@@ -226,58 +226,62 @@ class TimeAuthorityManager
             }
         }
 
-        private suspend fun emitAssertion(): Boolean {
+        private suspend fun emitAssertion(): Boolean =
             try {
                 val unixMillis = System.currentTimeMillis()
-                val signed =
-                    signedBytes(
-                        unixMillis = unixMillis,
-                        validForSeconds = VALID_FOR_SECONDS,
-                        stratum = STRATUM,
-                        source = SOURCE_NTP,
-                    )
+                // The identity the backend signs with: signWithIdentity uses the
+                // delivery identity, so the announce and the assertion inside it
+                // are made by one key. A receiver that trusts the announced
+                // identity is trusting exactly what signed the bytes.
+                val identity = rnsLxmf.getLxmfIdentity().getOrNull()
+                val signature =
+                    identity?.let {
+                        rnsCore.signWithIdentity(
+                            signedBytes(unixMillis, VALID_FOR_SECONDS, STRATUM, SOURCE_NTP),
+                        )
+                    }
+                val destination = identity?.let { timeDestinationFor(it) }
 
-                val signature = rnsCore.signWithIdentity(signed)
-                if (signature == null || signature.size != SIGNATURE_LENGTH) {
+                when {
+                    identity == null -> {
+                        Log.w(TAG, "No LXMF identity yet; not asserting time")
+                        false
+                    }
                     // No identity, or a backend that cannot sign. Say nothing
                     // rather than announce an assertion nobody can verify.
-                    Log.w(TAG, "No signature available; not asserting time")
-                    return false
-                }
-
-                // The same identity the backend signed with: signWithIdentity
-                // uses the delivery identity, so the announce and the assertion
-                // inside it are made by one key. A receiver that trusts the
-                // announced identity is trusting exactly what signed the bytes.
-                val identity =
-                    rnsLxmf.getLxmfIdentity().getOrElse { error ->
-                        Log.w(TAG, "No LXMF identity yet; not asserting time", error)
-                        return false
+                    signature == null || signature.size != SIGNATURE_LENGTH -> {
+                        Log.w(TAG, "No signature available; not asserting time")
+                        false
                     }
-                val destination =
-                    timeDestinationFor(identity) ?: return false
-
-                val appData =
-                    assertionAppData(
-                        unixMillis = unixMillis,
-                        validForSeconds = VALID_FOR_SECONDS,
-                        stratum = STRATUM,
-                        source = SOURCE_NTP,
-                        signature = signature,
-                    )
-
-                val result = rnsCore.announceDestination(destination, appData)
-                return if (result.isSuccess) {
-                    Log.d(TAG, "Asserted UTC $unixMillis at stratum $STRATUM")
-                    settingsRepository.saveLastTimeAssertionTime(unixMillis)
-                    true
-                } else {
-                    Log.e(TAG, "Announce failed: ${result.exceptionOrNull()?.message}")
-                    false
+                    // timeDestinationFor has already said why.
+                    destination == null -> false
+                    else -> announceAssertion(destination, unixMillis, signature)
                 }
             } catch (e: Exception) {
                 Log.e(TAG, "Error while asserting time", e)
+                false
+            }
+
+        private suspend fun announceAssertion(
+            destination: Destination,
+            unixMillis: Long,
+            signature: ByteArray,
+        ): Boolean {
+            val appData =
+                assertionAppData(
+                    unixMillis = unixMillis,
+                    validForSeconds = VALID_FOR_SECONDS,
+                    stratum = STRATUM,
+                    source = SOURCE_NTP,
+                    signature = signature,
+                )
+            val result = rnsCore.announceDestination(destination, appData)
+            if (result.isFailure) {
+                Log.e(TAG, "Announce failed: ${result.exceptionOrNull()?.message}")
                 return false
             }
+            Log.d(TAG, "Asserted UTC $unixMillis at stratum $STRATUM")
+            settingsRepository.saveLastTimeAssertionTime(unixMillis)
+            return true
         }
     }

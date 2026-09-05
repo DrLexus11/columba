@@ -274,7 +274,7 @@ class SettingsViewModelIncomingMessageLimitTest {
             interfaceRepository = interfaceRepository,
             mapTileSourceManager = mapTileSourceManager,
             telemetryCollectorManager = telemetryCollectorManager,
-            timeAuthorityManager = mockk(relaxed = true),
+            timeAuthorityManager = mockk(),
             contactRepository = contactRepository,
             updateChecker = updateChecker,
             crashReportManager = crashReportManager,
