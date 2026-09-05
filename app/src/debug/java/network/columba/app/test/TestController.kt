@@ -55,6 +55,7 @@ object TestController {
         fun rnsTelemetry(): RnsTelemetry
         fun interfaceRepository(): InterfaceRepository
         fun interfaceConfigManager(): InterfaceConfigManager
+        fun timeAuthorityManager(): network.columba.app.service.TimeAuthorityManager
     }
 
     // Surface uncaught throws inside any scope.launch as a parseable
@@ -80,6 +81,7 @@ object TestController {
     private var rnsTelemetry: RnsTelemetry? = null
     private var interfaceRepo: InterfaceRepository? = null
     private var interfaceConfigManager: InterfaceConfigManager? = null
+    private var timeAuthorityManager: network.columba.app.service.TimeAuthorityManager? = null
     private val rxQueue = mutableListOf<ReceivedMessage>()
     private val rxLock = Any()
     private val deliveryStates = mutableMapOf<String, String>() // msgHashHex -> stateName
@@ -101,6 +103,7 @@ object TestController {
         rnsTelemetry = ep.rnsTelemetry()
         interfaceRepo = ep.interfaceRepository()
         interfaceConfigManager = ep.interfaceConfigManager()
+        timeAuthorityManager = ep.timeAuthorityManager()
         receiveJob = scope.launch {
             rnsLxmf!!.observeMessages().collect { msg ->
                 synchronized(rxLock) { rxQueue.add(msg) }
@@ -555,6 +558,27 @@ object TestController {
      * announces"); on success the reply is `announced dest=<hex>`, on
      * failure it's `announce_err dest=<hex> reason=<msg>` (or
      * `announce_err reason=no_active_destination` before LXMF is up). */
+    /**
+     * Emit one signed time assertion, without going near the settings UI.
+     *
+     * The assertion is verified by an ESP32 across a LoRa hop, so what needs
+     * exercising is the whole path -- sign, pack, announce, relay, adopt -- and
+     * a UI toggle is the one part of it that a harness cannot drive. This makes
+     * the interesting half testable on its own.
+     */
+    fun handleAssertTime(context: Context) {
+        ensureInit(context)
+        scope.launch {
+            val identity = rnsLxmf!!.getLxmfIdentity().getOrNull()
+            val asserted = timeAuthorityManager!!.assertNow()
+            if (asserted) {
+                Log.i(LOGCAT_TAG, "time_asserted identity=${identity?.hash?.toHex() ?: "unknown"}")
+            } else {
+                Log.i(LOGCAT_TAG, "time_assert_err reason=not_sent")
+            }
+        }
+    }
+
     fun handleAnnounce(context: Context) {
         ensureInit(context)
         scope.launch {

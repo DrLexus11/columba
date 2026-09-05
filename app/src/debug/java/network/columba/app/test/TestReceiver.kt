@@ -38,6 +38,7 @@ import network.columba.app.rns.api.model.DeliveryMethod
  * single tokens.
  *   network.columba.test.RX_CLEAR                     -> rx_cleared
  *   network.columba.test.ANNOUNCE                     -> announced dest=<hex> | announce_err …
+ *   network.columba.test.ASSERT_TIME                  -> time_asserted identity=<hex> | time_assert_err …
  *   network.columba.test.LIST_INTERFACES              -> N×interface lines + interface_list_done count=N
  *   network.columba.test.DISABLE_ALL_INTERFACES       -> interfaces_disabled count=N applied=true
  *   network.columba.test.DISABLE_INTERFACE  --es name -> interface_disabled name=<…> id=<n> applied=true
@@ -210,6 +211,9 @@ class TestReceiver : BroadcastReceiver() {
 
             "network.columba.test.ANNOUNCE" ->
                 TestController.handleAnnounce(app)
+
+            "network.columba.test.ASSERT_TIME" ->
+                TestController.handleAssertTime(app)
 
             "network.columba.test.LIST_INTERFACES" ->
                 TestController.handleListInterfaces(app)
