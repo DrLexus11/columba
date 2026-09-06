@@ -39,6 +39,8 @@ import network.columba.app.rns.api.model.DeliveryMethod
  *   network.columba.test.RX_CLEAR                     -> rx_cleared
  *   network.columba.test.ANNOUNCE                     -> announced dest=<hex> | announce_err …
  *   network.columba.test.ASSERT_TIME                  -> time_asserted identity=<hex> | time_assert_err …
+ *   network.columba.test.SET_POS_GATEWAY    --es hex  -> pos_gateway_set hex=<…> enabled=true | pos_gateway_err …
+ *   network.columba.test.REPORT_POSITION              -> pos_reported | pos_report_err reason=not_sent
  *   network.columba.test.LIST_INTERFACES              -> N×interface lines + interface_list_done count=N
  *   network.columba.test.DISABLE_ALL_INTERFACES       -> interfaces_disabled count=N applied=true
  *   network.columba.test.DISABLE_INTERFACE  --es name -> interface_disabled name=<…> id=<n> applied=true
@@ -214,6 +216,18 @@ class TestReceiver : BroadcastReceiver() {
 
             "network.columba.test.ASSERT_TIME" ->
                 TestController.handleAssertTime(app)
+
+            "network.columba.test.SET_POS_GATEWAY" -> {
+                val hex = intent.getStringExtra("hex") ?: ""
+                if (hex.isEmpty()) {
+                    Log.i(TestController.LOGCAT_TAG, "pos_gateway_err reason=missing_hex")
+                } else {
+                    TestController.handleSetPosGateway(app, hex)
+                }
+            }
+
+            "network.columba.test.REPORT_POSITION" ->
+                TestController.handleReportPosition(app)
 
             "network.columba.test.LIST_INTERFACES" ->
                 TestController.handleListInterfaces(app)

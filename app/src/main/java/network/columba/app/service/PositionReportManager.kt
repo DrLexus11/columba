@@ -4,6 +4,10 @@ import android.content.Context
 import android.location.Location
 import android.os.CancellationSignal
 import android.util.Log
+import com.google.android.gms.location.FusedLocationProviderClient
+import com.google.android.gms.location.LocationServices
+import com.google.android.gms.location.Priority
+import com.google.android.gms.tasks.CancellationTokenSource
 import dagger.hilt.android.qualifiers.ApplicationContext
 import network.columba.app.di.ApplicationScope
 import network.columba.app.repository.SettingsRepository
@@ -79,6 +83,17 @@ class PositionReportManager
              */
             internal const val MAX_FIX_AGE_MS = 120_000L
         }
+
+        // The same choice LocationSharingManager makes, and for the same reason.
+        // LocationCompat exists for devices *without* Play Services -- custom
+        // ROMs and F-Droid builds -- and using it as the primary path on a phone
+        // that has GMS asks the wrong provider: a raw LocationManager one-shot
+        // on GPS returns null indoors while the fused provider has a current fix
+        // the whole time. Measured on the A54, where every request failed and
+        // `dumpsys location` showed gps, network and fused all populated.
+        private val useGms = network.columba.app.util.LocationCompat.isPlayServicesAvailable(context)
+        private val fusedLocationClient: FusedLocationProviderClient? =
+            if (useGms) LocationServices.getFusedLocationProviderClient(context) else null
 
         private var reportJob: Job? = null
 
@@ -308,7 +323,59 @@ class PositionReportManager
          * coroutine is cancelled -- otherwise a settings change during a fix
          * would leave the provider holding a callback into a dead scope.
          */
+        /**
+         * The best fix available, by whichever route this device actually has.
+         *
+         * Ordered most-current first, and every one of them is allowed to fail:
+         * freshLocation() applies the age check afterwards, so a fallback never
+         * smuggles in a stale position, it only avoids reporting nothing when
+         * the device plainly knows where it is.
+         */
         private suspend fun currentLocation(): Location? =
+            fusedCurrentLocation()
+                ?: fusedLastLocation()
+                ?: requestCurrentLocation()
+                ?: lastKnownLocation()
+
+        private suspend fun fusedCurrentLocation(): Location? {
+            val client = fusedLocationClient ?: return null
+            return suspendCancellableCoroutine { continuation ->
+                val tokens = CancellationTokenSource()
+                continuation.invokeOnCancellation { tokens.cancel() }
+                try {
+                    client
+                        .getCurrentLocation(Priority.PRIORITY_HIGH_ACCURACY, tokens.token)
+                        .addOnSuccessListener { location ->
+                            if (continuation.isActive) continuation.resume(location)
+                        }.addOnFailureListener { error ->
+                            Log.d(TAG, "Fused current location failed", error)
+                            if (continuation.isActive) continuation.resume(null)
+                        }
+                } catch (e: SecurityException) {
+                    Log.w(TAG, "Location permission revoked mid-request", e)
+                    if (continuation.isActive) continuation.resume(null)
+                }
+            }
+        }
+
+        private suspend fun fusedLastLocation(): Location? {
+            val client = fusedLocationClient ?: return null
+            return suspendCancellableCoroutine { continuation ->
+                try {
+                    client.lastLocation
+                        .addOnSuccessListener { location ->
+                            if (continuation.isActive) continuation.resume(location)
+                        }.addOnFailureListener {
+                            if (continuation.isActive) continuation.resume(null)
+                        }
+                } catch (e: SecurityException) {
+                    Log.w(TAG, "Location permission revoked before last fused read", e)
+                    if (continuation.isActive) continuation.resume(null)
+                }
+            }
+        }
+
+        private suspend fun requestCurrentLocation(): Location? =
             suspendCancellableCoroutine { continuation ->
                 val signal = CancellationSignal()
                 continuation.invokeOnCancellation { signal.cancel() }
@@ -324,5 +391,32 @@ class PositionReportManager
                     Log.w(TAG, "Location permission revoked mid-request", e)
                     if (continuation.isActive) continuation.resume(null)
                 }
+            }
+
+        /**
+         * What the system already has, when a fresh request produced nothing.
+         *
+         * On API 30 and above LocationCompat hands back whatever
+         * LocationManager.getCurrentLocation() returned, null included, and a
+         * one-shot GPS request from cold indoors is exactly the case that
+         * returns null -- while the same device has a fix from seconds ago
+         * because something else is holding continuous updates. Measured on the
+         * A54: six locations delivered to this app in the half-minute during
+         * which every one-shot request failed.
+         *
+         * Asking for the last known fix is not a lowering of standards. The age
+         * check in freshLocation() is what decides whether a position may be
+         * reported as current, and it applies to this exactly as it applies to
+         * a fresh one; a fix from four seconds ago is a fix, whatever produced
+         * it.
+         */
+        private fun lastKnownLocation(): Location? =
+            try {
+                network.columba.app.util.LocationCompat
+                    .getLastKnownLocation(context)
+                    ?.also { Log.d(TAG, "Using last known fix; no current one available") }
+            } catch (e: SecurityException) {
+                Log.w(TAG, "Location permission revoked before last-known read", e)
+                null
             }
     }

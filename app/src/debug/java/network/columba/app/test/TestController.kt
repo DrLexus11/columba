@@ -56,6 +56,10 @@ object TestController {
         fun interfaceRepository(): InterfaceRepository
         fun interfaceConfigManager(): InterfaceConfigManager
         fun timeAuthorityManager(): network.columba.app.service.TimeAuthorityManager
+
+        fun positionReportManager(): network.columba.app.service.PositionReportManager
+
+        fun settingsRepository(): network.columba.app.repository.SettingsRepository
     }
 
     // Surface uncaught throws inside any scope.launch as a parseable
@@ -82,6 +86,8 @@ object TestController {
     private var interfaceRepo: InterfaceRepository? = null
     private var interfaceConfigManager: InterfaceConfigManager? = null
     private var timeAuthorityManager: network.columba.app.service.TimeAuthorityManager? = null
+    private var positionReportManager: network.columba.app.service.PositionReportManager? = null
+    private var settingsRepository: network.columba.app.repository.SettingsRepository? = null
     private val rxQueue = mutableListOf<ReceivedMessage>()
     private val rxLock = Any()
     private val deliveryStates = mutableMapOf<String, String>() // msgHashHex -> stateName
@@ -104,6 +110,8 @@ object TestController {
         interfaceRepo = ep.interfaceRepository()
         interfaceConfigManager = ep.interfaceConfigManager()
         timeAuthorityManager = ep.timeAuthorityManager()
+        positionReportManager = ep.positionReportManager()
+        settingsRepository = ep.settingsRepository()
         receiveJob = scope.launch {
             rnsLxmf!!.observeMessages().collect { msg ->
                 synchronized(rxLock) { rxQueue.add(msg) }
@@ -575,6 +583,37 @@ object TestController {
                 Log.i(LOGCAT_TAG, "time_asserted identity=${identity?.hash?.toHex() ?: "unknown"}")
             } else {
                 Log.i(LOGCAT_TAG, "time_assert_err reason=not_sent")
+            }
+        }
+    }
+
+    /**
+     * Point position reporting at a gateway and switch it on, so an end-to-end
+     * run does not depend on somebody typing a 32-character hash into a phone
+     * with their thumbs. Same reasoning as ASSERT_TIME above.
+     */
+    fun handleSetPosGateway(
+        context: Context,
+        hex: String,
+    ) {
+        ensureInit(context)
+        scope.launch {
+            settingsRepository!!.savePositionGatewayHash(hex)
+            settingsRepository!!.savePositionReportEnabled(true)
+            Log.i(LOGCAT_TAG, "pos_gateway_set hex=$hex enabled=true")
+        }
+    }
+
+    fun handleReportPosition(context: Context) {
+        ensureInit(context)
+        scope.launch {
+            val sent = positionReportManager!!.reportNow()
+            if (sent) {
+                Log.i(LOGCAT_TAG, "pos_reported")
+            } else {
+                // reportNow() has already logged which of the several reasons
+                // it was: no gateway, no permission, a stale fix, or no path.
+                Log.i(LOGCAT_TAG, "pos_report_err reason=not_sent")
             }
         }
     }
