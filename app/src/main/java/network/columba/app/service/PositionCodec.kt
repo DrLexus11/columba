@@ -23,10 +23,11 @@ import java.nio.ByteOrder
  *     off  size  field
  *     0    1     version
  *     1    1     flags
- *     2    4     lat_e7       int32 BE   degrees x 1e7, positive north
- *     6    4     lon_e7       int32 BE   degrees x 1e7, positive east
- *     10   4     fix_unix_s   uint32 BE  seconds; 0 when the source had no clock
- *     14   1     accuracy_m   uint8      0 unreported, 1..254 m, 255 = over
+ *     2    4     sender_id    uint32 BE  four bytes of the sender's identity hash
+ *     6    4     lat_e7       int32 BE   degrees x 1e7, positive north
+ *     10   4     lon_e7       int32 BE   degrees x 1e7, positive east
+ *     14   4     fix_unix_s   uint32 BE  seconds; 0 when the source had no clock
+ *     18   1     accuracy_m   uint8      0 unreported, 1..254 m, 255 = over
  *     -- then, in flag order, only what is present --
  *     +2         alt_m        int16 BE   metres HAE          FLAG_ALT
  *     +1         course       uint8      2-degree units      FLAG_COURSE
@@ -40,9 +41,9 @@ import java.nio.ByteOrder
  * a LoRa mesh.
  */
 object PositionCodec {
-    const val WIRE_VERSION = 1
-    const val WIRE_BASE_LEN = 15
-    const val WIRE_MAX_LEN = 20
+    const val WIRE_VERSION = 2
+    const val WIRE_BASE_LEN = 19
+    const val WIRE_MAX_LEN = 24
 
     const val FLAG_ALT = 0x01
     const val FLAG_COURSE = 0x02
@@ -65,6 +66,19 @@ object PositionCodec {
     data class Fix(
         val latE7: Int,
         val lonE7: Int,
+        /**
+         * Four bytes of this device's identity hash, so a receiver can tell one
+         * reporter from another.
+         *
+         * It has to be in the payload because nothing else carries it: a
+         * Reticulum packet to a SINGLE destination is anonymous by
+         * construction. Without it every report is a new track and a map fills
+         * with one person's ghosts, which is precisely what the first two live
+         * reports did.
+         *
+         * An identifier, not an authentication. These packets are unsigned.
+         */
+        val senderId: Int = 0,
         val fixUnixSeconds: Long = 0,
         val accuracyM: Int = 0,
         val altKnown: Boolean = false,
@@ -84,10 +98,14 @@ object PositionCodec {
      * deprecated extras bundle or a GnssStatus callback this does not run, and
      * a fabricated count would be worse than an absent one.
      */
-    fun fromLocation(location: Location): Fix =
+    fun fromLocation(
+        location: Location,
+        senderId: Int = 0,
+    ): Fix =
         Fix(
             latE7 = Math.round(location.latitude * 1e7).toInt(),
             lonE7 = Math.round(location.longitude * 1e7).toInt(),
+            senderId = senderId,
             // Location.time is UTC epoch milliseconds from the provider, not
             // from this phone's clock reading of when the callback arrived.
             // Those are different measurements and the firmware treats them
@@ -121,6 +139,7 @@ object PositionCodec {
                 .order(ByteOrder.BIG_ENDIAN)
                 .put(WIRE_VERSION.toByte())
                 .put(flags.toByte())
+                .putInt(fix.senderId)
                 .putInt(fix.latE7)
                 .putInt(fix.lonE7)
                 .putInt(fix.fixUnixSeconds.toInt())
@@ -177,6 +196,7 @@ object PositionCodec {
         val flags = buffer.get().toInt() and 0xFF
         if (version != WIRE_VERSION || data.size < expectedLength(flags)) return null
 
+        val senderId = buffer.int
         val latE7 = buffer.int
         val lonE7 = buffer.int
         // Unsigned on the wire. Read as a signed Int this goes negative in
@@ -195,6 +215,7 @@ object PositionCodec {
         return Fix(
             latE7 = latE7,
             lonE7 = lonE7,
+            senderId = senderId,
             fixUnixSeconds = seconds,
             accuracyM = accuracy,
             altKnown = altKnown,

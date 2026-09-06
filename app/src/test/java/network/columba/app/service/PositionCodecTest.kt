@@ -20,9 +20,9 @@ import org.junit.Test
 class PositionCodecTest {
     @Test
     fun `wire constants match the firmware`() {
-        assertEquals(1, PositionCodec.WIRE_VERSION)
-        assertEquals(15, PositionCodec.WIRE_BASE_LEN)
-        assertEquals(20, PositionCodec.WIRE_MAX_LEN)
+        assertEquals(2, PositionCodec.WIRE_VERSION)
+        assertEquals(19, PositionCodec.WIRE_BASE_LEN)
+        assertEquals(24, PositionCodec.WIRE_MAX_LEN)
         assertEquals(0x01, PositionCodec.FLAG_ALT)
         assertEquals(0x02, PositionCodec.FLAG_COURSE)
         assertEquals(0x04, PositionCodec.FLAG_SPEED)
@@ -49,7 +49,32 @@ class PositionCodecTest {
                 ),
             )
         assertEquals(PositionCodec.WIRE_MAX_LEN, encoded.size)
+        // Still inside the §2 budget with the sender id carried.
         assertTrue(encoded.size <= 25)
+    }
+
+    @Test
+    fun `the sender survives the round trip`() {
+        // Without this every report becomes its own track, because a Reticulum
+        // packet to a SINGLE destination carries no sender at all.
+        val fix = PositionCodec.Fix(latE7 = 1, lonE7 = 1, senderId = 0xDEADBEEF.toInt())
+        val back = PositionCodec.decode(PositionCodec.encode(fix))!!
+        assertEquals(0xDEADBEEF.toInt(), back.senderId)
+    }
+
+    @Test
+    fun `a sender with the high bit set is not corrupted`() {
+        // Four bytes of a hash have the top bit set about half the time.
+        val fix = PositionCodec.Fix(latE7 = 1, lonE7 = 1, senderId = -1)
+        val back = PositionCodec.decode(PositionCodec.encode(fix))!!
+        assertEquals(-1, back.senderId)
+    }
+
+    @Test
+    fun `version one is refused rather than read anonymously`() {
+        val encoded = PositionCodec.encode(PositionCodec.Fix(latE7 = 1, lonE7 = 1, senderId = 1))
+        encoded[0] = 1
+        assertNull(PositionCodec.decode(encoded))
     }
 
     @Test

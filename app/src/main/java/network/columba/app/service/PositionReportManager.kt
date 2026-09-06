@@ -63,6 +63,7 @@ class PositionReportManager
         @ApplicationContext private val context: Context,
         private val settingsRepository: SettingsRepository,
         private val rnsCore: RnsCore,
+        private val rnsLxmf: network.columba.app.rns.api.RnsLxmf,
         @ApplicationScope private val scope: CoroutineScope,
     ) {
         companion object {
@@ -203,7 +204,8 @@ class PositionReportManager
         private suspend fun sendFix(gatewayHash: String): Boolean {
             val location = freshLocation() ?: return false
             val destination = readyDestination(gatewayHash) ?: return false
-            return deliver(destination, PositionCodec.encode(PositionCodec.fromLocation(location)))
+            return deliver(destination,
+                PositionCodec.encode(PositionCodec.fromLocation(location, senderId())))
         }
 
         /**
@@ -271,6 +273,27 @@ class PositionReportManager
                 return null
             }
             return destinationFor(gatewayHash, gatewayBytes)
+        }
+
+        /**
+         * Four bytes of this device's LXMF identity, so the gateway can tell
+         * one reporter from another.
+         *
+         * The LXMF identity rather than any other: it is the one this device is
+         * already known by across the mesh, it is what the time authority signs
+         * with, and it is what an operator provisions onto a node. A second
+         * identifier here would be a second thing to keep in step.
+         *
+         * Zero when there is no identity yet, which the gateway renders as a
+         * track of its own rather than pretending to know who it is.
+         */
+        private suspend fun senderId(): Int {
+            val hash = rnsLxmf.getLxmfIdentity().getOrNull()?.hash ?: return 0
+            if (hash.size < 4) return 0
+            return ((hash[0].toInt() and 0xFF) shl 24) or
+                ((hash[1].toInt() and 0xFF) shl 16) or
+                ((hash[2].toInt() and 0xFF) shl 8) or
+                (hash[3].toInt() and 0xFF)
         }
 
         private suspend fun destinationFor(

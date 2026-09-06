@@ -397,6 +397,38 @@ class ServiceNotificationManager(
      * @param service The service to start in foreground mode
      * @return true if foreground started successfully, false if it failed
      */
+    /**
+     * The service types to claim, which is not simply what the manifest lists.
+     *
+     * `location` is what keeps position reporting alive once the phone is in a
+     * pocket: without it Android denies location to the app the moment it
+     * leaves the foreground, and reports stop with the screen. Measured on an
+     * A54 -- every report succeeded with the app on screen and every one failed
+     * after it dozed.
+     *
+     * It is added only when the permission is actually granted. From Android
+     * 14 a service claiming a type it lacks permission for does not degrade,
+     * it throws, and this service is the whole mesh stack: taking it down for
+     * users who declined location would be a far worse bug than the one being
+     * fixed. So the location capability appears when it can and is absent when
+     * it cannot, and the rest of the service is unaffected either way.
+     */
+    private fun foregroundServiceTypes(service: Service): Int {
+        var types = ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
+        val granted =
+            service.checkSelfPermission(android.Manifest.permission.ACCESS_FINE_LOCATION) ==
+                android.content.pm.PackageManager.PERMISSION_GRANTED ||
+                service.checkSelfPermission(android.Manifest.permission.ACCESS_COARSE_LOCATION) ==
+                android.content.pm.PackageManager.PERMISSION_GRANTED
+        if (granted) {
+            types = types or ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION
+            Log.d(TAG, "Foreground service claiming location; reporting survives the screen")
+        } else {
+            Log.d(TAG, "No location permission; foreground service runs without it")
+        }
+        return types
+    }
+
     fun startForeground(service: Service): Boolean {
         this.service = service
         try {
@@ -406,7 +438,7 @@ class ServiceNotificationManager(
                 service.startForeground(
                     NOTIFICATION_ID,
                     notification,
-                    ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE,
+                    foregroundServiceTypes(service),
                 )
             } else {
                 // Android 9 and below
@@ -443,10 +475,17 @@ class ServiceNotificationManager(
         if (svc != null) {
             try {
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    // The same types as the initial call, not a subset. Every
+                    // startForeground() *replaces* the service's type set, so
+                    // passing CONNECTED_DEVICE here silently dropped the
+                    // location capability that onCreate had just claimed -- and
+                    // this runs on every notification update, so it happened
+                    // within seconds and left no error behind. Observed as
+                    // types=0x10 where 0x18 was expected.
                     svc.startForeground(
                         NOTIFICATION_ID,
                         notification,
-                        ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE,
+                        foregroundServiceTypes(svc),
                     )
                 } else {
                     svc.startForeground(NOTIFICATION_ID, notification)
