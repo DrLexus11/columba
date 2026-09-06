@@ -131,6 +131,10 @@ class PythonEventBridge {
     val packets: SharedFlow<ReceivedPacket> = _packets.asSharedFlow()
     val links: SharedFlow<LinkEvent> = _links.asSharedFlow()
 
+    internal fun publishPacket(destination: network.columba.app.rns.api.model.Destination, data: ByteArray) {
+        _packets.tryEmit(ReceivedPacket(data.copyOf(), destination, null, System.currentTimeMillis(), null, null))
+    }
+
     // --- The five sinks event_bridge.py drives -----------------------------
 
     val onAnnounce = PyEventCallback { payload -> handleAnnounce(payload) }
@@ -158,10 +162,9 @@ class PythonEventBridge {
     val onLxmfRetryingPropagated = PyEventCallback { payload -> handleLxmfRetryingPropagated(payload) }
 
     /**
-     * Packet observation is a low-traffic diagnostic surface; upstream RNS
-     * delivers raw packets per-Destination, so wiring this fully is on-device
-     * integration work. The sink is present so `event_bridge.py`'s
-     * `register_callbacks` signature is satisfied today.
+     * Legacy global diagnostic sink retained for register_callbacks. RNS has
+     * per-destination callbacks: PythonRnsCore attaches those when it creates
+     * an incoming destination and publishes its packets via publishPacket.
      */
     val onPacket = PyEventCallback { payload -> handlePacket(payload) }
 
@@ -502,9 +505,9 @@ class PythonEventBridge {
     }
 
     private fun handlePacket(payload: PyObject) {
-        // See onPacket kdoc — structural placeholder until per-Destination
-        // packet callbacks are wired on-device.
-        Log.v(TAG, "packet event received (not yet wired): ${payload.dictStr("destination_hash")}")
+        // Generic destination traffic uses publishPacket, with the full model
+        // captured at registration; this legacy sink has no destination model.
+        Log.v(TAG, "global packet diagnostic: ${payload.dictStr("destination_hash")}")
     }
 
     private fun handleLinkEvent(payload: PyObject) {

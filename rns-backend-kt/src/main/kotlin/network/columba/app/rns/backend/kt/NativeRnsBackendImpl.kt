@@ -1549,7 +1549,7 @@ class NativeRnsBackendImpl(
     ): Result<ColumbaDestination> =
         withContext(Dispatchers.IO) {
             runCatching {
-                val nativeIdentity = identity.toNative()
+                val nativeIdentity = deliveryIdentity?.takeIf { it.hash.contentEquals(identity.hash) } ?: identity.toNative()
                 val nativeDir =
                     when (direction) {
                         Direction.IN -> DestinationDirection.IN
@@ -1563,8 +1563,20 @@ class NativeRnsBackendImpl(
                         DestinationType.PLAIN -> NativeDestinationType.PLAIN
                         else -> NativeDestinationType.SINGLE
                     }
-                val dest = createNativeDestination(nativeIdentity, nativeDir, nativeType, appName, aspects)
-                dest.toColumba(identity)
+                val hash = NativeDestination.computeHash(appName, aspects, nativeIdentity.hash)
+                val dest = if (direction == Direction.IN) {
+                    Transport.findDestination(hash)
+                        ?: createNativeDestination(nativeIdentity, nativeDir, nativeType, appName, aspects)
+                } else {
+                    createNativeDestination(nativeIdentity, nativeDir, nativeType, appName, aspects)
+                }
+                val model = dest.toColumba(identity)
+                if (direction == Direction.IN) {
+                    dest.packetCallback = { data, _ ->
+                        _packets.tryEmit(ReceivedPacket(data.copyOf(), model, null, System.currentTimeMillis(), null, null))
+                    }
+                }
+                model
             }
         }
 
@@ -1601,7 +1613,9 @@ class NativeRnsBackendImpl(
     ): Result<Unit> =
         withContext(Dispatchers.IO) {
             runCatching {
-                announceLocalPeerDestinations(appData, "announceDestination(${destination.hexHash.take(16)})")
+                val native = Transport.findDestination(destination.hash)
+                    ?: error("Destination is not registered: ${destination.hexHash}")
+                native.announce(appData)
                 Unit
             }
         }
@@ -1613,10 +1627,17 @@ class NativeRnsBackendImpl(
     ): Result<PacketReceipt> =
         withContext(Dispatchers.IO) {
             runCatching {
-                Log.d(TAG, "sendPacket: ${data.size} bytes to ${destination.hexHash.take(16)}")
+                require(packetType == PacketType.DATA) { "Only DATA packets are supported" }
+                val native = createNativeDestination(
+                    destination.identity.toNative(), DestinationDirection.OUT,
+                    NativeDestinationType.SINGLE, destination.appName, destination.aspects,
+                )
+                require(native.hash.contentEquals(destination.hash)) { "Destination hash mismatch" }
+                val packet = network.reticulum.packet.Packet.create(native, data)
+                val receipt = packet.send()
                 PacketReceipt(
-                    hash = ByteArray(32),
-                    delivered = false,
+                    hash = packet.getHash(),
+                    delivered = receipt != null,
                     timestamp = System.currentTimeMillis(),
                 )
             }

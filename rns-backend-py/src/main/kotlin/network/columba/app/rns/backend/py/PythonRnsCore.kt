@@ -271,9 +271,21 @@ class PythonRnsCore(
                 add(appName)
                 addAll(aspects)
             }
-            val pyDest = runtime.rnsModule.callAttr("Destination", *args.toTypedArray())
+            val hash = destClass.callAttr("hash", pyIdentity, appName, *aspects.toTypedArray())
+                .toJava(ByteArray::class.java).toHex()
+            val pyDest = runtime.destinations[hash]
+                ?: runtime.rnsModule.callAttr("Destination", *args.toTypedArray())
             val model = pyDest.toModelDestination(identity, direction, type, appName, aspects)
             runtime.destinations[model.hexHash] = pyDest
+            if (direction == Direction.IN) {
+                val callback = PyEventCallback { payload ->
+                    events.publishPacket(model, payload.toJava(ByteArray::class.java))
+                }
+                pyDest.callAttr(
+                    "set_packet_callback",
+                    runtime.eventBridge.callAttr("make_link_packet_handler", callback),
+                )
+            }
             model
         }
 
