@@ -5,9 +5,11 @@ import network.columba.app.data.repository.IdentityRepository
 import network.columba.app.di.ApplicationScope
 import network.columba.app.repository.SettingsRepository
 import network.columba.app.rns.api.RnsCore
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
@@ -83,7 +85,13 @@ class AutoAnnounceManager
                         identityRepository.activeIdentity,
                     ) { enabled, intervalHours, activeIdentity ->
                         Triple(enabled, intervalHours, activeIdentity?.displayName)
-                    }.collect { (enabled, intervalHours, displayName) ->
+                    // collectLatest, not collect: startAnnounceLoop never
+                    // returns, so a plain collect took the first settings value
+                    // and never saw another. Disabling auto-announce, changing
+                    // the interval, or renaming the identity had no effect until
+                    // the app restarted -- and the settings screen showed the new
+                    // value as though it had taken.
+                    }.collectLatest { (enabled, intervalHours, displayName) ->
                         Log.d(TAG, "Settings changed: enabled=$enabled, interval=${intervalHours}h")
 
                         if (enabled) {
@@ -138,6 +146,14 @@ class AutoAnnounceManager
                     } else {
                         Log.e(TAG, "Auto-announce failed: ${result.exceptionOrNull()?.message}")
                     }
+                } catch (e: CancellationException) {
+                    // A settings change cancels this loop through collectLatest,
+                    // and that arrives as a CancellationException at whichever
+                    // suspension point the announce is sitting on. Catching it
+                    // below would log it as an announce failure and carry on to
+                    // the next suspension point before dying anyway -- a
+                    // spurious error in the log and a delayed restart.
+                    throw e
                 } catch (e: Exception) {
                     Log.e(TAG, "Error during auto-announce", e)
                 }

@@ -113,6 +113,9 @@ internal class ServerRnsCore(
         impl.getFullIdentityKey()
     }
 
+    override fun signWithIdentity(data: ByteArray, cb: IRnsByteArrayCallback) =
+        dispatchNullableByteArray(cb, scope) { impl.signWithIdentity(data) }
+
     override fun createDestination(
         identity: Identity,
         direction: Direction,

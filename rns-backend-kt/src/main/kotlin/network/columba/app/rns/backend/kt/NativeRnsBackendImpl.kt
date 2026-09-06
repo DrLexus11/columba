@@ -120,6 +120,9 @@ class NativeRnsBackendImpl(
         // app-extension point; 0x70 was a non-canonical invention.
         private const val FIELD_COLUMBA_META = 0xFD
 
+        /** Ed25519 signature length, as `RnsCore.signWithIdentity` documents. */
+        private const val ED25519_SIGNATURE_LENGTH = 64
+
         /** Live-poll cadence for `propagationTransferState`. ~2 polls / second. */
         private const val PROPAGATION_POLL_INTERVAL_MS = 500L
 
@@ -1133,6 +1136,20 @@ class NativeRnsBackendImpl(
     override suspend fun getFullIdentityKey(): ByteArray? =
         try {
             deliveryIdentity?.getPrivateKey()
+        } catch (_: Exception) {
+            null
+        }
+
+    override suspend fun signWithIdentity(data: ByteArray): ByteArray? =
+        try {
+            deliveryIdentity
+                ?.takeIf { it.hasPrivateKey }
+                ?.sign(data)
+                // The contract promises 64 bytes. Anything else is a signature
+                // no verifier will accept, and returning it only moves the
+                // failure to the far side of the mesh where it looks like a
+                // forged assertion rather than a bug here.
+                ?.takeIf { it.size == ED25519_SIGNATURE_LENGTH }
         } catch (_: Exception) {
             null
         }

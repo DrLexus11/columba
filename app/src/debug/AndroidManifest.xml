@@ -33,6 +33,7 @@
                 <action android:name="network.columba.test.GET_RX" />
                 <action android:name="network.columba.test.RX_CLEAR" />
                 <action android:name="network.columba.test.ANNOUNCE" />
+                <action android:name="network.columba.test.ASSERT_TIME" />
                 <action android:name="network.columba.test.LIST_INTERFACES" />
                 <action android:name="network.columba.test.DISABLE_ALL_INTERFACES" />
                 <action android:name="network.columba.test.DISABLE_INTERFACE" />

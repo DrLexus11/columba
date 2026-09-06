@@ -50,6 +50,10 @@ class PythonRnsCore(
 ) : RnsCore {
     private companion object {
         const val TAG = "PythonRnsCore"
+
+        /** Ed25519 signature length, as `RnsCore.signWithIdentity` documents. */
+        const val ED25519_SIGNATURE_LENGTH = 64
+
         // Conversation-link + probe timing knobs (mirrors v0.10.x
         // `establish_link` / `probe_link_speed`).
 
@@ -228,6 +232,19 @@ class PythonRnsCore(
     override suspend fun getFullIdentityKey(): ByteArray? =
         pyCall {
             runtime.localIdentity?.callAttr("get_private_key")?.toJava(ByteArray::class.java)
+        }
+
+    override suspend fun signWithIdentity(data: ByteArray): ByteArray? =
+        pyCall {
+            runtime.localIdentity
+                ?.callAttr("sign", data.toPyBytes())
+                ?.toJava(ByteArray::class.java)
+                // The contract promises 64 bytes, and this one crosses a
+                // dynamically typed bridge and then IPC before anything looks
+                // at it. Checking here keeps a malformed signature from being
+                // announced onto the mesh, where a node that fails to verify it
+                // cannot tell a bug from a forgery.
+                ?.takeIf { it.size == ED25519_SIGNATURE_LENGTH }
         }
 
     // ==================== Destination management ====================

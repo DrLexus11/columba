@@ -91,6 +91,9 @@ class SettingsViewModelTest {
     private val shareInstanceHostingEnabledFlow = MutableStateFlow(false)
     private val rpcKeyFlow = MutableStateFlow<String?>(null)
     private val autoAnnounceEnabledFlow = MutableStateFlow(true)
+    private val timeAuthorityEnabledFlow = MutableStateFlow(false)
+    private val timeAuthorityIntervalMinutesFlow = MutableStateFlow(30)
+    private val lastTimeAssertionTimeFlow = MutableStateFlow<Long?>(null)
     private val autoAnnounceIntervalHoursFlow = MutableStateFlow(3)
     private val lastAutoAnnounceTimeFlow = MutableStateFlow<Long?>(null)
     private val nextAutoAnnounceTimeFlow = MutableStateFlow<Long?>(null)
@@ -175,6 +178,9 @@ class SettingsViewModelTest {
         coEvery { settingsRepository.saveShareInstanceHostingEnabled(any()) } returns Unit
         every { settingsRepository.rpcKeyFlow } returns rpcKeyFlow
         every { settingsRepository.autoAnnounceEnabledFlow } returns autoAnnounceEnabledFlow
+        every { settingsRepository.timeAuthorityEnabledFlow } returns timeAuthorityEnabledFlow
+        every { settingsRepository.timeAuthorityIntervalMinutesFlow } returns timeAuthorityIntervalMinutesFlow
+        every { settingsRepository.lastTimeAssertionTimeFlow } returns lastTimeAssertionTimeFlow
         every { settingsRepository.autoAnnounceIntervalHoursFlow } returns autoAnnounceIntervalHoursFlow
         every { settingsRepository.lastAutoAnnounceTimeFlow } returns lastAutoAnnounceTimeFlow
         every { settingsRepository.nextAutoAnnounceTimeFlow } returns nextAutoAnnounceTimeFlow
@@ -306,6 +312,7 @@ class SettingsViewModelTest {
             interfaceRepository = interfaceRepository,
             mapTileSourceManager = mapTileSourceManager,
             telemetryCollectorManager = telemetryCollectorManager,
+            timeAuthorityManager = mockk(),
             contactRepository = contactRepository,
             updateChecker = updateChecker,
             crashReportManager = crashReportManager,
@@ -1664,6 +1671,7 @@ class SettingsViewModelTest {
                     interfaceRepository = interfaceRepository,
                     mapTileSourceManager = mapTileSourceManager,
                     telemetryCollectorManager = telemetryCollectorManager,
+                    timeAuthorityManager = mockk(),
                     contactRepository = contactRepository,
                     updateChecker = updateChecker,
                     crashReportManager = crashReportManager,
@@ -1717,6 +1725,7 @@ class SettingsViewModelTest {
                     interfaceRepository = interfaceRepository,
                     mapTileSourceManager = mapTileSourceManager,
                     telemetryCollectorManager = telemetryCollectorManager,
+                    timeAuthorityManager = mockk(),
                     contactRepository = contactRepository,
                     updateChecker = updateChecker,
                     crashReportManager = crashReportManager,
@@ -1791,6 +1800,45 @@ class SettingsViewModelTest {
                 autoAnnounceEnabledFlow.value = true
                 state = awaitItem()
                 assertTrue(state.autoAnnounceEnabled)
+
+                cancelAndConsumeRemainingEvents()
+            }
+        }
+
+    @Test
+    fun `time authority state survives an unrelated settings emission`() =
+        runTest {
+            // The regression: loadSettings() builds a fresh SettingsState rather
+            // than copying, so time-authority fields it forgot to carry reverted
+            // to their defaults whenever any other flow ticked. On the device the
+            // switch turned on and then snapped straight back off.
+            timeAuthorityEnabledFlow.value = true
+            timeAuthorityIntervalMinutesFlow.value = 120
+            viewModel = createViewModel()
+
+            viewModel.state.test {
+                var state = awaitItem()
+                var loadAttempts = 0
+                while (state.isLoading && loadAttempts++ < 50) {
+                    state = awaitItem()
+                }
+
+                assertTrue("time authority should load as enabled", state.timeAuthorityEnabled)
+                assertEquals(120, state.timeAuthorityIntervalMinutes)
+
+                // Tick a flow that has nothing to do with time authority.
+                autoAnnounceEnabledFlow.value = false
+                state = awaitItem()
+
+                assertTrue(
+                    "time authority should survive an unrelated settings emission",
+                    state.timeAuthorityEnabled,
+                )
+                assertEquals(
+                    "the interval should survive an unrelated settings emission",
+                    120,
+                    state.timeAuthorityIntervalMinutes,
+                )
 
                 cancelAndConsumeRemainingEvents()
             }
@@ -2380,6 +2428,7 @@ class SettingsViewModelTest {
                     interfaceRepository = interfaceRepository,
                     mapTileSourceManager = mapTileSourceManager,
                     telemetryCollectorManager = telemetryCollectorManager,
+                    timeAuthorityManager = mockk(),
                     contactRepository = contactRepository,
                     updateChecker = updateChecker,
                     crashReportManager = crashReportManager,
@@ -2549,6 +2598,7 @@ class SettingsViewModelTest {
                     interfaceRepository = interfaceRepository,
                     mapTileSourceManager = mapTileSourceManager,
                     telemetryCollectorManager = telemetryCollectorManager,
+                    timeAuthorityManager = mockk(),
                     contactRepository = contactRepository,
                     updateChecker = updateChecker,
                     crashReportManager = crashReportManager,

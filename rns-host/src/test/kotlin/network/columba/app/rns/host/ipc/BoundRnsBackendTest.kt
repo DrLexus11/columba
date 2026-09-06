@@ -281,6 +281,7 @@ class BoundRnsBackendTest {
         override suspend fun importIdentityFile(fileData: ByteArray, displayName: String): Map<String, Any> = emptyMap()
         override suspend fun exportIdentityFile(keyData: ByteArray, filePath: String): ByteArray = ByteArray(0)
         override suspend fun getFullIdentityKey(): ByteArray? = null
+        override suspend fun signWithIdentity(data: ByteArray): ByteArray? = null
         override suspend fun createDestination(
             identity: Identity, direction: Direction, type: DestinationType,
             appName: String, aspects: List<String>,

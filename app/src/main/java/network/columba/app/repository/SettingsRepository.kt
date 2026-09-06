@@ -77,6 +77,9 @@ class SettingsRepository
 
             // Auto-announce preferences
             val AUTO_ANNOUNCE_ENABLED = booleanPreferencesKey("auto_announce_enabled")
+            val TIME_AUTHORITY_ENABLED = booleanPreferencesKey("time_authority_enabled")
+            val TIME_AUTHORITY_INTERVAL_MINUTES = intPreferencesKey("time_authority_interval_minutes")
+            val TIME_AUTHORITY_LAST_ASSERTION = longPreferencesKey("time_authority_last_assertion")
             val AUTO_ANNOUNCE_INTERVAL_MINUTES = intPreferencesKey("auto_announce_interval_minutes") // Legacy, for migration
             val AUTO_ANNOUNCE_INTERVAL_HOURS = intPreferencesKey("auto_announce_interval_hours")
             val LAST_AUTO_ANNOUNCE_TIME = longPreferencesKey("last_auto_announce_time")
@@ -579,6 +582,70 @@ class SettingsRepository
         suspend fun saveAutoAnnounceIntervalHours(hours: Int) {
             context.dataStore.edit { preferences ->
                 preferences[PreferencesKeys.AUTO_ANNOUNCE_INTERVAL_HOURS] = hours.coerceIn(1, 12)
+            }
+        }
+
+        /**
+         * Flow of the time-authority enabled state.
+         *
+         * Defaults to false: asserting the time for a whole mesh is not
+         * something a phone should start doing because it was installed. It is
+         * off until someone decides this device's clock is worth trusting and
+         * provisions its identity onto the nodes that will listen.
+         */
+        val timeAuthorityEnabledFlow: Flow<Boolean> =
+            context.dataStore.data
+                .map { preferences ->
+                    preferences[PreferencesKeys.TIME_AUTHORITY_ENABLED] ?: false
+                }.distinctUntilChanged()
+
+        /**
+         * Save the time-authority enabled state.
+         *
+         * @param enabled Whether this device asserts signed time onto the mesh
+         */
+        suspend fun saveTimeAuthorityEnabled(enabled: Boolean) {
+            context.dataStore.edit { preferences ->
+                preferences[PreferencesKeys.TIME_AUTHORITY_ENABLED] = enabled
+            }
+        }
+
+        /**
+         * Flow of the interval between time assertions, in minutes.
+         * Defaults to 30.
+         */
+        val timeAuthorityIntervalMinutesFlow: Flow<Int> =
+            context.dataStore.data
+                .map { preferences ->
+                    preferences[PreferencesKeys.TIME_AUTHORITY_INTERVAL_MINUTES] ?: 30
+                }.distinctUntilChanged()
+
+        /**
+         * Save the interval between time assertions.
+         *
+         * @param minutes The interval in minutes (5-720)
+         */
+        suspend fun saveTimeAuthorityIntervalMinutes(minutes: Int) {
+            context.dataStore.edit { preferences ->
+                preferences[PreferencesKeys.TIME_AUTHORITY_INTERVAL_MINUTES] = minutes.coerceIn(5, 720)
+            }
+        }
+
+        /**
+         * Flow of the last time assertion this device emitted (epoch
+         * milliseconds), or null if it has never asserted. Shown in settings so
+         * an operator can see the feature is doing something rather than
+         * trusting a toggle.
+         */
+        val lastTimeAssertionTimeFlow: Flow<Long?> =
+            context.dataStore.data
+                .map { preferences -> preferences[PreferencesKeys.TIME_AUTHORITY_LAST_ASSERTION] }
+                .distinctUntilChanged()
+
+        /** Record that an assertion was announced at [timestamp]. */
+        suspend fun saveLastTimeAssertionTime(timestamp: Long) {
+            context.dataStore.edit { preferences ->
+                preferences[PreferencesKeys.TIME_AUTHORITY_LAST_ASSERTION] = timestamp
             }
         }
 

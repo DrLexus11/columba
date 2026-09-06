@@ -113,6 +113,9 @@ internal class BoundRnsCore(
 
     override suspend fun getFullIdentityKey(): ByteArray? = awaitBound().core.getFullIdentityKey()
 
+    override suspend fun signWithIdentity(data: ByteArray): ByteArray? =
+        awaitBound().core.signWithIdentity(data)
+
     override suspend fun createDestination(
         identity: Identity,
         direction: Direction,
