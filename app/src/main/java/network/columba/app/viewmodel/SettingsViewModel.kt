@@ -60,6 +60,7 @@ enum class SettingsCardId {
     VOICE_CALL_PERMISSIONS,
     AUTO_ANNOUNCE,
     TIME_AUTHORITY,
+    POSITION_REPORT,
     LOCATION_SHARING,
     MAP_SOURCES,
     MESSAGE_DELIVERY,
@@ -91,6 +92,10 @@ data class SettingsState(
     val timeAuthorityEnabled: Boolean = false,
     val timeAuthorityIntervalMinutes: Int = 30,
     val lastTimeAssertionTime: Long? = null,
+    val positionReportEnabled: Boolean = false,
+    val positionReportIntervalMinutes: Int = 1,
+    val positionGatewayHash: String? = null,
+    val lastPositionReportTime: Long? = null,
     val autoAnnounceIntervalHours: Int = 3,
     val lastAutoAnnounceTime: Long? = null,
     val nextAutoAnnounceTime: Long? = null,
@@ -213,6 +218,20 @@ data class SettingsState(
     val sortMessagesBySentTime: Boolean = false,
 )
 
+/**
+ * The four position-reporting settings, carried together.
+ *
+ * A holder rather than a Triple because there are four of them, and rather than
+ * an arm of the big combine because that one destructures a positional array
+ * and every insertion shifts the indices after it.
+ */
+private data class PositionSettings(
+    val enabled: Boolean,
+    val intervalMinutes: Int,
+    val gatewayHash: String?,
+    val lastReport: Long?,
+)
+
 @Suppress("TooManyFunctions", "LargeClass") // ViewModel with many user interaction methods is expected
 @HiltViewModel
 class SettingsViewModel
@@ -234,6 +253,7 @@ class SettingsViewModel
         private val mapTileSourceManager: MapTileSourceManager,
         private val telemetryCollectorManager: TelemetryCollectorManager,
         private val timeAuthorityManager: network.columba.app.service.TimeAuthorityManager,
+        private val positionReportManager: network.columba.app.service.PositionReportManager,
         private val contactRepository: ContactRepository,
         private val updateChecker: network.columba.app.service.UpdateChecker,
         private val crashReportManager: network.columba.app.util.CrashReportManager,
@@ -296,6 +316,7 @@ class SettingsViewModel
             fetchProtocolVersions()
             loadTelemetryCollectorSettings()
             observeTimeAuthoritySettings()
+            observePositionReportSettings()
             // Load contacts for allowed requesters picker
             loadContacts()
             // Load update checker settings and maybe check on startup
@@ -582,6 +603,14 @@ class SettingsViewModel
                             // Preserve allowed requesters and contacts from loadTelemetryCollectorSettings()
                             telemetryAllowedRequesters = _state.value.telemetryAllowedRequesters,
                             contacts = _state.value.contacts,
+                            // Preserve position state from observePositionReportSettings(),
+                            // for the same reason as the time authority below: this
+                            // combine rebuilds the state wholesale and would reset
+                            // whatever the other collector had just written.
+                            positionReportEnabled = _state.value.positionReportEnabled,
+                            positionReportIntervalMinutes = _state.value.positionReportIntervalMinutes,
+                            positionGatewayHash = _state.value.positionGatewayHash,
+                            lastPositionReportTime = _state.value.lastPositionReportTime,
                             // Preserve time authority state from observeTimeAuthoritySettings().
                             // This block builds a fresh SettingsState rather than a copy, so a
                             // field left out here silently reverts to its data-class default on
@@ -959,6 +988,69 @@ class SettingsViewModel
         fun setTimeAuthorityInterval(minutes: Int) {
             viewModelScope.launch {
                 settingsRepository.saveTimeAuthorityIntervalMinutes(minutes)
+            }
+        }
+
+        /**
+         * Observe the position-reporting settings.
+         *
+         * Its own collector for the same reason the time authority has one: the
+         * large combine above destructures a positional array, and adding an
+         * arm shifts every index after it.
+         */
+        private fun observePositionReportSettings() {
+            viewModelScope.launch {
+                combine(
+                    settingsRepository.positionReportEnabledFlow,
+                    settingsRepository.positionReportIntervalMinutesFlow,
+                    settingsRepository.positionGatewayHashFlow,
+                    settingsRepository.lastPositionReportTimeFlow,
+                ) { enabled, intervalMinutes, gatewayHash, lastReport ->
+                    PositionSettings(enabled, intervalMinutes, gatewayHash, lastReport)
+                }.collect { settings ->
+                    _state.value =
+                        _state.value.copy(
+                            positionReportEnabled = settings.enabled,
+                            positionReportIntervalMinutes = settings.intervalMinutes,
+                            positionGatewayHash = settings.gatewayHash,
+                            lastPositionReportTime = settings.lastReport,
+                        )
+                }
+            }
+        }
+
+        /** Start or stop reporting this device's position to a CoT gateway. */
+        fun setPositionReportEnabled(enabled: Boolean) {
+            viewModelScope.launch {
+                settingsRepository.savePositionReportEnabled(enabled)
+                Log.d(TAG, "Position reporting ${if (enabled) "enabled" else "disabled"}")
+            }
+        }
+
+        /** Change how often this device reports its position. */
+        fun setPositionReportInterval(minutes: Int) {
+            viewModelScope.launch {
+                settingsRepository.savePositionReportIntervalMinutes(minutes)
+            }
+        }
+
+        /** Set the CoT gateway destination hash. Blank clears it. */
+        fun setPositionGatewayHash(hash: String) {
+            viewModelScope.launch {
+                settingsRepository.savePositionGatewayHash(hash)
+            }
+        }
+
+        /**
+         * Report position immediately.
+         *
+         * Same reasoning as asserting the time by hand: arriving somewhere and
+         * wanting the map to show it should not mean waiting out an interval.
+         */
+        fun reportPositionNow() {
+            viewModelScope.launch {
+                val sent = positionReportManager.reportNow()
+                Log.d(TAG, "Manual position report ${if (sent) "sent" else "failed"}")
             }
         }
 
