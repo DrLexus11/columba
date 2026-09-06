@@ -2,6 +2,7 @@ package network.columba.app.rns.backend.py
 
 import android.util.Log
 import com.chaquo.python.PyObject
+import com.chaquo.python.Python
 import network.columba.app.rns.api.util.hexToBytes
 import network.columba.app.rns.api.util.toHex
 import kotlinx.coroutines.flow.Flow
@@ -313,14 +314,44 @@ class PythonRnsCore(
             val pyDest = runtime.destinations[destination.hexHash]
                 ?: throw RnsException(RnsError.IdentityNotFound(destination.hexHash))
             val pyPacket = runtime.rnsModule.callAttr("Packet", pyDest, data.toPyBytes())
-            val receipt = pyPacket.callAttr("send")
+            val sendResult = pyPacket.callAttr("send")
             val hashBytes = pyPacket["packet_hash"]?.toJava(ByteArray::class.java) ?: ByteArray(0)
             PacketReceipt(
                 hash = hashBytes,
-                delivered = receipt?.toJava(Boolean::class.javaObjectType) ?: false,
+                delivered = sendAccepted(sendResult),
                 timestamp = System.currentTimeMillis(),
             )
         }
+
+    /**
+     * Whether Python RNS accepted the packet for transmission.
+     *
+     * `Packet.send()` returns two different things: `False` when the packet
+     * could not be sent, and a **PacketReceipt object** when it could. Reading
+     * the result as a Boolean therefore throws on exactly the successful case --
+     * "TypeError: Cannot convert PacketReceipt object to java.lang.Boolean" --
+     * and every delivered packet is reported to the caller as a failure.
+     *
+     * Found on 2026-09-06 by the first position report to cross the mesh: the
+     * gateway received it and rendered it, while the phone logged the send as
+     * failed and never recorded the timestamp.
+     *
+     * A receipt means handed to the transport, not proven delivered; proof
+     * arrives later on the receipt itself, which nothing here waits for.
+     */
+    private fun sendAccepted(sendResult: PyObject?): Boolean {
+        if (sendResult == null) return false
+        // Ask Python what it handed back rather than converting and catching
+        // the failure: the conversion throws on the *success* path, so using
+        // that as control flow means an exception per delivered packet.
+        val builtins = Python.getInstance().builtins
+        val isBool =
+            builtins
+                .callAttr("isinstance", sendResult, builtins["bool"])
+                .toJava(Boolean::class.javaObjectType)
+        // A bool is the failure report; a receipt means it went out.
+        return if (isBool) sendResult.toJava(Boolean::class.javaObjectType) else true
+    }
 
     override fun observePackets(): Flow<ReceivedPacket> = events.packets
 
