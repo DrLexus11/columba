@@ -582,6 +582,14 @@ class SettingsViewModel
                             // Preserve allowed requesters and contacts from loadTelemetryCollectorSettings()
                             telemetryAllowedRequesters = _state.value.telemetryAllowedRequesters,
                             contacts = _state.value.contacts,
+                            // Preserve time authority state from observeTimeAuthoritySettings().
+                            // This block builds a fresh SettingsState rather than a copy, so a
+                            // field left out here silently reverts to its data-class default on
+                            // every emission -- which is what made the toggle snap back off the
+                            // instant any other settings flow ticked.
+                            timeAuthorityEnabled = _state.value.timeAuthorityEnabled,
+                            timeAuthorityIntervalMinutes = _state.value.timeAuthorityIntervalMinutes,
+                            lastTimeAssertionTime = _state.value.lastTimeAssertionTime,
                             // Preserve notifications state from loadNotificationsSettings()
                             notificationsEnabled = _state.value.notificationsEnabled,
                             // Preserve privacy state from loadPrivacySettings()

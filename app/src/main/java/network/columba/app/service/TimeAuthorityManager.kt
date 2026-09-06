@@ -10,6 +10,7 @@ import network.columba.app.rns.api.model.DestinationType
 import network.columba.app.rns.api.model.Direction
 import network.columba.app.rns.api.model.Identity
 import org.msgpack.core.MessagePack
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -257,6 +258,12 @@ class TimeAuthorityManager
                     destination == null -> false
                     else -> announceAssertion(destination, unixMillis, signature)
                 }
+            } catch (e: CancellationException) {
+                // Same reasoning as AutoAnnounceManager: collectLatest cancels
+                // the loop on a settings change, and that reaches us as a
+                // CancellationException from whichever call is in flight.
+                // Swallowing it would log a phantom assertion failure.
+                throw e
             } catch (e: Exception) {
                 Log.e(TAG, "Error while asserting time", e)
                 false

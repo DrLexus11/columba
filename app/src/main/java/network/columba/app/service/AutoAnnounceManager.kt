@@ -5,6 +5,7 @@ import network.columba.app.data.repository.IdentityRepository
 import network.columba.app.di.ApplicationScope
 import network.columba.app.repository.SettingsRepository
 import network.columba.app.rns.api.RnsCore
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableSharedFlow
@@ -145,6 +146,14 @@ class AutoAnnounceManager
                     } else {
                         Log.e(TAG, "Auto-announce failed: ${result.exceptionOrNull()?.message}")
                     }
+                } catch (e: CancellationException) {
+                    // A settings change cancels this loop through collectLatest,
+                    // and that arrives as a CancellationException at whichever
+                    // suspension point the announce is sitting on. Catching it
+                    // below would log it as an announce failure and carry on to
+                    // the next suspension point before dying anyway -- a
+                    // spurious error in the log and a delayed restart.
+                    throw e
                 } catch (e: Exception) {
                     Log.e(TAG, "Error during auto-announce", e)
                 }
