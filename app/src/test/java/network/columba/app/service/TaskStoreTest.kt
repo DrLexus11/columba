@@ -55,6 +55,19 @@ class TaskStoreTest {
     }
 
     @Test
+    fun `deferring for path discovery delays the next try without spending an attempt`() {
+        store.receive(owner, task, byteArrayOf(1), "key", 1000)
+        val row = store.rows(owner).single()
+        assertTrue(store.deferAttempt(row, 1010))
+        val deferred = store.rows(owner).single()
+        assertEquals(0, deferred.attempts)
+        assertEquals(1010, deferred.lastAttempt)
+        // The budget is still whole, so a route that appears late is still used.
+        assertTrue(store.markAttempt(deferred, 1070))
+        assertEquals(1, store.rows(owner).single().attempts)
+    }
+
+    @Test
     fun `identity isolation expiry and ack retry persistence`() {
         store.receive(owner, task, byteArrayOf(1), "key", 1000)
         assertTrue(store.rows("other").isEmpty())

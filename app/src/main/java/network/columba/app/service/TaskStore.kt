@@ -146,6 +146,27 @@ class TaskStore(
         ) == 1
     }
 
+    /**
+     * Defer the next try without spending one of the three attempts.
+     *
+     * Path discovery is not a delivery attempt. Charging it as one let a
+     * receipt exhaust its whole budget waiting for a route it never got to
+     * use, and the acknowledgment was then never sent at all.
+     */
+    @Synchronized
+    fun deferAttempt(
+        row: Row,
+        now: Long,
+    ): Boolean {
+        val values = ContentValues().apply { put("last_attempt", now) }
+        return writableDatabase.update(
+            "tasks",
+            values,
+            "owner=? AND issuer=? AND id=? AND status=? AND attempts=?",
+            arrayOf(row.owner, row.message.issuer, row.message.taskId, row.status.toString(), row.attempts.toString()),
+        ) == 1
+    }
+
     @Synchronized
     fun markAttempt(
         row: Row,
