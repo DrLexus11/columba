@@ -165,7 +165,12 @@ class TaskManager
                         }
                         for (row in store.rows(owner)) {
                             if (row.publicKey != key || row.message.expires <= now) continue
-                            if (row.attempts < 3 && now - row.lastAttempt >= 60) {
+                            // Retried until the task expires rather than for a
+                            // fixed three tries. A responder who walks through a
+                            // dead spot would otherwise spend the whole budget in
+                            // two minutes and never acknowledge a task that stayed
+                            // valid for another quarter hour.
+                            if (now - row.lastAttempt >= 60) {
                                 sendStatus(local, row, now)
                             }
                         }
