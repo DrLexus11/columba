@@ -60,6 +60,8 @@ object TestController {
         fun positionReportManager(): network.columba.app.service.PositionReportManager
 
         fun settingsRepository(): network.columba.app.repository.SettingsRepository
+
+        fun taskManager(): network.columba.app.service.TaskManager
     }
 
     // Surface uncaught throws inside any scope.launch as a parseable
@@ -88,6 +90,7 @@ object TestController {
     private var timeAuthorityManager: network.columba.app.service.TimeAuthorityManager? = null
     private var positionReportManager: network.columba.app.service.PositionReportManager? = null
     private var settingsRepository: network.columba.app.repository.SettingsRepository? = null
+    private var taskManager: network.columba.app.service.TaskManager? = null
     private val rxQueue = mutableListOf<ReceivedMessage>()
     private val rxLock = Any()
     private val deliveryStates = mutableMapOf<String, String>() // msgHashHex -> stateName
@@ -112,6 +115,7 @@ object TestController {
         timeAuthorityManager = ep.timeAuthorityManager()
         positionReportManager = ep.positionReportManager()
         settingsRepository = ep.settingsRepository()
+        taskManager = ep.taskManager()
         receiveJob = scope.launch {
             rnsLxmf!!.observeMessages().collect { msg ->
                 synchronized(rxLock) { rxQueue.add(msg) }
@@ -615,6 +619,106 @@ object TestController {
                 // it was: no gateway, no permission, a stale fix, or no path.
                 Log.i(LOGCAT_TAG, "pos_report_err reason=not_sent")
             }
+        }
+    }
+
+    // ── TAK tasking ──
+    //
+    // The inbox is otherwise reachable only by tapping Settings → TAK tasks,
+    // which leaves the whole verify → persist → decide → acknowledge path
+    // unexercised by the harness. These four actions drive that path through
+    // the real TaskManager, the real store and the real backend, so the only
+    // step a person still has to perform by hand is the tap itself.
+
+    fun handleGetTaskKey(context: Context) {
+        ensureInit(context)
+        scope.launch {
+            val state = taskManager!!.state.value
+            if (state.owner.isEmpty()) {
+                // The receiver installs owner/publicKey once the LXMF identity
+                // and its destination exist; before that there is nothing to pin.
+                Log.i(LOGCAT_TAG, "task_key_err reason=not_ready")
+            } else {
+                Log.i(
+                    LOGCAT_TAG,
+                    "task_key owner=${state.owner} public=${state.publicKey} " +
+                        "authority=${state.authority.ifEmpty { "unset" }}",
+                )
+            }
+        }
+    }
+
+    fun handleSetTaskAuthority(
+        context: Context,
+        hex: String,
+    ) {
+        ensureInit(context)
+        scope.launch {
+            val normalized = if (hex.equals("clear", ignoreCase = true)) "" else hex
+            try {
+                taskManager!!.setAuthority(normalized)
+                val state = taskManager!!.state.value
+                if (state.owner.isEmpty()) {
+                    Log.i(LOGCAT_TAG, "task_authority_err reason=not_ready")
+                } else {
+                    Log.i(
+                        LOGCAT_TAG,
+                        "task_authority_set owner=${state.owner} " +
+                            "authority=${state.authority.ifEmpty { "unset" }}",
+                    )
+                }
+            } catch (error: IllegalArgumentException) {
+                // A key that is not 64 bytes must be refused rather than stored;
+                // the harness asserts on this rejection.
+                Log.i(LOGCAT_TAG, "task_authority_err reason=invalid_key msg=${escape(error.message ?: "")}")
+            }
+        }
+    }
+
+    fun handleListTasks(context: Context) {
+        ensureInit(context)
+        scope.launch {
+            val state = taskManager!!.state.value
+            for (row in state.tasks) {
+                Log.i(
+                    LOGCAT_TAG,
+                    "task id=${row.message.taskId} issuer=${row.message.issuer} " +
+                        "lat=${row.message.latE7} lon=${row.message.lonE7} " +
+                        "instruction=${escape(row.message.instruction)} " +
+                        "status=${row.status} attempts=${row.attempts} " +
+                        "expires=${row.message.expires} now=${state.now}",
+                )
+            }
+            Log.i(LOGCAT_TAG, "task_list_done count=${state.tasks.size} owner=${state.owner}")
+        }
+    }
+
+    fun handleRespondTask(
+        context: Context,
+        id: String,
+        decision: String,
+    ) {
+        ensureInit(context)
+        scope.launch {
+            val status =
+                when (decision.lowercase()) {
+                    "accept", "accepted" -> network.columba.app.service.TaskCodec.ACCEPTED
+                    "decline", "declined" -> network.columba.app.service.TaskCodec.DECLINED
+                    else -> 0
+                }
+            if (status == 0) {
+                Log.i(LOGCAT_TAG, "task_respond_err reason=unknown_decision decision=${escape(decision)}")
+                return@launch
+            }
+            val row = taskManager!!.state.value.tasks.firstOrNull { it.message.taskId == id }
+            if (row == null) {
+                Log.i(LOGCAT_TAG, "task_respond_err reason=unknown_task id=${escape(id)}")
+                return@launch
+            }
+            // decide() is the same call the inbox card makes. A decision is
+            // terminal, and the store -- not this handler -- enforces that.
+            taskManager!!.decide(row, status)
+            Log.i(LOGCAT_TAG, "task_decided id=$id status=$status")
         }
     }
 
