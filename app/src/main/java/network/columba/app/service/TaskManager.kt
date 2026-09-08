@@ -141,13 +141,27 @@ class TaskManager
                     }
                 }
                 var lastAnnounce = 0L
+                var announceInterval = 0L
                 while (true) {
                     val now = System.currentTimeMillis() / 1000
                     val key = preferences.getString("authority.$owner", "").orEmpty()
                     if (key.isNotEmpty()) {
-                        if (now - lastAnnounce >= 300) {
-                            core.announceDestination(destination).getOrThrow()
+                        if (now - lastAnnounce >= announceInterval) {
+                            // A failed announce must not end the receiver. It used
+                            // to throw out of the loop, and the destination was then
+                            // never advertised again for the life of the process --
+                            // so trusting an authority through the UI left a phone
+                            // that verified nothing and could not be reached, until
+                            // someone happened to restart the app. Retry sooner
+                            // after a failure than the steady-state interval.
                             lastAnnounce = now
+                            core
+                                .announceDestination(destination)
+                                .onSuccess { announceInterval = 300 }
+                                .onFailure {
+                                    announceInterval = 30
+                                    Log.w("TaskManager", "Task destination announce failed", it)
+                                }
                         }
                         for (row in store.rows(owner)) {
                             if (row.publicKey != key || row.message.expires <= now) continue
@@ -170,7 +184,6 @@ class TaskManager
             row: TaskStore.Row,
             now: Long,
         ) {
-            if (!store.markAttempt(row, now)) return
             try {
                 val key = TaskCodec.unhex(row.publicKey)
                 val native =
@@ -188,8 +201,12 @@ class TaskManager
                         ).getOrThrow()
                 if (!core.hasPath(destination.hash)) {
                     core.requestPath(destination.hash)
+                    // Back off a minute, but do not spend an attempt: no
+                    // acknowledgment was transmitted and none was refused.
+                    store.deferAttempt(row, now)
                     return
                 }
+                if (!store.markAttempt(row, now)) return
                 val message =
                     TaskCodec.Message(
                         TaskCodec.STATUS,
