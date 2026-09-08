@@ -1442,10 +1442,24 @@ class PythonRnsCore(
     private fun resolveIdentity(identity: Identity): PyObject {
         runtime.identities[identity.hash.toHex()]?.let { return it }
         val identityClass = runtime.rnsModule["Identity"] ?: error("RNS.Identity missing")
-        val key = identity.privateKey
+        identity.privateKey?.let { key ->
+            return identityClass.callAttr("from_bytes", key.toPyBytes())
+                .also { runtime.identities[identity.hash.toHex()] = it }
+        }
+        // A peer known only by its public key still needs to be addressable.
+        // An OUT destination encrypts to that peer and never signs as it, so
+        // the public half is sufficient -- and for a key pinned by hand it is
+        // the only half that exists. Without this an addressed reply fails as
+        // "Identity not found", which reads as a missing peer rather than as
+        // a backend that cannot express one. The native backend already falls
+        // back to fromPublicKey() here; this brings the two into line.
+        val publicKey = identity.publicKey.takeIf { it.isNotEmpty() }
             ?: throw RnsException(RnsError.IdentityNotFound(identity.hash.toHex()))
-        return identityClass.callAttr("from_bytes", key.toPyBytes())
-            .also { runtime.identities[identity.hash.toHex()] = it }
+        // Deliberately not cached: the cache is keyed by hash and shared with
+        // callers that must sign, and a verify-only entry would deny them the
+        // private half for the rest of the process.
+        return runtime.eventBridge.callAttr("identity_from_public_key", publicKey.toPyBytes())
+            ?: throw RnsException(RnsError.IdentityNotFound(identity.hash.toHex()))
     }
 
     /** `RNS.Identity` PyObject -> model. `.hash` is an attribute; keys are getters. */
