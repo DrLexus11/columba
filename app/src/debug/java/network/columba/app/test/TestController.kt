@@ -656,7 +656,9 @@ object TestController {
         scope.launch {
             val normalized = if (hex.equals("clear", ignoreCase = true)) "" else hex
             try {
-                taskManager!!.setAuthority(normalized)
+                // Joined: the write is durable and off-thread now, and the
+                // state is read on the very next line.
+                taskManager!!.setAuthority(normalized).join()
                 val state = taskManager!!.state.value
                 if (state.owner.isEmpty()) {
                     Log.i(LOGCAT_TAG, "task_authority_err reason=not_ready")

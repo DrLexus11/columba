@@ -15,6 +15,7 @@ import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
@@ -119,6 +120,52 @@ class NativePacketOperationsTest {
                 assertFalse(receipt.delivered)
             } finally {
                 unmockkObject(Transport)
+                Transport.findDestination(destination.hash)?.let(Transport::deregisterDestination)
+            }
+        }
+
+    /**
+     * sendPacket re-derives the destination as SINGLE. createDestination does
+     * honour GROUP and PLAIN, so a caller can hold one of those legitimately
+     * and reach sendPacket with it -- and before the type check that arrived as
+     * "Destination hash mismatch", which points at the hash rather than at the
+     * reason the hash was never going to match.
+     */
+    @Test
+    fun `a non-SINGLE destination is refused by type rather than by hash`() =
+        runTest {
+            val native =
+                network.reticulum.identity.Identity
+                    .create()
+            val identity = Identity(native.hash, native.getPublicKey(), native.getPrivateKey())
+            val backend = NativeRnsBackendImpl()
+            val destination =
+                backend
+                    .createDestination(
+                        identity,
+                        Direction.IN,
+                        DestinationType.SINGLE,
+                        "rnstransport",
+                        listOf("tak", "task"),
+                    ).getOrThrow()
+            try {
+                for (type in listOf(DestinationType.GROUP, DestinationType.PLAIN)) {
+                    val wrongType = destination.copy(direction = Direction.OUT, type = type)
+
+                    val error = backend.sendPacket(wrongType, byteArrayOf(1, 2, 3)).exceptionOrNull()
+
+                    assertNotNull("sending to a $type destination must fail", error)
+                    val message = error!!.message.orEmpty()
+                    assertTrue(
+                        "the error should name the type, but was: $message",
+                        message.contains(type.name),
+                    )
+                    assertFalse(
+                        "the type failure must not masquerade as a hash mismatch: $message",
+                        message.contains("hash mismatch"),
+                    )
+                }
+            } finally {
                 Transport.findDestination(destination.hash)?.let(Transport::deregisterDestination)
             }
         }

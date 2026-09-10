@@ -70,13 +70,44 @@ class TaskManager
             job = null
         }
 
-        fun setAuthority(key: String) {
+        /**
+         * Trust an authority to task this device, or -- with an empty key --
+         * stop trusting one.
+         *
+         * The write stays a commit() rather than an apply(), but moves off the
+         * caller's thread. This is the trust setting, and the dangerous
+         * direction is a revocation that does not survive a restart: the phone
+         * would go on accepting tasks from a key the operator believes they
+         * removed. commit() reports whether the write actually landed and
+         * apply() cannot, so the durability is worth keeping -- it just has no
+         * business happening on the main thread, which is where the settings
+         * card calls this from.
+         *
+         * The key is validated before the coroutine starts, so a malformed one
+         * still fails at the call site rather than somewhere off-thread.
+         *
+         * Returns the write's Job so a caller that reads [state] straight
+         * afterwards can join it first. The settings card does not need to --
+         * it re-renders from the flow -- but the test harness asserts on the
+         * state one line later, and without joining it would race the write.
+         */
+        fun setAuthority(key: String): Job {
             val current = state.value
-            if (current.owner.isEmpty()) return
+            if (current.owner.isEmpty()) return Job().apply { complete() }
             val normalized = key.trim().lowercase()
             require(normalized.isEmpty() || TaskCodec.unhex(normalized).size == 64)
-            check(preferences.edit().putString("authority.${current.owner}", normalized).commit())
-            mutableState.value = current.copy(authority = normalized)
+            return scope.launch(Dispatchers.IO) {
+                if (preferences.edit().putString("authority.${current.owner}", normalized).commit()) {
+                    mutableState.value = state.value.copy(authority = normalized)
+                } else {
+                    // Deliberately leaves the state alone. refresh() re-reads
+                    // the stored value every second, so the card settles on
+                    // what is actually persisted rather than on what was
+                    // typed -- and the receiver loop reads the same store, so
+                    // it and the UI cannot disagree about who is trusted.
+                    Log.e("TaskManager", "Could not persist the trust setting for ${current.owner}")
+                }
+            }
         }
 
         fun decide(

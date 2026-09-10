@@ -1671,11 +1671,27 @@ class NativeRnsBackendImpl(
         withContext(Dispatchers.IO) {
             runCatching {
                 require(packetType == PacketType.DATA) { "Only DATA packets are supported" }
+                // Re-derived as SINGLE below, so anything else must be refused
+                // here rather than silently sent with the wrong semantics.
+                // createDestination() does honour GROUP and PLAIN, so a caller
+                // can hold one of those legitimately and reach this point; the
+                // hash it derives would then not match and the failure arrived
+                // as "Destination hash mismatch", which says nothing about the
+                // actual cause. Mapping the type instead would be guessing:
+                // nothing in the app creates a non-SINGLE destination, so that
+                // path has never been exercised, and a GROUP destination keys
+                // on a shared secret rather than the identity used here.
+                require(destination.type == DestinationType.SINGLE) {
+                    "Only SINGLE destinations can be sent to, but this one is ${destination.type}"
+                }
                 val native = createNativeDestination(
                     destination.identity.toNative(), DestinationDirection.OUT,
                     NativeDestinationType.SINGLE, destination.appName, destination.aspects,
                 )
-                require(native.hash.contentEquals(destination.hash)) { "Destination hash mismatch" }
+                require(native.hash.contentEquals(destination.hash)) {
+                    "Destination hash mismatch: ${destination.hexHash} is not the SINGLE destination " +
+                        "derived from its own identity, app name and aspects"
+                }
                 val packet = network.reticulum.packet.Packet.create(native, data)
                 val receipt = packet.send()
                 PacketReceipt(
