@@ -390,7 +390,7 @@ class BoundRnsBackendTest {
         override fun observeMessages() = kotlinx.coroutines.flow.emptyFlow<ReceivedMessage>()
         override fun observeDeliveryStatus() = kotlinx.coroutines.flow.emptyFlow<DeliveryStatusUpdate>()
         override fun observeTransferProgress() = transferProgressEmitter.asSharedFlow()
-        override suspend fun getLxmfIdentity(): Result<Identity> = error("not used")
+        override suspend fun getLxmfIdentity(): Result<Identity> = Result.success(Identity(ByteArray(16), ByteArray(64), null))
         override suspend fun getLxmfDestination(): Result<Destination> = error("not used")
         override suspend fun setOutboundPropagationNode(destHash: ByteArray?) = Result.success(Unit)
         override suspend fun getOutboundPropagationNode(): Result<String?> = Result.success(null)

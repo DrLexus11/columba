@@ -22,6 +22,67 @@ import org.robolectric.RobolectricTestRunner
 @RunWith(RobolectricTestRunner::class)
 class NativePacketOperationsTest {
     @Test
+    fun `restart restores inbound callback before ready and account switch discards it`() =
+        runTest {
+            val native =
+                network.reticulum.identity.Identity
+                    .create()
+            val identity = Identity(native.hash, native.getPublicKey(), native.getPrivateKey())
+            val directory =
+                java.nio.file.Files
+                    .createTempDirectory("destination-restart")
+                    .toFile()
+            val backend = NativeRnsBackendImpl()
+            val config =
+                network.columba.app.rns.api.model.ReticulumConfig(
+                    storagePath = directory.absolutePath,
+                    enabledInterfaces = emptyList(),
+                    deliveryIdentityKey = native.getPrivateKey(),
+                    preferOwnInstance = true,
+                    enableTransport = false,
+                )
+            try {
+                backend.initialize(config).getOrThrow()
+                val destination =
+                    backend
+                        .createDestination(
+                            identity,
+                            Direction.IN,
+                            DestinationType.SINGLE,
+                            "rnstransport",
+                            listOf("tak", "task"),
+                        ).getOrThrow()
+                val original = Transport.findDestination(destination.hash)!!
+                repeat(2) {
+                    backend.shutdown().getOrThrow()
+                    org.junit.Assert.assertNull(Transport.findDestination(destination.hash))
+                    backend.initialize(config).getOrThrow()
+                    assertEquals(network.columba.app.rns.api.model.NetworkStatus.READY, backend.networkStatus.value)
+                    val restored = Transport.findDestination(destination.hash)!!
+                    org.junit.Assert.assertNotSame(original, restored)
+                    val received = async(start = CoroutineStart.UNDISPATCHED) { backend.observePackets().first() }
+                    restored.packetCallback!!.invoke(byteArrayOf(4, 5), Unit)
+                    assertArrayEquals(byteArrayOf(4, 5), received.await().data)
+                    assertEquals(destination, received.await().destination)
+                }
+                backend.shutdown().getOrThrow()
+                backend
+                    .initialize(
+                        config.copy(
+                            deliveryIdentityKey =
+                                network.reticulum.identity.Identity
+                                    .create()
+                                    .getPrivateKey(),
+                        ),
+                    ).getOrThrow()
+                org.junit.Assert.assertNull(Transport.findDestination(destination.hash))
+            } finally {
+                backend.shutdown().getOrThrow()
+                directory.deleteRecursively()
+            }
+        }
+
+    @Test
     fun `announce and send use the requested destination and real packet`() =
         runTest {
             val native =

@@ -9,7 +9,11 @@ import kotlinx.coroutines.flow.drop
 import kotlinx.coroutines.flow.filterNotNull
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flatMapLatest
+import kotlinx.coroutines.flow.flowOf
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import network.columba.app.rns.api.RnsBackend
 import network.columba.app.rns.api.RnsCore
 import network.columba.app.rns.api.RnsError
@@ -28,6 +32,8 @@ import network.columba.app.rns.api.model.PacketReceipt
 import network.columba.app.rns.api.model.PacketType
 import network.columba.app.rns.api.model.ReceivedPacket
 import network.columba.app.rns.api.model.ReticulumConfig
+import network.columba.app.rns.api.util.AppDestinationRegistry
+import network.columba.app.rns.api.util.toHex
 
 /**
  * UI-side proxy that delegates every [RnsCore] member to the currently-bound
@@ -44,6 +50,34 @@ internal class BoundRnsCore(
     private val backendFlow: StateFlow<RnsBackend?>,
     scope: CoroutineScope,
 ) : RnsCore {
+    private val destinationLifecycle = Mutex()
+    private val appDestinations = AppDestinationRegistry()
+
+    // Lives in the UI process, so this intent survives replacement of :reticulum.
+    // The backend also retains intent for restarts that keep the same process.
+    private suspend fun restoreDestinations(backend: RnsBackend): Result<Unit> =
+        destinationLifecycle.withLock {
+            runCatching {
+                appDestinations.activateOwner(
+                    backend.lxmf
+                        .getLxmfIdentity()
+                        .getOrThrow()
+                        .hash
+                        .toHex(),
+                )
+                appDestinations.registrations().forEach { destination ->
+                    backend.core
+                        .createDestination(
+                            destination.identity,
+                            destination.direction,
+                            destination.type,
+                            destination.appName,
+                            destination.aspects,
+                        ).getOrThrow()
+                }
+            }
+        }
+
     private suspend fun awaitBound(): RnsBackend = backendFlow.filterNotNull().first()
 
     /**
@@ -52,8 +86,7 @@ internal class BoundRnsCore(
      * out to be a dead binder — we need to wait for a fresh
      * `onServiceConnected`, not re-take the same stale reference.
      */
-    private suspend fun awaitNextFreshBound(): RnsBackend =
-        backendFlow.drop(1).filterNotNull().first()
+    private suspend fun awaitNextFreshBound(): RnsBackend = backendFlow.drop(1).filterNotNull().first()
 
     /**
      * Resilient initialize that survives an `onServiceDisconnected` race during
@@ -74,12 +107,17 @@ internal class BoundRnsCore(
      * sequence's Step 7 `startForegroundService(ACTION_START)` triggered.
      */
     override suspend fun initialize(config: ReticulumConfig): Result<Unit> {
-        val first = awaitBound().core.initialize(config)
+        var backend = awaitBound()
+        val first = backend.core.initialize(config)
         val firstError = first.exceptionOrNull()
         if (firstError is RnsException && firstError.error is RnsError.BackendNotReady) {
-            return awaitNextFreshBound().core.initialize(config)
+            backend = awaitNextFreshBound()
+            val retried = backend.core.initialize(config)
+            if (retried.isFailure) return retried
+        } else if (first.isFailure) {
+            return first
         }
-        return first
+        return restoreDestinations(backend)
     }
 
     override suspend fun shutdown(): Result<Unit> = awaitBound().core.shutdown()
@@ -87,34 +125,49 @@ internal class BoundRnsCore(
     @OptIn(ExperimentalCoroutinesApi::class)
     override val networkStatus: StateFlow<NetworkStatus> =
         backendFlow
-            .filterNotNull()
-            .flatMapLatest { it.core.networkStatus }
-            .stateIn(scope, SharingStarted.Eagerly, NetworkStatus.INITIALIZING)
+            .flatMapLatest { backend ->
+                if (backend == null) {
+                    flowOf(NetworkStatus.SHUTDOWN)
+                } else {
+                    backend.core.networkStatus.map { status ->
+                        if (status == NetworkStatus.READY) {
+                            restoreDestinations(backend).fold(
+                                onSuccess = { NetworkStatus.READY },
+                                onFailure = { NetworkStatus.ERROR("Destination restoration failed: ${it.message}") },
+                            )
+                        } else {
+                            status
+                        }
+                    }
+                }
+            }.stateIn(scope, SharingStarted.Eagerly, NetworkStatus.INITIALIZING)
 
     override suspend fun createIdentity(): Result<Identity> = awaitBound().core.createIdentity()
 
-    override suspend fun loadIdentity(path: String): Result<Identity> =
-        awaitBound().core.loadIdentity(path)
+    override suspend fun loadIdentity(path: String): Result<Identity> = awaitBound().core.loadIdentity(path)
 
-    override suspend fun saveIdentity(identity: Identity, path: String): Result<Unit> =
-        awaitBound().core.saveIdentity(identity, path)
+    override suspend fun saveIdentity(
+        identity: Identity,
+        path: String,
+    ): Result<Unit> = awaitBound().core.saveIdentity(identity, path)
 
-    override suspend fun recallIdentity(hash: ByteArray): Identity? =
-        awaitBound().core.recallIdentity(hash)
+    override suspend fun recallIdentity(hash: ByteArray): Identity? = awaitBound().core.recallIdentity(hash)
 
-    override suspend fun createIdentityWithName(displayName: String): Map<String, Any> =
-        awaitBound().core.createIdentityWithName(displayName)
+    override suspend fun createIdentityWithName(displayName: String): Map<String, Any> = awaitBound().core.createIdentityWithName(displayName)
 
-    override suspend fun importIdentityFile(fileData: ByteArray, displayName: String): Map<String, Any> =
-        awaitBound().core.importIdentityFile(fileData, displayName)
+    override suspend fun importIdentityFile(
+        fileData: ByteArray,
+        displayName: String,
+    ): Map<String, Any> = awaitBound().core.importIdentityFile(fileData, displayName)
 
-    override suspend fun exportIdentityFile(keyData: ByteArray, filePath: String): ByteArray =
-        awaitBound().core.exportIdentityFile(keyData, filePath)
+    override suspend fun exportIdentityFile(
+        keyData: ByteArray,
+        filePath: String,
+    ): ByteArray = awaitBound().core.exportIdentityFile(keyData, filePath)
 
     override suspend fun getFullIdentityKey(): ByteArray? = awaitBound().core.getFullIdentityKey()
 
-    override suspend fun signWithIdentity(data: ByteArray): ByteArray? =
-        awaitBound().core.signWithIdentity(data)
+    override suspend fun signWithIdentity(data: ByteArray): ByteArray? = awaitBound().core.signWithIdentity(data)
 
     override suspend fun createDestination(
         identity: Identity,
@@ -123,7 +176,22 @@ internal class BoundRnsCore(
         appName: String,
         aspects: List<String>,
     ): Result<Destination> =
-        awaitBound().core.createDestination(identity, direction, type, appName, aspects)
+        destinationLifecycle.withLock {
+            val backend = awaitBound()
+            runCatching {
+                appDestinations.activateOwner(
+                    backend.lxmf
+                        .getLxmfIdentity()
+                        .getOrThrow()
+                        .hash
+                        .toHex(),
+                )
+                backend.core
+                    .createDestination(identity, direction, type, appName, aspects)
+                    .getOrThrow()
+                    .also(appDestinations::remember)
+            }
+        }
 
     override suspend fun announceDestination(destination: Destination, appData: ByteArray?): Result<Unit> =
         awaitBound().core.announceDestination(destination, appData)
