@@ -26,6 +26,7 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import network.columba.app.ui.components.CollapsibleSettingsCard
+import network.columba.app.util.DestinationHashValidator
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -54,8 +55,12 @@ fun PositionReportCard(
 ) {
     val presetIntervals = listOf(1, 2, 5, 10)
     var gatewayField by remember(gatewayHash) { mutableStateOf(gatewayHash ?: "") }
-    val gatewayLooksValid = gatewayField.isEmpty() ||
-        (gatewayField.length % 2 == 0 && gatewayField.all { it.isDigit() || it.lowercaseChar() in "abcdef" })
+    // The app already has one answer to "is this a destination hash", used by
+    // the manual relay field and the nomadnet parser. A second, looser one here
+    // would let this card accept addresses the rest of the app calls invalid.
+    val validation = DestinationHashValidator.validate(gatewayField)
+    val gatewayIsValid = validation is DestinationHashValidator.ValidationResult.Valid
+    val gatewayError = (validation as? DestinationHashValidator.ValidationResult.Error)?.message
 
     CollapsibleSettingsCard(
         title = "Position Reporting",
@@ -133,19 +138,37 @@ fun PositionReportCard(
         OutlinedTextField(
             value = gatewayField,
             onValueChange = { entered ->
-                gatewayField = entered.trim().lowercase()
-                onGatewayChange(gatewayField)
+                // Filtered and capped rather than validated after the fact, so
+                // a stray character cannot be typed at all. Same treatment the
+                // manual relay field gives the same kind of value.
+                val filtered =
+                    entered
+                        .filter { it.isDigit() || it.lowercaseChar() in 'a'..'f' }
+                        .lowercase()
+                        .take(DestinationHashValidator.REQUIRED_LENGTH)
+                gatewayField = filtered
+                // Persisted only when it is a whole hash or nothing at all.
+                // Every write here restarts the reporting loop through
+                // collectLatest, and saving each keystroke meant 32 restarts
+                // and 32 DataStore writes to enter one gateway -- each one
+                // briefly pointing the loop at a prefix that addresses nothing.
+                if (filtered.isEmpty() || filtered.length == DestinationHashValidator.REQUIRED_LENGTH) {
+                    onGatewayChange(filtered)
+                }
             },
             label = { Text("Destination hash") },
             placeholder = { Text("32 hex characters") },
             singleLine = true,
-            isError = !gatewayLooksValid,
+            isError = gatewayField.isNotEmpty() && !gatewayIsValid,
             supportingText = {
                 Text(
                     text =
                         when {
-                            !gatewayLooksValid -> "Not hexadecimal"
                             gatewayField.isEmpty() -> "Nothing is sent until a gateway is set"
+                            // Says which of the two things is wrong, and how
+                            // far off: "Hash must be 32 characters (got 12)"
+                            // rather than a flat "invalid".
+                            gatewayError != null -> gatewayError
                             else -> "Reports go only here, not to the whole mesh"
                         },
                 )
@@ -170,7 +193,7 @@ fun PositionReportCard(
             Spacer(modifier = Modifier.height(8.dp))
             OutlinedButton(
                 onClick = onReportNow,
-                enabled = enabled && gatewayField.isNotEmpty() && gatewayLooksValid,
+                enabled = enabled && gatewayIsValid,
                 modifier = Modifier.fillMaxWidth(),
             ) {
                 Text("Report position now")

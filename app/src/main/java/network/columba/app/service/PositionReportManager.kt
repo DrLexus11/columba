@@ -15,6 +15,8 @@ import network.columba.app.rns.api.RnsCore
 import network.columba.app.rns.api.model.Destination
 import network.columba.app.rns.api.model.DestinationType
 import network.columba.app.rns.api.model.Direction
+import network.columba.app.rns.api.util.hexToBytes
+import network.columba.app.util.DestinationHashValidator
 import network.columba.app.util.LocationPermissionManager
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
@@ -222,10 +224,26 @@ class PositionReportManager
             payload: ByteArray,
         ): Boolean =
             rnsCore.sendPacket(destination, payload).fold(
-                onSuccess = {
-                    Log.d(TAG, "Reported position, ${payload.size} bytes")
-                    settingsRepository.saveLastPositionReportTime(System.currentTimeMillis())
-                    true
+                onSuccess = { receipt ->
+                    when {
+                        // A success only says the call did not throw. Whether
+                        // the packet reached the transport is the receipt's
+                        // business: Python RNS returns False from Packet.send()
+                        // when it could not send, and the Kotlin backend's
+                        // sendPacket is still a stub that sends nothing at all.
+                        // Recording either as a report would put a timestamp in
+                        // the settings UI for a position that never left the
+                        // phone -- the one lie this feature must not tell.
+                        !receipt.delivered -> {
+                            Log.w(TAG, "Transport did not accept the position report")
+                            false
+                        }
+                        else -> {
+                            Log.d(TAG, "Reported position, ${payload.size} bytes")
+                            settingsRepository.saveLastPositionReportTime(System.currentTimeMillis())
+                            true
+                        }
+                    }
                 },
                 onFailure = { error ->
                     Log.e(TAG, "Position report failed: ${error.message}")
@@ -327,25 +345,31 @@ class PositionReportManager
                 }
         }
 
+        /**
+         * The gateway hash as bytes, or null if it is not a destination hash.
+         *
+         * Exactly 16 bytes, not merely an even number of them, and the same
+         * rule the rest of the app applies -- a short hash is not a near miss,
+         * it addresses nothing, so a report built on one is discarded somewhere
+         * further down where the reason is much harder to see. The card refuses
+         * these now, but this setting is also written directly by the debug
+         * harness and by anything restored from an older install.
+         */
         private fun decodeHash(hash: String): ByteArray? {
+            // Reticulum writes destination hashes as <hex> in its own logs and
+            // people paste them back with the brackets attached.
             val cleaned = hash.trim().removePrefix("<").removeSuffix(">")
-            if (cleaned.length % 2 != 0 || cleaned.isEmpty()) return null
-            return try {
-                ByteArray(cleaned.length / 2) { index ->
-                    cleaned.substring(index * 2, index * 2 + 2).toInt(16).toByte()
+            return when (val result = DestinationHashValidator.validate(cleaned)) {
+                is DestinationHashValidator.ValidationResult.Error -> {
+                    Log.w(TAG, "Gateway hash rejected: ${result.message}")
+                    null
                 }
-            } catch (e: NumberFormatException) {
-                Log.w(TAG, "Gateway hash is not hex", e)
-                null
+                // Validated as 32 hex characters, so this cannot throw.
+                is DestinationHashValidator.ValidationResult.Valid ->
+                    result.normalizedHash.hexToBytes()
             }
         }
 
-        /**
-         * One location, or null. Wraps the callback API so the loop above reads
-         * as a sequence rather than a nest, and cancels the request if the
-         * coroutine is cancelled -- otherwise a settings change during a fix
-         * would leave the provider holding a callback into a dead scope.
-         */
         /**
          * The best fix available, by whichever route this device actually has.
          *
@@ -398,6 +422,12 @@ class PositionReportManager
             }
         }
 
+        /**
+         * One location, or null. Wraps the callback API so the caller reads as
+         * a sequence rather than a nest, and cancels the request if the
+         * coroutine is cancelled -- otherwise a settings change during a fix
+         * would leave the provider holding a callback into a dead scope.
+         */
         private suspend fun requestCurrentLocation(): Location? =
             suspendCancellableCoroutine { continuation ->
                 val signal = CancellationSignal()
