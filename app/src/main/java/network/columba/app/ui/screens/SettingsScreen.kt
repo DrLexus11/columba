@@ -386,6 +386,8 @@ fun SettingsScreen(
                     },
                 )
 
+                network.columba.app.ui.screens.settings.cards.TaskCard()
+
                 PositionReportCard(
                     isExpanded = state.cardExpansionStates[SettingsCardId.POSITION_REPORT.name] ?: false,
                     onExpandedChange = { viewModel.toggleCardExpanded(SettingsCardId.POSITION_REPORT, it) },

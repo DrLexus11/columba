@@ -16,6 +16,8 @@ import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import network.columba.app.rns.api.model.AnnounceEvent
 import network.columba.app.rns.api.model.BatteryProfile
@@ -44,6 +46,7 @@ import network.columba.app.rns.api.model.ReceivedPacket
 import network.columba.app.rns.api.model.ReticulumConfig
 import network.columba.app.rns.api.model.VoiceCallState
 import network.columba.app.rns.api.util.AppDataParser
+import network.columba.app.rns.api.util.AppDestinationRegistry
 import network.columba.app.rns.api.util.Aspects
 import network.columba.app.rns.api.util.LxmfFields
 import network.columba.app.rns.api.util.ReactionWireCodec
@@ -566,125 +569,144 @@ class NativeRnsBackendImpl(
         reticulumDatabase = null
     }
 
+    private val destinationLifecycle = Mutex()
+    private val appDestinations = AppDestinationRegistry()
+
+    private fun restoreAppDestinations(identity: NativeIdentity) {
+        appDestinations.activateOwner(identity.hash.toHex())
+        appDestinations.registrations().forEach { destination ->
+            registerDestination(
+                destination.identity,
+                destination.direction,
+                destination.type,
+                destination.appName,
+                destination.aspects,
+            )
+        }
+    }
+
     override suspend fun initialize(config: ReticulumConfig): Result<Unit> =
-        withContext(Dispatchers.IO) {
-            runCatching {
-                _networkStatus.value = NetworkStatus.INITIALIZING
-                // Cancel any coroutines from a previous init cycle before replacing the scope.
-                // Otherwise doze-state/battery-monitor observers and orphaned launches from a
-                // (possibly failed-partway) prior initialize() stay alive and emit stale state
-                // once the fresh initialize() installs a new scope.
-                scope.cancel()
-                scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
-                storagePath = config.storagePath
-                lastConfig = config
-                selectedBatteryProfile = config.batteryProfile
-                dozeThrottleMultiplier = 1.0f
-                Log.i(TAG, "Initializing native Reticulum stack")
+        destinationLifecycle.withLock {
+            withContext(Dispatchers.IO) {
+                runCatching {
+                    _networkStatus.value = NetworkStatus.INITIALIZING
+                    // Cancel any coroutines from a previous init cycle before replacing the scope.
+                    // Otherwise doze-state/battery-monitor observers and orphaned launches from a
+                    // (possibly failed-partway) prior initialize() stay alive and emit stale state
+                    // once the fresh initialize() installs a new scope.
+                    scope.cancel()
+                    scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+                    storagePath = config.storagePath
+                    lastConfig = config
+                    selectedBatteryProfile = config.batteryProfile
+                    dozeThrottleMultiplier = 1.0f
+                    Log.i(TAG, "Initializing native Reticulum stack")
 
-                warnIfOtherRnsInstance(config)
+                    warnIfOtherRnsInstance(config)
 
-                initializePersistentStores(config.storagePath)
+                    initializePersistentStores(config.storagePath)
 
-                // Start Reticulum with a fresh in-memory transport identity so the
-                // node-level RPC private key never touches disk. Transport identity
-                // continuity across app restarts isn't load-bearing on a phone client
-                // (unlike a fixed-location relay where established paths matter).
-                // Passing an override also triggers reticulum-kt to scrub and delete
-                // any stale $storagePath/transport_identity left from a prior run.
-                reticulum =
-                    Reticulum.start(
-                        configDir = config.storagePath,
-                        enableTransport = config.enableTransport,
-                        transportIdentity = NativeIdentity.create(),
-                    )
+                    // Start Reticulum with a fresh in-memory transport identity so the
+                    // node-level RPC private key never touches disk. Transport identity
+                    // continuity across app restarts isn't load-bearing on a phone client
+                    // (unlike a fixed-location relay where established paths matter).
+                    // Passing an override also triggers reticulum-kt to scrub and delete
+                    // any stale $storagePath/transport_identity left from a prior run.
+                    reticulum =
+                        Reticulum.start(
+                            configDir = config.storagePath,
+                            enableTransport = config.enableTransport,
+                            transportIdentity = NativeIdentity.create(),
+                        )
 
-                val identity = initializeRouter(config)
-                // Key bytes are now inside NativeIdentity; drop them from the cached
-                // config so each setBatteryProfile copy doesn't carry the key for the
-                // session. Shortens the in-memory lifetime of the raw key material.
-                lastConfig = lastConfig?.copy(deliveryIdentityKey = null)
+                    val identity = initializeRouter(config)
+                    restoreAppDestinations(identity)
+                    // Key bytes are now inside NativeIdentity; drop them from the cached
+                    // config so each setBatteryProfile copy doesn't carry the key for the
+                    // session. Shortens the in-memory lifetime of the raw key material.
+                    lastConfig = lastConfig?.copy(deliveryIdentityKey = null)
 
-                // Create and register network interfaces from config.
-                // The factory owns its own process-lifetime scope internally;
-                // we no longer assign one here (previously led to a stale
-                // cancelled scope between shutdown → next initialize cycles,
-                // silently dropping subsequent interface-toggle attempts).
-                NativeInterfaceFactory.appContext = appContext
-                NativeInterfaceFactory.rnodeHostBridge = rnodeHostBridge
-                NativeInterfaceFactory.addListener(interfaceFactoryListener)
-                NativeInterfaceFactory.syncInterfaces(config.enabledInterfaces)
+                    // Create and register network interfaces from config.
+                    // The factory owns its own process-lifetime scope internally;
+                    // we no longer assign one here (previously led to a stale
+                    // cancelled scope between shutdown → next initialize cycles,
+                    // silently dropping subsequent interface-toggle attempts).
+                    NativeInterfaceFactory.appContext = appContext
+                    NativeInterfaceFactory.rnodeHostBridge = rnodeHostBridge
+                    NativeInterfaceFactory.addListener(interfaceFactoryListener)
+                    NativeInterfaceFactory.syncInterfaces(config.enabledInterfaces)
 
-                // Register announce handlers for all relevant aspects
-                registerAnnounceHandlers()
+                    // Register announce handlers for all relevant aspects
+                    registerAnnounceHandlers()
 
-                // Apply the IFAC-only autoconnect filter before starting the
-                // discovery listener so the filter is active from the first
-                // announce — otherwise a non-IFAC interface could race in and
-                // grab the slot before the user-facing screen has a chance to
-                // re-push the setting.
-                autoconnectIfacOnly = config.autoconnectIfacOnly
+                    // Apply the IFAC-only autoconnect filter before starting the
+                    // discovery listener so the filter is active from the first
+                    // announce — otherwise a non-IFAC interface could race in and
+                    // grab the slot before the user-facing screen has a chance to
+                    // re-push the setting.
+                    autoconnectIfacOnly = config.autoconnectIfacOnly
 
-                // Wire up interface discovery if configured
-                if (config.discoverInterfaces) {
-                    startDiscovery(config)
+                    // Wire up interface discovery if configured
+                    if (config.discoverInterfaces) {
+                        startDiscovery(config)
+                    }
+
+                    // Start the router processing loop
+                    router!!.start()
+
+                    // Forward any propagation node hash that was set before the router existed
+                    // (PropagationNodeManager starts early and sets the relay before initialize)
+                    activePropagationNodeHash?.let { hash ->
+                        val hexHash = hash.toHex()
+                        val success = router!!.setActivePropagationNode(hexHash)
+                        Log.d(TAG, "Forwarded saved propagation node to router: ${hexHash.take(16)} (success=$success)")
+                    }
+
+                    if (appContext != null) {
+                        startBatteryMonitor()
+                        startDozeObserver()
+                    }
+
+                    applyBatteryProfileInternal()
+                    emitInterfaceSnapshotsAsync()
+
+                    // Set up native telephony (requires Context for AudioDevice/PacketRouter)
+                    if (appContext != null) {
+                        setupNativeTelephone(identity)
+                    } else {
+                        Log.w(TAG, "No appContext — skipping Telephone setup (unit test mode)")
+                    }
+
+                    _networkStatus.value = NetworkStatus.READY
+                    Log.i(TAG, "Native Reticulum stack initialized")
+                    Unit
+                }.onFailure { e ->
+                    Log.e(TAG, "Failed to initialize native Reticulum", e)
+                    NativeInterfaceFactory.removeListener(interfaceFactoryListener)
+                    batteryMonitor?.stop()
+                    batteryMonitor = null
+                    systemPowerSaveEnabled = false
+                    // Tear down anything that may have been brought up before the
+                    // failure point: interfaces registered by NativeInterfaceFactory
+                    // and the Reticulum Transport itself. Without this, a retry
+                    // would call Reticulum.start() on an already-running instance
+                    // and inherit stale interface state.
+                    try {
+                        NativeInterfaceFactory.shutdownAll()
+                    } catch (cleanupError: Exception) {
+                        Log.w(TAG, "Error shutting down interfaces during init failure cleanup", cleanupError)
+                    }
+                    try {
+                        Reticulum.stop()
+                    } catch (cleanupError: Exception) {
+                        Log.w(TAG, "Error stopping Reticulum during init failure cleanup", cleanupError)
+                    }
+                    closePersistentStores()
+                    // Cancel the scope we created at the top of initialize() so any
+                    // coroutines launched before the failure don't leak across retries.
+                    scope.cancel()
+                    _networkStatus.value = NetworkStatus.ERROR(e.message ?: "Unknown error")
                 }
-
-                // Start the router processing loop
-                router!!.start()
-
-                // Forward any propagation node hash that was set before the router existed
-                // (PropagationNodeManager starts early and sets the relay before initialize)
-                activePropagationNodeHash?.let { hash ->
-                    val hexHash = hash.toHex()
-                    val success = router!!.setActivePropagationNode(hexHash)
-                    Log.d(TAG, "Forwarded saved propagation node to router: ${hexHash.take(16)} (success=$success)")
-                }
-
-                if (appContext != null) {
-                    startBatteryMonitor()
-                    startDozeObserver()
-                }
-
-                applyBatteryProfileInternal()
-                emitInterfaceSnapshotsAsync()
-
-                // Set up native telephony (requires Context for AudioDevice/PacketRouter)
-                if (appContext != null) {
-                    setupNativeTelephone(identity)
-                } else {
-                    Log.w(TAG, "No appContext — skipping Telephone setup (unit test mode)")
-                }
-
-                _networkStatus.value = NetworkStatus.READY
-                Log.i(TAG, "Native Reticulum stack initialized")
-                Unit
-            }.onFailure { e ->
-                Log.e(TAG, "Failed to initialize native Reticulum", e)
-                NativeInterfaceFactory.removeListener(interfaceFactoryListener)
-                batteryMonitor?.stop()
-                batteryMonitor = null
-                systemPowerSaveEnabled = false
-                // Tear down anything that may have been brought up before the
-                // failure point: interfaces registered by NativeInterfaceFactory
-                // and the Reticulum Transport itself. Without this, a retry
-                // would call Reticulum.start() on an already-running instance
-                // and inherit stale interface state.
-                try {
-                    NativeInterfaceFactory.shutdownAll()
-                } catch (cleanupError: Exception) {
-                    Log.w(TAG, "Error shutting down interfaces during init failure cleanup", cleanupError)
-                }
-                try {
-                    Reticulum.stop()
-                } catch (cleanupError: Exception) {
-                    Log.w(TAG, "Error stopping Reticulum during init failure cleanup", cleanupError)
-                }
-                closePersistentStores()
-                // Cancel the scope we created at the top of initialize() so any
-                // coroutines launched before the failure don't leak across retries.
-                scope.cancel()
-                _networkStatus.value = NetworkStatus.ERROR(e.message ?: "Unknown error")
             }
         }
 
@@ -704,40 +726,47 @@ class NativeRnsBackendImpl(
     fun isInitialized(): Result<Boolean> = Result.success(_networkStatus.value is NetworkStatus.READY)
 
     override suspend fun shutdown(): Result<Unit> =
-        withContext(Dispatchers.IO) {
-            runCatching {
-                Log.i(TAG, "Shutting down native Reticulum stack")
-                _networkStatus.value = NetworkStatus.SHUTDOWN
-                callManager?.shutdown()
-                callManager = null
-                router?.stop()
-                dozeObserver?.stop()
-                dozeObserver = null
-                batteryMonitor?.stop()
-                batteryMonitor = null
-                systemPowerSaveEnabled = false
-                NativeInterfaceFactory.removeListener(interfaceFactoryListener)
-                NativeInterfaceFactory.shutdownAll()
-                Reticulum.stop()
-                closePersistentStores()
-                // stop() cancels only processingJob and deliberately keeps the
-                // process-lifetime SupervisorJob scope alive (LXMF-kt v0.0.7 fix
-                // for the processingScope silent-drop bug on restart). close()
-                // is the explicit teardown path for that scope on final shutdown.
-                router?.close()
-                router = null
-                reticulum = null
-                deliveryIdentity = null
-                deliveryDestination = null
-                // Drop the ReticulumConfig reference so the delivery-identity key bytes
-                // it carries (and any copies via setBatteryProfile) become GC-eligible.
-                // True in-memory zeroing isn't achievable on the JVM, but releasing the
-                // strong reference matches the key lifecycle care elsewhere in this flow.
-                lastConfig = null
-                Transport.customJobIntervalMs = null
-                Transport.customTablesCullIntervalMs = null
-                Transport.customAnnouncesCheckIntervalMs = null
-                scope.cancel()
+        destinationLifecycle.withLock {
+            withContext(Dispatchers.IO) {
+                runCatching {
+                    Log.i(TAG, "Shutting down native Reticulum stack")
+                    _networkStatus.value = NetworkStatus.SHUTDOWN
+                    callManager?.shutdown()
+                    callManager = null
+                    router?.stop()
+                    dozeObserver?.stop()
+                    dozeObserver = null
+                    batteryMonitor?.stop()
+                    batteryMonitor = null
+                    systemPowerSaveEnabled = false
+                    NativeInterfaceFactory.removeListener(interfaceFactoryListener)
+                    NativeInterfaceFactory.shutdownAll()
+                    Reticulum.stop()
+                    // Transport retains its destination table after stop. App callbacks
+                    // must not retain the stopped runtime or survive an account switch.
+                    appDestinations.registrations().filter { it.direction == Direction.IN }.forEach { destination ->
+                        Transport.findDestination(destination.hash)?.let(Transport::deregisterDestination)
+                    }
+                    closePersistentStores()
+                    // stop() cancels only processingJob and deliberately keeps the
+                    // process-lifetime SupervisorJob scope alive (LXMF-kt v0.0.7 fix
+                    // for the processingScope silent-drop bug on restart). close()
+                    // is the explicit teardown path for that scope on final shutdown.
+                    router?.close()
+                    router = null
+                    reticulum = null
+                    deliveryIdentity = null
+                    deliveryDestination = null
+                    // Drop the ReticulumConfig reference so the delivery-identity key bytes
+                    // it carries (and any copies via setBatteryProfile) become GC-eligible.
+                    // True in-memory zeroing isn't achievable on the JVM, but releasing the
+                    // strong reference matches the key lifecycle care elsewhere in this flow.
+                    lastConfig = null
+                    Transport.customJobIntervalMs = null
+                    Transport.customTablesCullIntervalMs = null
+                    Transport.customAnnouncesCheckIntervalMs = null
+                    scope.cancel()
+                }
             }
         }
 
@@ -1547,26 +1576,52 @@ class NativeRnsBackendImpl(
         appName: String,
         aspects: List<String>,
     ): Result<ColumbaDestination> =
-        withContext(Dispatchers.IO) {
-            runCatching {
-                val nativeIdentity = identity.toNative()
-                val nativeDir =
-                    when (direction) {
-                        Direction.IN -> DestinationDirection.IN
-                        Direction.OUT -> DestinationDirection.OUT
-                        else -> DestinationDirection.OUT
-                    }
-                val nativeType =
-                    when (type) {
-                        DestinationType.SINGLE -> NativeDestinationType.SINGLE
-                        DestinationType.GROUP -> NativeDestinationType.GROUP
-                        DestinationType.PLAIN -> NativeDestinationType.PLAIN
-                        else -> NativeDestinationType.SINGLE
-                    }
-                val dest = createNativeDestination(nativeIdentity, nativeDir, nativeType, appName, aspects)
-                dest.toColumba(identity)
+        destinationLifecycle.withLock {
+            withContext(Dispatchers.IO) {
+                runCatching {
+                    registerDestination(identity, direction, type, appName, aspects)
+                        .also(appDestinations::remember)
+                }
             }
         }
+
+    private fun registerDestination(
+        identity: ColumbaIdentity,
+        direction: Direction,
+        type: DestinationType,
+        appName: String,
+        aspects: List<String>,
+    ): ColumbaDestination {
+        val nativeIdentity = deliveryIdentity?.takeIf { it.hash.contentEquals(identity.hash) } ?: identity.toNative()
+        val nativeDir =
+            when (direction) {
+                Direction.IN -> DestinationDirection.IN
+                Direction.OUT -> DestinationDirection.OUT
+                else -> DestinationDirection.OUT
+            }
+        val nativeType =
+            when (type) {
+                DestinationType.SINGLE -> NativeDestinationType.SINGLE
+                DestinationType.GROUP -> NativeDestinationType.GROUP
+                DestinationType.PLAIN -> NativeDestinationType.PLAIN
+                else -> NativeDestinationType.SINGLE
+            }
+        val hash = NativeDestination.computeHash(appName, aspects, nativeIdentity.hash)
+        val dest =
+            if (direction == Direction.IN) {
+                Transport.findDestination(hash)
+                    ?: createNativeDestination(nativeIdentity, nativeDir, nativeType, appName, aspects)
+            } else {
+                createNativeDestination(nativeIdentity, nativeDir, nativeType, appName, aspects)
+            }
+        val model = dest.toColumba(identity)
+        if (direction == Direction.IN) {
+            dest.packetCallback = { data, _ ->
+                _packets.tryEmit(ReceivedPacket(data.copyOf(), model, null, System.currentTimeMillis(), null, null))
+            }
+        }
+        return model
+    }
 
     private fun announceLocalPeerDestinations(
         appData: ByteArray?,
@@ -1601,7 +1656,9 @@ class NativeRnsBackendImpl(
     ): Result<Unit> =
         withContext(Dispatchers.IO) {
             runCatching {
-                announceLocalPeerDestinations(appData, "announceDestination(${destination.hexHash.take(16)})")
+                val native = Transport.findDestination(destination.hash)
+                    ?: error("Destination is not registered: ${destination.hexHash}")
+                native.announce(appData)
                 Unit
             }
         }
@@ -1613,10 +1670,33 @@ class NativeRnsBackendImpl(
     ): Result<PacketReceipt> =
         withContext(Dispatchers.IO) {
             runCatching {
-                Log.d(TAG, "sendPacket: ${data.size} bytes to ${destination.hexHash.take(16)}")
+                require(packetType == PacketType.DATA) { "Only DATA packets are supported" }
+                // Re-derived as SINGLE below, so anything else must be refused
+                // here rather than silently sent with the wrong semantics.
+                // createDestination() does honour GROUP and PLAIN, so a caller
+                // can hold one of those legitimately and reach this point; the
+                // hash it derives would then not match and the failure arrived
+                // as "Destination hash mismatch", which says nothing about the
+                // actual cause. Mapping the type instead would be guessing:
+                // nothing in the app creates a non-SINGLE destination, so that
+                // path has never been exercised, and a GROUP destination keys
+                // on a shared secret rather than the identity used here.
+                require(destination.type == DestinationType.SINGLE) {
+                    "Only SINGLE destinations can be sent to, but this one is ${destination.type}"
+                }
+                val native = createNativeDestination(
+                    destination.identity.toNative(), DestinationDirection.OUT,
+                    NativeDestinationType.SINGLE, destination.appName, destination.aspects,
+                )
+                require(native.hash.contentEquals(destination.hash)) {
+                    "Destination hash mismatch: ${destination.hexHash} is not the SINGLE destination " +
+                        "derived from its own identity, app name and aspects"
+                }
+                val packet = network.reticulum.packet.Packet.create(native, data)
+                val receipt = packet.send()
                 PacketReceipt(
-                    hash = ByteArray(32),
-                    delivered = false,
+                    hash = packet.getHash(),
+                    delivered = receipt != null,
                     timestamp = System.currentTimeMillis(),
                 )
             }

@@ -36,6 +36,10 @@
                 <action android:name="network.columba.test.ASSERT_TIME" />
                 <action android:name="network.columba.test.SET_POS_GATEWAY" />
                 <action android:name="network.columba.test.REPORT_POSITION" />
+                <action android:name="network.columba.test.GET_TASK_KEY" />
+                <action android:name="network.columba.test.SET_TASK_AUTHORITY" />
+                <action android:name="network.columba.test.LIST_TASKS" />
+                <action android:name="network.columba.test.RESPOND_TASK" />
                 <action android:name="network.columba.test.LIST_INTERFACES" />
                 <action android:name="network.columba.test.DISABLE_ALL_INTERFACES" />
                 <action android:name="network.columba.test.DISABLE_INTERFACE" />

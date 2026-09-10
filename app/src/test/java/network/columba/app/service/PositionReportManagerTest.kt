@@ -6,6 +6,8 @@ import network.columba.app.repository.SettingsRepository
 import network.columba.app.rns.api.RnsCore
 import network.columba.app.rns.api.RnsLxmf
 import network.columba.app.rns.api.model.Destination
+import network.columba.app.rns.api.model.DestinationType
+import network.columba.app.rns.api.model.Direction
 import network.columba.app.rns.api.model.Identity
 import network.columba.app.rns.api.model.PacketReceipt
 import network.columba.app.util.LocationCompat
@@ -50,12 +52,32 @@ class PositionReportManagerTest {
     /** A real 32-character destination hash, the only shape now accepted. */
     private val gatewayHash = "a1b2c3d4e5f60718293a4b5c6d7e8f90"
 
+    // Plain data classes, so real ones rather than mocks.
+    private val gatewayIdentity = Identity(ByteArray(16) { 0x0a }, ByteArray(64) { 0x0b }, null)
+    private val gatewayDestination =
+        Destination(
+            hash = ByteArray(16) { 0x0a },
+            hexHash = gatewayHash,
+            identity = gatewayIdentity,
+            direction = Direction.OUT,
+            type = DestinationType.SINGLE,
+            appName = "rnstransport",
+            aspects = listOf("position", "report"),
+        )
+
+    // Context is the sanctioned exception: it is an Android system handle with
+    // far more surface than this test touches. Everything else is strict, so an
+    // unstubbed call means the manager changed rather than quietly returning a
+    // default.
+    @Suppress("NoRelaxedMocks")
     @Before
     fun setUp() {
         context = mockk(relaxed = true)
-        settingsRepository = mockk(relaxed = true)
-        rnsCore = mockk(relaxed = true)
-        rnsLxmf = mockk(relaxed = true)
+        settingsRepository = mockk()
+        rnsCore = mockk()
+        rnsLxmf = mockk()
+        coEvery { settingsRepository.saveLastPositionReportTime(any()) } returns Unit
+        coEvery { rnsCore.requestPath(any()) } returns Result.success(Unit)
 
         // Both are objects reached statically from inside the manager.
         mockkObject(LocationCompat)
@@ -74,10 +96,10 @@ class PositionReportManagerTest {
         // gateway already handles and keeps this test off that path.
         coEvery { rnsLxmf.getLxmfIdentity() } returns Result.failure(IllegalStateException("no identity"))
         coEvery { rnsCore.hasPath(any()) } returns true
-        coEvery { rnsCore.recallIdentity(any()) } returns mockk<Identity>(relaxed = true)
+        coEvery { rnsCore.recallIdentity(any()) } returns gatewayIdentity
         coEvery {
             rnsCore.createDestination(any(), any(), any(), any(), any())
-        } returns Result.success(mockk<Destination>(relaxed = true))
+        } returns Result.success(gatewayDestination)
     }
 
     @After
@@ -94,7 +116,15 @@ class PositionReportManagerTest {
             scope = CoroutineScope(testDispatcher),
         )
 
-    /** A fix from now, so the age check in freshLocation() lets it through. */
+    /**
+     * A fix from now, so the age check in freshLocation() lets it through.
+     *
+     * Relaxed because Location is an Android framework type with a dozen
+     * accessors the codec probes (hasAccuracy, hasAltitude, hasBearing,
+     * hasSpeed and their getters); a real one is no use here, since with
+     * returnDefaultValues its time reads back as zero.
+     */
+    @Suppress("NoRelaxedMocks")
     private fun freshFix(): Location =
         mockk<Location>(relaxed = true) {
             every { time } returns System.currentTimeMillis()
@@ -188,6 +218,7 @@ class PositionReportManagerTest {
             assertTrue("brackets are punctuation, not part of the hash", reported)
         }
 
+    @Suppress("NoRelaxedMocks") // Location, as above.
     @Test
     fun `a stale fix is not reported`() =
         runTest {

@@ -3,12 +3,12 @@ package network.columba.app.rns.backend.py
 import android.util.Log
 import com.chaquo.python.PyObject
 import com.chaquo.python.Python
-import network.columba.app.rns.api.util.hexToBytes
-import network.columba.app.rns.api.util.toHex
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import network.columba.app.rns.api.RnsCore
 import network.columba.app.rns.api.RnsError
 import network.columba.app.rns.api.RnsException
@@ -27,6 +27,9 @@ import network.columba.app.rns.api.model.PacketReceipt
 import network.columba.app.rns.api.model.PacketType
 import network.columba.app.rns.api.model.ReceivedPacket
 import network.columba.app.rns.api.model.ReticulumConfig
+import network.columba.app.rns.api.util.AppDestinationRegistry
+import network.columba.app.rns.api.util.hexToBytes
+import network.columba.app.rns.api.util.toHex
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicLong
 
@@ -72,6 +75,9 @@ class PythonRnsCore(
         const val MIN_LINK_WAIT_MS = 1_000L
     }
 
+    private val destinationLifecycle = Mutex()
+    private val appDestinations = AppDestinationRegistry()
+
     private val _networkStatus = MutableStateFlow<NetworkStatus>(NetworkStatus.SHUTDOWN)
     override val networkStatus: StateFlow<NetworkStatus> = _networkStatus.asStateFlow()
 
@@ -89,34 +95,53 @@ class PythonRnsCore(
     // boundary must flip networkStatus to ERROR before re-throwing.
     @Suppress("TooGenericExceptionCaught")
     override suspend fun initialize(config: ReticulumConfig): Result<Unit> =
-        pyResult {
-            _networkStatus.value = NetworkStatus.INITIALIZING
-            try {
-                runtime.start(config)
-                // Attach the Kotlin event sinks now that the Reticulum
-                // instance + LXMRouter are live (event_bridge.register_callbacks
-                // needs both). This is the bridge from upstream RNS/LXMF
-                // callbacks into the same SharedFlows the kotlin backend uses.
-                runtime.wireEventBridge(
-                    onAnnounce = events.onAnnounce,
-                    onPacket = events.onPacket,
-                    onLinkEvent = events.onLinkEvent,
-                    onLxmfDelivery = events.onLxmfDelivery,
-                    onLxmfFailure = events.onLxmfFailure,
-                )
-                // LXST telephony setup is host-side: PythonCallManager
-                // observes this networkStatus flow and runs setup() on READY.
-                _networkStatus.value = NetworkStatus.READY
-            } catch (e: Throwable) {
-                _networkStatus.value = NetworkStatus.ERROR(e.message ?: "Python RNS init failed")
-                throw e
+        destinationLifecycle.withLock {
+            pyResult {
+                _networkStatus.value = NetworkStatus.INITIALIZING
+                try {
+                    runtime.start(config)
+                    // Attach the Kotlin event sinks now that the Reticulum
+                    // instance + LXMRouter are live (event_bridge.register_callbacks
+                    // needs both). This is the bridge from upstream RNS/LXMF
+                    // callbacks into the same SharedFlows the kotlin backend uses.
+                    runtime.wireEventBridge(
+                        onAnnounce = events.onAnnounce,
+                        onPacket = events.onPacket,
+                        onLinkEvent = events.onLinkEvent,
+                        onLxmfDelivery = events.onLxmfDelivery,
+                        onLxmfFailure = events.onLxmfFailure,
+                    )
+                    // LXST telephony setup is host-side: PythonCallManager
+                    // observes this networkStatus flow and runs setup() on READY.
+                    val owner =
+                        checkNotNull(runtime.localIdentity?.get("hash"))
+                            .toJava(ByteArray::class.java)
+                            .toHex()
+                    appDestinations.activateOwner(owner)
+                    appDestinations.registrations().forEach { destination ->
+                        registerDestination(
+                            destination.identity,
+                            destination.direction,
+                            destination.type,
+                            destination.appName,
+                            destination.aspects,
+                        )
+                    }
+                    _networkStatus.value = NetworkStatus.READY
+                } catch (e: Throwable) {
+                    runCatching { runtime.stop() }.onFailure { Log.w(TAG, "Failed to clean up RNS initialization", it) }
+                    _networkStatus.value = NetworkStatus.ERROR(e.message ?: "Python RNS init failed")
+                    throw e
+                }
             }
         }
 
     override suspend fun shutdown(): Result<Unit> =
-        pyResult {
-            runtime.stop()
-            _networkStatus.value = NetworkStatus.SHUTDOWN
+        destinationLifecycle.withLock {
+            pyResult {
+                runtime.stop()
+                _networkStatus.value = NetworkStatus.SHUTDOWN
+            }
         }
 
     // ==================== Identity management ====================
@@ -250,9 +275,6 @@ class PythonRnsCore(
 
     // ==================== Destination management ====================
 
-    // Spread is required: RNS.Destination(identity, dir, type, app_name, *aspects)
-    // is variadic in `aspects`, whose count is only known at runtime.
-    @Suppress("SpreadOperator")
     override suspend fun createDestination(
         identity: Identity,
         direction: Direction,
@@ -260,22 +282,56 @@ class PythonRnsCore(
         appName: String,
         aspects: List<String>,
     ): Result<Destination> =
-        pyResult {
-            val destClass = runtime.rnsModule["Destination"] ?: error("RNS.Destination missing")
-            val pyIdentity = resolveIdentity(identity)
-            // RNS.Destination(identity, direction, type, app_name, *aspects)
-            val args = buildList<Any> {
+        destinationLifecycle.withLock {
+            pyResult {
+                runtime.requireRunning()
+                registerDestination(identity, direction, type, appName, aspects)
+                    .also(appDestinations::remember)
+            }
+        }
+
+    // RNS.Destination takes a variadic aspect list.
+    @Suppress("SpreadOperator")
+    private fun registerDestination(
+        identity: Identity,
+        direction: Direction,
+        type: DestinationType,
+        appName: String,
+        aspects: List<String>,
+    ): Destination {
+        val destClass = runtime.rnsModule["Destination"] ?: error("RNS.Destination missing")
+        val pyIdentity = resolveIdentity(identity)
+        // RNS.Destination(identity, direction, type, app_name, *aspects)
+        val args =
+            buildList<Any> {
                 add(pyIdentity)
                 add(destClass[directionConst(direction)] ?: error("bad direction"))
                 add(destClass[typeConst(type)] ?: error("bad dest type"))
                 add(appName)
                 addAll(aspects)
             }
-            val pyDest = runtime.rnsModule.callAttr("Destination", *args.toTypedArray())
-            val model = pyDest.toModelDestination(identity, direction, type, appName, aspects)
-            runtime.destinations[model.hexHash] = pyDest
-            model
+        val hash =
+            destClass
+                .callAttr("hash", pyIdentity, appName, *aspects.toTypedArray())
+                .toJava(ByteArray::class.java)
+                .toHex()
+        val pyDest =
+            runtime.destinations[hash]
+                ?: runtime.rnsModule.callAttr("Destination", *args.toTypedArray())
+        val model = pyDest.toModelDestination(identity, direction, type, appName, aspects)
+        runtime.destinations[model.hexHash] = pyDest
+        if (direction == Direction.IN) {
+            val callback =
+                PyEventCallback { payload ->
+                    events.publishPacket(model, payload.toJava(ByteArray::class.java))
+                }
+            pyDest.callAttr(
+                "set_packet_callback",
+                runtime.eventBridge.callAttr("make_link_packet_handler", callback),
+            )
         }
+        return model
+    }
 
     override suspend fun announceDestination(destination: Destination, appData: ByteArray?): Result<Unit> =
         pyResult {
@@ -1430,10 +1486,24 @@ class PythonRnsCore(
     private fun resolveIdentity(identity: Identity): PyObject {
         runtime.identities[identity.hash.toHex()]?.let { return it }
         val identityClass = runtime.rnsModule["Identity"] ?: error("RNS.Identity missing")
-        val key = identity.privateKey
+        identity.privateKey?.let { key ->
+            return identityClass.callAttr("from_bytes", key.toPyBytes())
+                .also { runtime.identities[identity.hash.toHex()] = it }
+        }
+        // A peer known only by its public key still needs to be addressable.
+        // An OUT destination encrypts to that peer and never signs as it, so
+        // the public half is sufficient -- and for a key pinned by hand it is
+        // the only half that exists. Without this an addressed reply fails as
+        // "Identity not found", which reads as a missing peer rather than as
+        // a backend that cannot express one. The native backend already falls
+        // back to fromPublicKey() here; this brings the two into line.
+        val publicKey = identity.publicKey.takeIf { it.isNotEmpty() }
             ?: throw RnsException(RnsError.IdentityNotFound(identity.hash.toHex()))
-        return identityClass.callAttr("from_bytes", key.toPyBytes())
-            .also { runtime.identities[identity.hash.toHex()] = it }
+        // Deliberately not cached: the cache is keyed by hash and shared with
+        // callers that must sign, and a verify-only entry would deny them the
+        // private half for the rest of the process.
+        return runtime.eventBridge.callAttr("identity_from_public_key", publicKey.toPyBytes())
+            ?: throw RnsException(RnsError.IdentityNotFound(identity.hash.toHex()))
     }
 
     /** `RNS.Identity` PyObject -> model. `.hash` is an attribute; keys are getters. */

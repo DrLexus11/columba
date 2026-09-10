@@ -9,7 +9,7 @@ import network.columba.app.rns.api.model.DeliveryMethod
 
 /**
  * Debug-only BroadcastReceiver that exposes the [TestController] surface
- * to `adb shell am broadcast`. All 17 manifest actions are routed; see
+ * to `adb shell am broadcast`. All manifest actions are routed; see
  * the `when` block below.
  *
  * Action contract (one action per row; reply lines under
@@ -41,6 +41,11 @@ import network.columba.app.rns.api.model.DeliveryMethod
  *   network.columba.test.ASSERT_TIME                  -> time_asserted identity=<hex> | time_assert_err …
  *   network.columba.test.SET_POS_GATEWAY    --es hex  -> pos_gateway_set hex=<…> enabled=true | pos_gateway_err …
  *   network.columba.test.REPORT_POSITION              -> pos_reported | pos_report_err reason=not_sent
+ *   network.columba.test.GET_TASK_KEY                 -> task_key owner=<hex> public=<hex> authority=<hex|unset> | task_key_err reason=not_ready
+ *   network.columba.test.SET_TASK_AUTHORITY --es hex  -> task_authority_set owner=<hex> authority=<hex|unset> | task_authority_err …
+ *                                                        ("clear" as the hex un-trusts the current authority)
+ *   network.columba.test.LIST_TASKS                   -> N×task lines + task_list_done count=N owner=<hex>
+ *   network.columba.test.RESPOND_TASK   --es id,decision -> task_decided id=<hex> status=<2|3> | task_respond_err …
  *   network.columba.test.LIST_INTERFACES              -> N×interface lines + interface_list_done count=N
  *   network.columba.test.DISABLE_ALL_INTERFACES       -> interfaces_disabled count=N applied=true
  *   network.columba.test.DISABLE_INTERFACE  --es name -> interface_disabled name=<…> id=<n> applied=true
@@ -228,6 +233,34 @@ class TestReceiver : BroadcastReceiver() {
 
             "network.columba.test.REPORT_POSITION" ->
                 TestController.handleReportPosition(app)
+
+            "network.columba.test.GET_TASK_KEY" ->
+                TestController.handleGetTaskKey(app)
+
+            "network.columba.test.SET_TASK_AUTHORITY" -> {
+                val hex = intent.getStringExtra("hex") ?: ""
+                if (hex.isEmpty()) {
+                    Log.i(TestController.LOGCAT_TAG, "task_authority_err reason=missing_hex")
+                } else {
+                    TestController.handleSetTaskAuthority(app, hex)
+                }
+            }
+
+            "network.columba.test.LIST_TASKS" ->
+                TestController.handleListTasks(app)
+
+            "network.columba.test.RESPOND_TASK" -> {
+                val id = intent.getStringExtra("id") ?: ""
+                val decision = intent.getStringExtra("decision") ?: ""
+                if (id.isEmpty() || decision.isEmpty()) {
+                    Log.i(
+                        TestController.LOGCAT_TAG,
+                        "task_respond_err reason=missing_args id=$id decision=$decision",
+                    )
+                } else {
+                    TestController.handleRespondTask(app, id, decision)
+                }
+            }
 
             "network.columba.test.LIST_INTERFACES" ->
                 TestController.handleListInterfaces(app)

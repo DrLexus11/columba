@@ -802,6 +802,22 @@ _collected_telemetry = {}
 _collector_allowed_requesters = set()
 
 
+def identity_from_public_key(public_key):
+    """Build a verify-only RNS identity from a peer's public key.
+
+    An OUT destination addressed to a remote peer encrypts to that peer and
+    never signs as it, so the public half is all it needs. RNS.Identity has
+    no constructor for this: from_bytes() loads a *private* key and recall()
+    only finds identities this node has already heard announce. A peer whose
+    key was pinned by hand -- a task authority, for instance -- has neither,
+    so it is built keyless and given the public half directly.
+    """
+    import RNS
+    identity = RNS.Identity(create_keys=False)
+    identity.load_public_key(bytes(public_key))
+    return identity
+
+
 def _local_lxmf_destination():
     """Return the host's local LXMF delivery `RNS.Destination`, or None.
 
