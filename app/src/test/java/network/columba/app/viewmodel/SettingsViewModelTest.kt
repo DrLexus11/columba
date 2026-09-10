@@ -91,6 +91,10 @@ class SettingsViewModelTest {
     private val shareInstanceHostingEnabledFlow = MutableStateFlow(false)
     private val rpcKeyFlow = MutableStateFlow<String?>(null)
     private val autoAnnounceEnabledFlow = MutableStateFlow(true)
+    private val positionReportEnabledFlow = MutableStateFlow(false)
+    private val positionReportIntervalMinutesFlow = MutableStateFlow(1)
+    private val positionGatewayHashFlow = MutableStateFlow<String?>(null)
+    private val lastPositionReportTimeFlow = MutableStateFlow<Long?>(null)
     private val timeAuthorityEnabledFlow = MutableStateFlow(false)
     private val timeAuthorityIntervalMinutesFlow = MutableStateFlow(30)
     private val lastTimeAssertionTimeFlow = MutableStateFlow<Long?>(null)
@@ -178,6 +182,12 @@ class SettingsViewModelTest {
         coEvery { settingsRepository.saveShareInstanceHostingEnabled(any()) } returns Unit
         every { settingsRepository.rpcKeyFlow } returns rpcKeyFlow
         every { settingsRepository.autoAnnounceEnabledFlow } returns autoAnnounceEnabledFlow
+        every { settingsRepository.positionReportEnabledFlow } returns positionReportEnabledFlow
+        every {
+            settingsRepository.positionReportIntervalMinutesFlow
+        } returns positionReportIntervalMinutesFlow
+        every { settingsRepository.positionGatewayHashFlow } returns positionGatewayHashFlow
+        every { settingsRepository.lastPositionReportTimeFlow } returns lastPositionReportTimeFlow
         every { settingsRepository.timeAuthorityEnabledFlow } returns timeAuthorityEnabledFlow
         every { settingsRepository.timeAuthorityIntervalMinutesFlow } returns timeAuthorityIntervalMinutesFlow
         every { settingsRepository.lastTimeAssertionTimeFlow } returns lastTimeAssertionTimeFlow
@@ -313,6 +323,7 @@ class SettingsViewModelTest {
             mapTileSourceManager = mapTileSourceManager,
             telemetryCollectorManager = telemetryCollectorManager,
             timeAuthorityManager = mockk(),
+            positionReportManager = mockk(),
             contactRepository = contactRepository,
             updateChecker = updateChecker,
             crashReportManager = crashReportManager,
@@ -1672,6 +1683,7 @@ class SettingsViewModelTest {
                     mapTileSourceManager = mapTileSourceManager,
                     telemetryCollectorManager = telemetryCollectorManager,
                     timeAuthorityManager = mockk(),
+                    positionReportManager = mockk(),
                     contactRepository = contactRepository,
                     updateChecker = updateChecker,
                     crashReportManager = crashReportManager,
@@ -1726,6 +1738,7 @@ class SettingsViewModelTest {
                     mapTileSourceManager = mapTileSourceManager,
                     telemetryCollectorManager = telemetryCollectorManager,
                     timeAuthorityManager = mockk(),
+                    positionReportManager = mockk(),
                     contactRepository = contactRepository,
                     updateChecker = updateChecker,
                     crashReportManager = crashReportManager,
@@ -2429,6 +2442,7 @@ class SettingsViewModelTest {
                     mapTileSourceManager = mapTileSourceManager,
                     telemetryCollectorManager = telemetryCollectorManager,
                     timeAuthorityManager = mockk(),
+                    positionReportManager = mockk(),
                     contactRepository = contactRepository,
                     updateChecker = updateChecker,
                     crashReportManager = crashReportManager,
@@ -2599,6 +2613,7 @@ class SettingsViewModelTest {
                     mapTileSourceManager = mapTileSourceManager,
                     telemetryCollectorManager = telemetryCollectorManager,
                     timeAuthorityManager = mockk(),
+                    positionReportManager = mockk(),
                     contactRepository = contactRepository,
                     updateChecker = updateChecker,
                     crashReportManager = crashReportManager,

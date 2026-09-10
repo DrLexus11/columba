@@ -8,7 +8,8 @@ package network.columba.app.util
  * - Case-insensitive (normalized to lowercase)
  */
 object DestinationHashValidator {
-    private const val REQUIRED_LENGTH = 32
+    /** 16 bytes, hex-encoded. Public so callers can filter and cap input to it. */
+    const val REQUIRED_LENGTH = 32
     private val HEX_PATTERN = Regex("^[a-fA-F0-9]{$REQUIRED_LENGTH}$")
 
     /**

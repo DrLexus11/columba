@@ -71,6 +71,7 @@ import network.columba.app.ui.screens.settings.cards.MapSourcesCard
 import network.columba.app.ui.screens.settings.cards.MessageDeliveryRetrievalCard
 import network.columba.app.ui.screens.settings.cards.NetworkCard
 import network.columba.app.ui.screens.settings.cards.NotificationSettingsCard
+import network.columba.app.ui.screens.settings.cards.PositionReportCard
 import network.columba.app.ui.screens.settings.cards.PrivacyCard
 import network.columba.app.ui.screens.settings.cards.RNodeFlasherCard
 import network.columba.app.ui.screens.settings.cards.ShareColumbaCard
@@ -383,6 +384,19 @@ fun SettingsScreen(
                         val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
                         clipboard.setPrimaryClip(ClipData.newPlainText("Time authority identity", hash))
                     },
+                )
+
+                PositionReportCard(
+                    isExpanded = state.cardExpansionStates[SettingsCardId.POSITION_REPORT.name] ?: false,
+                    onExpandedChange = { viewModel.toggleCardExpanded(SettingsCardId.POSITION_REPORT, it) },
+                    enabled = state.positionReportEnabled,
+                    intervalMinutes = state.positionReportIntervalMinutes,
+                    gatewayHash = state.positionGatewayHash,
+                    lastReportTime = state.lastPositionReportTime,
+                    onToggle = { viewModel.setPositionReportEnabled(it) },
+                    onIntervalChange = { viewModel.setPositionReportInterval(it) },
+                    onGatewayChange = { viewModel.setPositionGatewayHash(it) },
+                    onReportNow = { viewModel.reportPositionNow() },
                 )
 
                 LocationSharingCard(

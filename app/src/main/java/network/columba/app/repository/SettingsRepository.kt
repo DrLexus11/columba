@@ -80,6 +80,10 @@ class SettingsRepository
             val TIME_AUTHORITY_ENABLED = booleanPreferencesKey("time_authority_enabled")
             val TIME_AUTHORITY_INTERVAL_MINUTES = intPreferencesKey("time_authority_interval_minutes")
             val TIME_AUTHORITY_LAST_ASSERTION = longPreferencesKey("time_authority_last_assertion")
+            val POSITION_REPORT_ENABLED = booleanPreferencesKey("position_report_enabled")
+            val POSITION_REPORT_INTERVAL_MINUTES = intPreferencesKey("position_report_interval_minutes")
+            val POSITION_GATEWAY_HASH = stringPreferencesKey("position_gateway_hash")
+            val POSITION_REPORT_LAST = longPreferencesKey("position_report_last")
             val AUTO_ANNOUNCE_INTERVAL_MINUTES = intPreferencesKey("auto_announce_interval_minutes") // Legacy, for migration
             val AUTO_ANNOUNCE_INTERVAL_HOURS = intPreferencesKey("auto_announce_interval_hours")
             val LAST_AUTO_ANNOUNCE_TIME = longPreferencesKey("last_auto_announce_time")
@@ -646,6 +650,92 @@ class SettingsRepository
         suspend fun saveLastTimeAssertionTime(timestamp: Long) {
             context.dataStore.edit { preferences ->
                 preferences[PreferencesKeys.TIME_AUTHORITY_LAST_ASSERTION] = timestamp
+            }
+        }
+
+        /**
+         * Flow of whether this device reports its position to a CoT gateway.
+         *
+         * Defaults to false, and more emphatically than the time authority
+         * does. Time is a fact about the world that helps everyone who hears
+         * it; position is a fact about the person holding the phone. It is not
+         * something an app should begin emitting because it was installed.
+         */
+        val positionReportEnabledFlow: Flow<Boolean> =
+            context.dataStore.data
+                .map { preferences ->
+                    preferences[PreferencesKeys.POSITION_REPORT_ENABLED] ?: false
+                }.distinctUntilChanged()
+
+        /** Save whether this device reports its position. */
+        suspend fun savePositionReportEnabled(enabled: Boolean) {
+            context.dataStore.edit { preferences ->
+                preferences[PreferencesKeys.POSITION_REPORT_ENABLED] = enabled
+            }
+        }
+
+        /**
+         * Flow of the interval between position reports, in minutes.
+         *
+         * Defaults to 1. TAKCapability.md §2 measures ten nodes at one report a
+         * minute as inside the airtime budget and twenty-five as outside it, so
+         * this is a fleet-size decision rather than a preference.
+         */
+        val positionReportIntervalMinutesFlow: Flow<Int> =
+            context.dataStore.data
+                .map { preferences ->
+                    preferences[PreferencesKeys.POSITION_REPORT_INTERVAL_MINUTES] ?: 1
+                }.distinctUntilChanged()
+
+        /** Save the interval between position reports. */
+        suspend fun savePositionReportIntervalMinutes(minutes: Int) {
+            context.dataStore.edit { preferences ->
+                preferences[PreferencesKeys.POSITION_REPORT_INTERVAL_MINUTES] = minutes.coerceIn(1, 60)
+            }
+        }
+
+        /**
+         * Flow of the destination hash of the CoT gateway, as hex, or null.
+         *
+         * Null is the meaningful default: with no gateway the feature is inert
+         * even when enabled. A device that has not been told where to send its
+         * position must not pick somewhere.
+         */
+        val positionGatewayHashFlow: Flow<String?> =
+            context.dataStore.data
+                .map { preferences -> preferences[PreferencesKeys.POSITION_GATEWAY_HASH] }
+                .distinctUntilChanged()
+
+        /** The gateway hash right now, for a one-shot report. */
+        suspend fun currentPositionGatewayHash(): String? =
+            context.dataStore.data.first()[PreferencesKeys.POSITION_GATEWAY_HASH]
+
+        /** Save the CoT gateway destination hash. Blank clears it. */
+        suspend fun savePositionGatewayHash(hash: String) {
+            context.dataStore.edit { preferences ->
+                val cleaned = hash.trim().lowercase()
+                if (cleaned.isEmpty()) {
+                    preferences.remove(PreferencesKeys.POSITION_GATEWAY_HASH)
+                } else {
+                    preferences[PreferencesKeys.POSITION_GATEWAY_HASH] = cleaned
+                }
+            }
+        }
+
+        /**
+         * Flow of the last position report this device sent, or null. Shown in
+         * settings so an operator can see the feature doing something rather
+         * than trusting a toggle -- the same reason the time card shows it.
+         */
+        val lastPositionReportTimeFlow: Flow<Long?> =
+            context.dataStore.data
+                .map { preferences -> preferences[PreferencesKeys.POSITION_REPORT_LAST] }
+                .distinctUntilChanged()
+
+        /** Record that a report was sent at [timestamp]. */
+        suspend fun saveLastPositionReportTime(timestamp: Long) {
+            context.dataStore.edit { preferences ->
+                preferences[PreferencesKeys.POSITION_REPORT_LAST] = timestamp
             }
         }
 

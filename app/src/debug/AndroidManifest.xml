@@ -34,6 +34,8 @@
                 <action android:name="network.columba.test.RX_CLEAR" />
                 <action android:name="network.columba.test.ANNOUNCE" />
                 <action android:name="network.columba.test.ASSERT_TIME" />
+                <action android:name="network.columba.test.SET_POS_GATEWAY" />
+                <action android:name="network.columba.test.REPORT_POSITION" />
                 <action android:name="network.columba.test.LIST_INTERFACES" />
                 <action android:name="network.columba.test.DISABLE_ALL_INTERFACES" />
                 <action android:name="network.columba.test.DISABLE_INTERFACE" />

@@ -7,8 +7,18 @@
         into :app at assembly time; :app's own manifest no longer declares
         the service.
 
-        foregroundServiceType=connectedDevice|microphone covers BLE / USB
-        peripherals (connectedDevice) and LXST voice calls (microphone).
+        foregroundServiceType=connectedDevice|microphone|location covers BLE /
+        USB peripherals (connectedDevice), LXST voice calls (microphone), and
+        position reporting (location).
+
+        location is what lets a pocketed phone keep reporting. Without it
+        Android denies location to the app the moment it leaves the foreground,
+        so position reporting worked only with the app open on screen, which is
+        no use to somebody walking around with the handset in a pocket.
+
+        Declaring the type is not enough on its own: startForeground() must
+        also pass it, and only when the permission is actually granted. See
+        ServiceNotificationManager.startForeground().
     -->
     <application>
         <service
@@ -16,6 +26,6 @@
             android:enabled="true"
             android:exported="false"
             android:process=":reticulum"
-            android:foregroundServiceType="connectedDevice|microphone" />
+            android:foregroundServiceType="connectedDevice|microphone|location" />
     </application>
 </manifest>
