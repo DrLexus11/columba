@@ -70,6 +70,55 @@ class CotTier2Test {
     }
 
     @Test
+    fun `the frame bound matches the python side`() {
+        assertEquals(tier2.getInt("max_frame_bytes"), CotTier2.MAX_FRAME_BYTES)
+    }
+
+    @Test
+    fun `an event that cannot fit one packet is refused`() {
+        // A 5 KB ATAK drawing compresses to about 700 bytes -- inside
+        // MAX_DECOMPRESSED and nearly twice the MDU. Nothing checked it, so
+        // the frame reached Reticulum, which refuses it at the packet layer.
+        val drawing = buildString {
+            append("<event uid=\"drawing-1\" type=\"u-d-f\" how=\"h-e\" version=\"2.0\">")
+            append("<point lat=\"40.95\" lon=\"29.09\" hae=\"0\" ce=\"9\" le=\"9\"/>")
+            append("<detail><shape><polyline closed=\"true\">")
+            for (i in 0 until 120) {
+                append("<vertex lat=\"40.95%04d\" lon=\"29.09%04d\"/>".format(i, i * 7 % 9999))
+            }
+            append("</polyline></shape></detail></event>")
+        }
+        assertTrue(drawing.length > 4000)
+        val failure = runCatching { CotTier2.encode(drawing) }.exceptionOrNull()
+        assertTrue("expected a refusal, got $failure", failure is IllegalArgumentException)
+        assertTrue(failure!!.message!!.contains("tier 3"))
+    }
+
+    @Test
+    fun `everything encode returns fits one packet`() {
+        for (cot in listOf(tier2.getString("cot"), "<event type=\"a\" uid=\"b\"/>")) {
+            assertTrue(CotTier2.encode(cot).size <= CotTier2.MAX_FRAME_BYTES)
+        }
+    }
+
+    @Test
+    fun `trailing data after the stream is refused`() {
+        val frame = CotTier2.encode(tier2.getString("cot")) + "leftover".toByteArray()
+        assertTrue(runCatching { CotTier2.decode(frame) }.isFailure)
+    }
+
+    @Test
+    fun `a payload that is not valid utf8 is refused, not substituted`() {
+        // toString(UTF_8) substitutes U+FFFD, so a frame carrying malformed
+        // bytes would reach the map as text nobody sent.
+        val frame = byteArrayOf(CotTier2.VERSION, CotTier2.ENCODING_RAW) +
+            "<event uid=\"a\"/>".toByteArray().let {
+                it.copyOfRange(0, 8) + byteArrayOf(-1, -2) + it.copyOfRange(8, it.size)
+            }
+        assertTrue(runCatching { CotTier2.decode(frame) }.isFailure)
+    }
+
+    @Test
     fun `unknown version and short frames are refused`() {
         for (frame in listOf(
             byteArrayOf(99, CotTier2.ENCODING_RAW) + "<event/>".toByteArray(),
@@ -90,5 +139,34 @@ class CotTier2Test {
         frame[frame.size - 1] = (frame[frame.size - 1].toInt() xor 0xFF).toByte()
         frame[5] = (frame[5].toInt() xor 0xFF).toByte()
         assertTrue(runCatching { CotTier2.decode(frame) }.isFailure)
+    }
+
+    /**
+     * MAX_DECOMPRESSED was enforced inside inflate(), so it only ever guarded
+     * the deflate path. A raw frame walked straight past it -- and a raw frame
+     * is the easy one to forge, needing no compressor at all. encode() refusing
+     * to produce one says nothing about what a peer may send.
+     */
+    @Test
+    fun `an oversized raw frame is refused`() {
+        val oversized =
+            byteArrayOf(CotTier2.VERSION, CotTier2.ENCODING_RAW) +
+                ByteArray(CotTier2.MAX_DECOMPRESSED + 1) { 'x'.code.toByte() }
+
+        val error = runCatching { CotTier2.decode(oversized) }.exceptionOrNull()
+
+        assertTrue("an oversized raw frame must be refused, got $error", error is IllegalArgumentException)
+    }
+
+    /** A raw frame exactly at the bound is legitimate. */
+    @Test
+    fun `a raw frame at the bound is accepted`() {
+        val atBound =
+            byteArrayOf(CotTier2.VERSION, CotTier2.ENCODING_RAW) +
+                ByteArray(CotTier2.MAX_DECOMPRESSED) { 'x'.code.toByte() }
+
+        val decoded = CotTier2.decode(atBound)
+
+        assertEquals(CotTier2.MAX_DECOMPRESSED, decoded.length)
     }
 }

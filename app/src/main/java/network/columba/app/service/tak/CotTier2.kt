@@ -31,6 +31,14 @@ object CotTier2 {
      */
     const val MAX_DECOMPRESSED = 64 * 1024
 
+    /**
+     * One Reticulum packet, which is the whole promise of tier 2.
+     *
+     * RNS's ENCRYPTED_MDU. Hard-coded on both sides and pinned to the real
+     * value by a test on the Python side, where RNS is importable.
+     */
+    const val MAX_FRAME_BYTES = 383
+
     private const val ATTRIBUTES =
         "version uid type time start stale how access qos opex lat lon hae ce le " +
             "callsign endpoint device os platform battery course speed altsrc geopointsrc " +
@@ -89,11 +97,21 @@ object CotTier2 {
         } finally {
             deflater.end()
         }
-        return if (deflated.size < raw.size) {
+        val frame = if (deflated.size < raw.size) {
             byteArrayOf(VERSION, ENCODING_DEFLATE_DICT_V1) + deflated
         } else {
             byteArrayOf(VERSION, ENCODING_RAW) + raw
         }
+        // Tier 2 is one packet by definition, and this is the bound that makes
+        // it one. MAX_DECOMPRESSED bounds the *input* at 64 KB, which a real
+        // 5 KB ATAK drawing is comfortably inside -- it compresses to about
+        // 700 bytes, nearly twice the MDU. Nothing caught that, so the frame
+        // reached Reticulum, which refuses it at the packet layer.
+        require(frame.size <= MAX_FRAME_BYTES) {
+            "tier 2 frame is ${frame.size} bytes, over the $MAX_FRAME_BYTES-byte bound; " +
+                "it belongs in tier 3"
+        }
+        return frame
     }
 
     /** Recover the CoT event, refusing anything that is not plainly ours. */
@@ -107,7 +125,22 @@ object CotTier2 {
             else -> throw IllegalArgumentException("unknown tier 2 encoding ${frame[1]}")
         }
         require(payload.isNotEmpty()) { "tier 2 payload is empty" }
-        return payload.toString(Charsets.UTF_8)
+        // After the switch, not inside inflate(). The bound was enforced only
+        // on the deflate path, so a raw frame walked straight past it -- and a
+        // raw frame is the easy one to forge, since it needs no compressor.
+        // encode() refuses to *produce* one this large, which says nothing
+        // about what a peer may send.
+        require(payload.size <= MAX_DECOMPRESSED) {
+            "tier 2 payload is ${payload.size} bytes, beyond the tier 2 bound of $MAX_DECOMPRESSED"
+        }
+        // Strictly, like the Python side. toString(UTF_8) substitutes U+FFFD
+        // for malformed bytes, so a frame carrying invalid UTF-8 would arrive
+        // on the map as text nobody sent rather than being refused.
+        val text = payload.toString(Charsets.UTF_8)
+        require(text.toByteArray(Charsets.UTF_8).contentEquals(payload)) {
+            "tier 2 payload is not valid UTF-8"
+        }
+        return text
     }
 
     private fun inflate(body: ByteArray): ByteArray {
@@ -139,6 +172,11 @@ object CotTier2 {
                 if (out.size() > MAX_DECOMPRESSED) {
                     throw IllegalArgumentException("tier 2 payload expands beyond the tier 2 bound")
                 }
+            }
+            // Trailing bytes after the deflate stream ends are not part of
+            // this event, and a frame carrying them is not one we produced.
+            require(inflater.remaining == 0) {
+                "tier 2 frame has trailing data after the stream"
             }
             return out.toByteArray()
         } finally {
