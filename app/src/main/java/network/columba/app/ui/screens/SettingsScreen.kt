@@ -71,7 +71,7 @@ import network.columba.app.ui.screens.settings.cards.MapSourcesCard
 import network.columba.app.ui.screens.settings.cards.MessageDeliveryRetrievalCard
 import network.columba.app.ui.screens.settings.cards.NetworkCard
 import network.columba.app.ui.screens.settings.cards.NotificationSettingsCard
-import network.columba.app.ui.screens.settings.cards.PositionReportCard
+import network.columba.app.ui.screens.settings.cards.TakCard
 import network.columba.app.ui.screens.settings.cards.PrivacyCard
 import network.columba.app.ui.screens.settings.cards.RNodeFlasherCard
 import network.columba.app.ui.screens.settings.cards.ShareColumbaCard
@@ -104,6 +104,7 @@ fun SettingsScreen(
     onNavigateToNetworkStatus: () -> Unit = {},
     onNavigateToIdentityManager: () -> Unit = {},
     onNavigateToNotifications: () -> Unit = {},
+    onNavigateToTak: () -> Unit = {},
     onNavigateToCustomThemes: () -> Unit = {},
     onNavigateToMigration: () -> Unit = {},
     onNavigateToAnnounces: (filterType: String?) -> Unit = {},
@@ -386,19 +387,10 @@ fun SettingsScreen(
                     },
                 )
 
-                network.columba.app.ui.screens.settings.cards.TaskCard()
-
-                PositionReportCard(
-                    isExpanded = state.cardExpansionStates[SettingsCardId.POSITION_REPORT.name] ?: false,
-                    onExpandedChange = { viewModel.toggleCardExpanded(SettingsCardId.POSITION_REPORT, it) },
-                    enabled = state.positionReportEnabled,
-                    intervalMinutes = state.positionReportIntervalMinutes,
-                    gatewayHash = state.positionGatewayHash,
-                    lastReportTime = state.lastPositionReportTime,
-                    onToggle = { viewModel.setPositionReportEnabled(it) },
-                    onIntervalChange = { viewModel.setPositionReportInterval(it) },
-                    onGatewayChange = { viewModel.setPositionGatewayHash(it) },
-                    onReportNow = { viewModel.reportPositionNow() },
+                TakCard(
+                    isExpanded = state.cardExpansionStates[SettingsCardId.TAK.name] ?: false,
+                    onExpandedChange = { viewModel.toggleCardExpanded(SettingsCardId.TAK, it) },
+                    onOpenTakSettings = onNavigateToTak,
                 )
 
                 LocationSharingCard(
