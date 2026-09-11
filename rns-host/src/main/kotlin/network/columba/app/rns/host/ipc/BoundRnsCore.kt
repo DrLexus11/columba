@@ -169,6 +169,9 @@ internal class BoundRnsCore(
 
     override suspend fun recallIdentity(hash: ByteArray): Identity? = awaitBound().core.recallIdentity(hash)
 
+    override suspend fun identityFromPrivateKey(privateKey: ByteArray): Result<Identity> =
+        awaitBound().core.identityFromPrivateKey(privateKey)
+
     override suspend fun createIdentityWithName(displayName: String): Map<String, Any> = awaitBound().core.createIdentityWithName(displayName)
 
     override suspend fun importIdentityFile(

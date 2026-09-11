@@ -50,6 +50,23 @@ interface RnsCore {
     suspend fun recallIdentity(hash: ByteArray): Identity?
 
     /**
+     * Derive an [Identity] from a 64-byte private key, storing nothing.
+     *
+     * A team's identity is derived from the team name and the fleet secret, so
+     * every member computes the same one without being told about the others
+     * (see `TakGroups`). It is not one of the user's identities: it must not be
+     * named, must not reach the identity database, and must not appear in any
+     * picker -- which is why this exists alongside [importIdentityFile] rather
+     * than reusing it.
+     *
+     * Derivation happens in the backend on purpose. The public halves and the
+     * hash must match Reticulum's own derivation exactly, and a reimplementation
+     * that drifts yields an identity that looks entirely valid while addressing
+     * a destination nobody else is on.
+     */
+    suspend fun identityFromPrivateKey(privateKey: ByteArray): Result<Identity>
+
+    /**
      * Multi-identity management.
      *
      * These methods never write plaintext private keys to the app's internal

@@ -175,6 +175,19 @@ class PythonRnsCore(
             recalled.toModelIdentity().also { runtime.identities[it.hash.toHex()] = recalled }
         }
 
+    override suspend fun identityFromPrivateKey(privateKey: ByteArray): Result<Identity> =
+        pyResult {
+            val identityClass = runtime.rnsModule["Identity"] ?: error("RNS.Identity missing")
+            val pyId = identityClass.callAttr("from_bytes", privateKey.toPyBytes())
+                ?: throw RnsException(RnsError.Generic("Identity.from_bytes returned None", null))
+            // Cached like any other identity so resolveIdentity() finds it
+            // instead of reconstructing it for every destination, but
+            // deliberately not handed to buildIdentityResult: that is what
+            // makes a *named* identity, and a derived team identity is not one
+            // of the user's.
+            pyId.toModelIdentity().also { runtime.identities[it.hash.toHex()] = pyId }
+        }
+
     override suspend fun createIdentityWithName(displayName: String): Map<String, Any> =
         pyCall {
             val pyId = runtime.rnsModule.callAttr("Identity")

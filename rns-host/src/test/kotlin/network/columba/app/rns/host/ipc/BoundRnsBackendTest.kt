@@ -277,6 +277,7 @@ class BoundRnsBackendTest {
         override suspend fun loadIdentity(path: String): Result<Identity> = error("not used")
         override suspend fun saveIdentity(identity: Identity, path: String) = Result.success(Unit)
         override suspend fun recallIdentity(hash: ByteArray): Identity? = null
+        override suspend fun identityFromPrivateKey(privateKey: ByteArray): Result<Identity> = error("not used")
         override suspend fun createIdentityWithName(displayName: String): Map<String, Any> = emptyMap()
         override suspend fun importIdentityFile(fileData: ByteArray, displayName: String): Map<String, Any> = emptyMap()
         override suspend fun exportIdentityFile(keyData: ByteArray, filePath: String): ByteArray = ByteArray(0)

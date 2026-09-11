@@ -115,6 +115,14 @@ internal class ClientRnsCore(
         Unit
     }
 
+    override suspend fun identityFromPrivateKey(privateKey: ByteArray): Result<Identity> = runCatching {
+        val bundle = awaitResult { cb -> remote.identityFromPrivateKey(privateKey, cb) }
+        bundle.classLoader = Identity::class.java.classLoader
+        @Suppress("DEPRECATION")
+        bundle.getParcelable<Identity>(BundleKeys.IDENTITY)
+            ?: throw RnsException(RnsError.Generic("identityFromPrivateKey payload missing 'identity'", null))
+    }
+
     override suspend fun recallIdentity(hash: ByteArray): Identity? {
         val bundle = awaitResult { cb -> remote.recallIdentity(hash, cb) }
         bundle.classLoader = Identity::class.java.classLoader

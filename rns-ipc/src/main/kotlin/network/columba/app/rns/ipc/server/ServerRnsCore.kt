@@ -97,6 +97,11 @@ internal class ServerRnsCore(
         Bundle().apply { if (identity != null) putParcelable(BundleKeys.IDENTITY, identity) }
     }
 
+    override fun identityFromPrivateKey(privateKey: ByteArray, cb: IRnsResultCallback) = dispatch(cb, scope) {
+        val identity = impl.identityFromPrivateKey(privateKey).getOrThrow()
+        Bundle().apply { putParcelable(BundleKeys.IDENTITY, identity) }
+    }
+
     override fun createIdentityWithName(displayName: String, cb: IRnsResultCallback) = dispatch(cb, scope) {
         impl.createIdentityWithName(displayName).toIdentityKeyBundle()
     }

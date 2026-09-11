@@ -180,6 +180,22 @@ class RnsBackendIpcRoundTripTest {
     }
 
     @Test
+    fun `a derived identity round-trips through the stub`() = runTest {
+        // A team identity is derived from the fleet secret in the app process
+        // but must be built by whichever backend is live, so the 64-byte key
+        // crosses the seam intact or the whole team lands on a different
+        // destination from everyone else.
+        val (client, _) = buildClientAndServer()
+        val key = ByteArray(64) { (it * 7 + 3).toByte() }
+
+        val identity = client.core.identityFromPrivateKey(key).getOrThrow()
+        advanceUntilIdle()
+
+        assertArrayEquals(key, identity.privateKey)
+        assertArrayEquals(key, identity.publicKey)
+    }
+
+    @Test
     fun `identity import error map round-trips through the stub`() = runTest {
         val (client, _) = buildClientAndServer()
         fake.core.nextImportResult =
@@ -639,6 +655,12 @@ private class FakeRnsCore : RnsCore {
     override suspend fun loadIdentity(path: String): Result<Identity> = Result.failure(NotImplementedError())
     override suspend fun saveIdentity(identity: Identity, path: String) = Result.success(Unit)
     override suspend fun recallIdentity(hash: ByteArray): Identity? = null
+    // Echoes the key back inside the identity so the round trip can assert
+    // the bytes survived the parcel, rather than only that a call happened.
+    override suspend fun identityFromPrivateKey(privateKey: ByteArray): Result<Identity> =
+        Result.success(
+            Identity(hash = privateKey.copyOf(2), publicKey = privateKey.copyOf(), privateKey = privateKey.copyOf()),
+        )
     override suspend fun createIdentityWithName(displayName: String): Map<String, Any> = emptyMap()
     override suspend fun importIdentityFile(fileData: ByteArray, displayName: String): Map<String, Any> = nextImportResult
     override suspend fun exportIdentityFile(keyData: ByteArray, filePath: String): ByteArray = ByteArray(0)

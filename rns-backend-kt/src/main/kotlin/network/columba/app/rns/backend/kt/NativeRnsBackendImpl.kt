@@ -1147,6 +1147,17 @@ class NativeRnsBackendImpl(
             }
         }
 
+    override suspend fun identityFromPrivateKey(privateKey: ByteArray): Result<ColumbaIdentity> =
+        withContext(Dispatchers.IO) {
+            runCatching {
+                // No buildIdentityResult, no database row, no display name: a
+                // derived team identity is not one of the user's identities and
+                // must never turn up in a picker beside them.
+                NativeIdentity.fromBytes(privateKey)?.toColumba()
+                    ?: error("Invalid identity private key")
+            }
+        }
+
     override suspend fun saveIdentity(
         identity: ColumbaIdentity,
         path: String,
