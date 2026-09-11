@@ -28,6 +28,17 @@ object Aspects {
     /** LXST telephony / voice call destination. */
     const val LXST_TELEPHONY = "lxst.telephony"
 
+    /**
+     * A TAK team member's addressable node destination.
+     *
+     * Team membership is learned from these announces, so an aspect missing
+     * from this set is not a cosmetic omission: both backends drop announces
+     * whose aspect does not resolve, and a team would simply never discover
+     * itself. See `TakMembership`.
+     */
+    const val TAK_NODE = "rnstransport.tak.node"
+
     /** Every aspect Columba tracks — handy for set-membership tests. */
-    val ALL: Set<String> = setOf(LXMF_DELIVERY, LXMF_PROPAGATION, NOMADNET_NODE, LXST_TELEPHONY)
+    val ALL: Set<String> =
+        setOf(LXMF_DELIVERY, LXMF_PROPAGATION, NOMADNET_NODE, LXST_TELEPHONY, TAK_NODE)
 }

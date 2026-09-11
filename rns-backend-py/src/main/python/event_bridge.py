@@ -567,7 +567,12 @@ def _emit(callback, payload):
 # receives every announce but is not told which aspect matched, so we resolve
 # it by recomputing the destination hash for each known aspect — pure RNS
 # protocol code, no Columba app-logic.
-_KNOWN_ASPECTS = ("lxmf.delivery", "lxmf.propagation", "nomadnetwork.node", "lxst.telephony")
+# Kept in sync by hand with Aspects.kt, which is the canonical list --
+# Chaquopy cannot read Kotlin constants from Python. An aspect missing
+# from here is dropped before it reaches the app, so a TAK team would
+# never discover its own members.
+_KNOWN_ASPECTS = ("lxmf.delivery", "lxmf.propagation", "nomadnetwork.node",
+                  "lxst.telephony", "rnstransport.tak.node")
 
 
 def _resolve_aspect(destination_hash, identity):
