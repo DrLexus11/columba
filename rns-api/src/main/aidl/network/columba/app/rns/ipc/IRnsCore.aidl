@@ -83,6 +83,19 @@ oneway interface IRnsCore {
         in List<String> aspects,
         in IRnsResultCallback cb);
 
+    // A GROUP destination needs its symmetric key, and createDestination has no
+    // way to carry one -- so it refuses type GROUP and callers come here. The
+    // key is required rather than nullable: a group destination without one is
+    // registered, announces, receives packets and silently decrypts none of
+    // them, which reads as a dead peer rather than a missing key.
+    void createGroupDestination(
+        in Identity identity,
+        in Direction direction,
+        String appName,
+        in List<String> aspects,
+        in byte[] groupKey,
+        in IRnsResultCallback cb);
+
     void announceDestination(in Destination destination, in @nullable byte[] appData, in IRnsResultCallback cb);
 
     void triggerAutoAnnounce(String displayName, in IRnsResultCallback cb);

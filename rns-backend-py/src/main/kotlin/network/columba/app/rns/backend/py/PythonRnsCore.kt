@@ -125,6 +125,7 @@ class PythonRnsCore(
                             destination.type,
                             destination.appName,
                             destination.aspects,
+                            appDestinations.groupKeyFor(destination),
                         )
                     }
                     _networkStatus.value = NetworkStatus.READY
@@ -285,8 +286,27 @@ class PythonRnsCore(
         destinationLifecycle.withLock {
             pyResult {
                 runtime.requireRunning()
+                require(type != DestinationType.GROUP) {
+                    "A GROUP destination needs its symmetric key; use createGroupDestination"
+                }
                 registerDestination(identity, direction, type, appName, aspects)
                     .also(appDestinations::remember)
+            }
+        }
+
+    override suspend fun createGroupDestination(
+        identity: Identity,
+        direction: Direction,
+        appName: String,
+        aspects: List<String>,
+        groupKey: ByteArray,
+    ): Result<Destination> =
+        destinationLifecycle.withLock {
+            pyResult {
+                runtime.requireRunning()
+                registerDestination(
+                    identity, direction, DestinationType.GROUP, appName, aspects, groupKey,
+                ).also { appDestinations.remember(it, groupKey) }
             }
         }
 
@@ -298,6 +318,7 @@ class PythonRnsCore(
         type: DestinationType,
         appName: String,
         aspects: List<String>,
+        groupKey: ByteArray? = null,
     ): Destination {
         val destClass = runtime.rnsModule["Destination"] ?: error("RNS.Destination missing")
         val pyIdentity = resolveIdentity(identity)
@@ -318,6 +339,12 @@ class PythonRnsCore(
         val pyDest =
             runtime.destinations[hash]
                 ?: runtime.rnsModule.callAttr("Destination", *args.toTypedArray())
+        if (groupKey != null) {
+            // RNS keeps the group's symmetric key on the destination itself, so
+            // this has to happen for every object built for the group -- the IN
+            // one and the OUT one alike, and again after every restart.
+            pyDest.callAttr("load_private_key", groupKey.toPyBytes())
+        }
         val model = pyDest.toModelDestination(identity, direction, type, appName, aspects)
         runtime.destinations[model.hexHash] = pyDest
         if (direction == Direction.IN) {

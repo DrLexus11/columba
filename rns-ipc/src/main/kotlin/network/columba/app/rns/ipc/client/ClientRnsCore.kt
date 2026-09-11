@@ -145,6 +145,24 @@ internal class ClientRnsCore(
     override suspend fun signWithIdentity(data: ByteArray): ByteArray? =
         awaitNullableByteArray { cb -> remote.signWithIdentity(data, cb) }
 
+    override suspend fun createGroupDestination(
+        identity: Identity,
+        direction: Direction,
+        appName: String,
+        aspects: List<String>,
+        groupKey: ByteArray,
+    ): Result<Destination> = runCatching {
+        val bundle = awaitResult { cb ->
+            remote.createGroupDestination(identity, direction, appName, aspects, groupKey, cb)
+        }
+        bundle.classLoader = Destination::class.java.classLoader
+        @Suppress("DEPRECATION")
+        bundle.getParcelable<Destination>(BundleKeys.DESTINATION)
+            ?: throw RnsException(
+                RnsError.Generic("createGroupDestination payload missing 'destination'", null),
+            )
+    }
+
     override suspend fun createDestination(
         identity: Identity,
         direction: Direction,

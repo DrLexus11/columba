@@ -116,6 +116,19 @@ internal class ServerRnsCore(
     override fun signWithIdentity(data: ByteArray, cb: IRnsByteArrayCallback) =
         dispatchNullableByteArray(cb, scope) { impl.signWithIdentity(data) }
 
+    override fun createGroupDestination(
+        identity: Identity,
+        direction: Direction,
+        appName: String,
+        aspects: MutableList<String>,
+        groupKey: ByteArray,
+        cb: IRnsResultCallback,
+    ) = dispatch(cb, scope) {
+        val destination =
+            impl.createGroupDestination(identity, direction, appName, aspects, groupKey).getOrThrow()
+        Bundle().apply { putParcelable(BundleKeys.DESTINATION, destination) }
+    }
+
     override fun createDestination(
         identity: Identity,
         direction: Direction,

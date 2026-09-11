@@ -286,6 +286,10 @@ class BoundRnsBackendTest {
             identity: Identity, direction: Direction, type: DestinationType,
             appName: String, aspects: List<String>,
         ): Result<Destination> = error("not used")
+        override suspend fun createGroupDestination(
+            identity: Identity, direction: Direction, appName: String,
+            aspects: List<String>, groupKey: ByteArray,
+        ): Result<Destination> = error("not used")
         override suspend fun announceDestination(destination: Destination, appData: ByteArray?) = Result.success(Unit)
         override suspend fun triggerAutoAnnounce(displayName: String) = Result.success(Unit)
         override suspend fun sendPacket(destination: Destination, data: ByteArray, packetType: PacketType): Result<PacketReceipt> = error("not used")

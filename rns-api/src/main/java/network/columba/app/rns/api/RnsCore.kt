@@ -105,6 +105,26 @@ interface RnsCore {
         aspects: List<String>,
     ): Result<Destination>
 
+    /**
+     * Create a GROUP destination and load its symmetric key.
+     *
+     * [createDestination] refuses [DestinationType.GROUP] because it has no way
+     * to carry a key, and a group destination without one is the worst kind of
+     * broken: it registers, it announces, it receives packets, and it decrypts
+     * none of them. That reads as a peer that has gone quiet rather than as a
+     * configuration error.
+     *
+     * The key is derived from the team name and the fleet secret, so every
+     * member computes it without being told; see `TakGroups`.
+     */
+    suspend fun createGroupDestination(
+        identity: Identity,
+        direction: Direction,
+        appName: String,
+        aspects: List<String>,
+        groupKey: ByteArray,
+    ): Result<Destination>
+
     suspend fun announceDestination(
         destination: Destination,
         appData: ByteArray? = null,

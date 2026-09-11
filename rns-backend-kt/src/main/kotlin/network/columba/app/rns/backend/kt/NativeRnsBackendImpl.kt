@@ -581,6 +581,7 @@ class NativeRnsBackendImpl(
                 destination.type,
                 destination.appName,
                 destination.aspects,
+                appDestinations.groupKeyFor(destination),
             )
         }
     }
@@ -1591,6 +1592,7 @@ class NativeRnsBackendImpl(
         type: DestinationType,
         appName: String,
         aspects: List<String>,
+        groupKey: ByteArray? = null,
     ): ColumbaDestination {
         val nativeIdentity = deliveryIdentity?.takeIf { it.hash.contentEquals(identity.hash) } ?: identity.toNative()
         val nativeDir =
@@ -1614,6 +1616,14 @@ class NativeRnsBackendImpl(
             } else {
                 createNativeDestination(nativeIdentity, nativeDir, nativeType, appName, aspects)
             }
+        if (groupKey != null) {
+            // The symmetric key lives on the destination object itself, so it
+            // must be loaded onto every one built for the group -- the IN and
+            // the OUT, and again after every restart. A group destination
+            // without it registers, announces, receives packets and decrypts
+            // none of them, which reads as a peer gone quiet.
+            dest.loadPrivateKey(groupKey)
+        }
         val model = dest.toColumba(identity)
         if (direction == Direction.IN) {
             dest.packetCallback = { data, _ ->
@@ -1622,6 +1632,23 @@ class NativeRnsBackendImpl(
         }
         return model
     }
+
+    override suspend fun createGroupDestination(
+        identity: ColumbaIdentity,
+        direction: Direction,
+        appName: String,
+        aspects: List<String>,
+        groupKey: ByteArray,
+    ): Result<ColumbaDestination> =
+        destinationLifecycle.withLock {
+            withContext(Dispatchers.IO) {
+                runCatching {
+                    registerDestination(
+                        identity, direction, DestinationType.GROUP, appName, aspects, groupKey,
+                    ).also { appDestinations.remember(it, groupKey) }
+                }
+            }
+        }
 
     private fun announceLocalPeerDestinations(
         appData: ByteArray?,

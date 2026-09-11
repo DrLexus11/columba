@@ -653,6 +653,14 @@ private class FakeRnsCore : RnsCore {
         aspects: List<String>,
     ): Result<Destination> = Result.failure(NotImplementedError())
 
+    override suspend fun createGroupDestination(
+        identity: Identity,
+        direction: Direction,
+        appName: String,
+        aspects: List<String>,
+        groupKey: ByteArray,
+    ): Result<Destination> = Result.failure(NotImplementedError())
+
     override suspend fun announceDestination(destination: Destination, appData: ByteArray?) = Result.success(Unit)
     override suspend fun triggerAutoAnnounce(displayName: String) = Result.success(Unit)
     override suspend fun sendPacket(
