@@ -114,6 +114,21 @@ class CotStreamTest {
         assertEquals(emptyList<String>(), events)
     }
 
+    /**
+     * The control for the two above: the same document, delivered, when the cap
+     * allows it. Without this they would pass just as well against a stream
+     * that dropped every event.
+     */
+    @Test
+    fun `the same event is delivered when the cap allows it`() {
+        val stream = CotStream(maxEventBytes = 8192)
+        val huge = "<event uid=\"big\">" + "x".repeat(2000) + "</event>"
+
+        val events = stream.feed(huge.toByteArray(Charsets.UTF_8))
+
+        assertEquals(listOf(huge), events)
+    }
+
     /** Dropping one oversized event must not cost the events behind it. */
     @Test
     fun `an event after an oversized one still arrives`() {

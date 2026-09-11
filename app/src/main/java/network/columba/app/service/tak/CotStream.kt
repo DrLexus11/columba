@@ -25,63 +25,85 @@ class CotStream(private val maxEventBytes: Int = MAX_EVENT_BYTES) {
         // corrupt any event split mid-character.
         buffer.append(String(chunk, 0, length, Charsets.ISO_8859_1))
         val events = mutableListOf<String>()
+        // One decision per pass, taken by locate(), so the loop itself holds no
+        // control flow beyond "stop when nothing more can be decided". Adding a
+        // new reason to reject an event is a Span case and a branch here, not
+        // another continue threaded through the scan.
         while (true) {
-            val start = buffer.indexOf(EVENT_OPEN)
-            if (start < 0) {
-                // Nothing resembling an event yet. Keep only a fragment that
-                // could still become one, so noise cannot accumulate.
-                if (buffer.length > EVENT_OPEN.length) {
-                    buffer.delete(0, buffer.length - EVENT_OPEN.length)
-                }
-                break
+            when (val span = locate()) {
+                is Span.Incomplete -> break
+                is Span.Oversized -> resynchronise()
+                is Span.Complete -> takeEvent(span.end)?.let(events::add)
             }
-            // Discard whatever preceded the event: XML declarations,
-            // whitespace between documents, or an event we already gave up on.
-            if (start > 0) buffer.delete(0, start)
-            val close = buffer.indexOf(EVENT_CLOSE)
-            if (close < 0) {
-                if (buffer.length > maxEventBytes) {
-                    // Abandon the oversized event, not the connection and not
-                    // whatever followed it. Clearing the buffer threw away any
-                    // complete event that shared a read with a runaway one.
-                    // Looping rather than breaking drains an oversized read
-                    // inside this call; each pass removes at least one byte.
-                    resynchronise()
-                    continue
-                }
-                break
-            }
-            val end = close + EVENT_CLOSE.length
-            if (end > maxEventBytes) {
-                // The cap has to apply to finished events too. Checking it only
-                // while waiting for a closing tag meant a peer could carry one
-                // past the bound simply by closing it: the event was oversized
-                // all along, but arrived complete, so it was decoded and
-                // forwarded to every connected client.
-                //
-                // Resynchronised from *inside* the span rather than dropping
-                // the span whole. The usual way to get here is an unterminated
-                // event followed by a real one, where this close tag belongs to
-                // the second and the span covers both -- so deleting the span
-                // discards the good event along with the runaway, which is the
-                // failure the branch above was just fixed for.
-                resynchronise()
-                continue
-            }
-            val bytes = buffer.substring(0, end).toByteArray(Charsets.ISO_8859_1)
-            buffer.delete(0, end)
-            val text = String(bytes, Charsets.UTF_8)
-            // Strictly. String(bytes, UTF_8) substitutes U+FFFD for malformed
-            // input, so one bad byte inside an otherwise valid event became a
-            // replacement character that passed every later check and reached
-            // the mesh as content nobody sent. Counted, never repaired.
-            if (!text.toByteArray(Charsets.UTF_8).contentEquals(bytes)) {
-                malformed++
-                continue
-            }
-            events.add(text)
         }
         return events
+    }
+
+    /** What the buffer currently holds, as far as the framing can tell. */
+    private sealed interface Span {
+        /** A whole event, within the cap, ending at [end]. */
+        data class Complete(val end: Int) : Span
+
+        /** An event past the cap, terminated or not. Its bytes stay put. */
+        data object Oversized : Span
+
+        /** Nothing decidable until more bytes arrive. */
+        data object Incomplete : Span
+    }
+
+    /**
+     * Find the next event in the buffer and classify it.
+     *
+     * Consumes only what can never become an event -- the noise before a start
+     * tag, and a stale fragment when no start tag is present at all. Everything
+     * else is left for the caller to act on, so the decision and the disposal
+     * stay in one place each.
+     */
+    private fun locate(): Span {
+        val start = buffer.indexOf(EVENT_OPEN)
+        if (start < 0) {
+            // Nothing resembling an event yet. Keep only a fragment that
+            // could still become one, so noise cannot accumulate.
+            if (buffer.length > EVENT_OPEN.length) {
+                buffer.delete(0, buffer.length - EVENT_OPEN.length)
+            }
+            return Span.Incomplete
+        }
+        // Discard whatever preceded the event: XML declarations,
+        // whitespace between documents, or an event we already gave up on.
+        if (start > 0) buffer.delete(0, start)
+        val close = buffer.indexOf(EVENT_CLOSE)
+        if (close < 0) {
+            // An unterminated event that has outgrown the cap will never
+            // become valid, so it is oversized now rather than pending.
+            return if (buffer.length > maxEventBytes) Span.Oversized else Span.Incomplete
+        }
+        // The cap applies to finished events too. Checking it only while
+        // waiting for a closing tag let a peer carry one past the bound simply
+        // by closing it: the event was oversized all along, arrived complete,
+        // and was decoded and forwarded to every connected client.
+        val end = close + EVENT_CLOSE.length
+        return if (end > maxEventBytes) Span.Oversized else Span.Complete(end)
+    }
+
+    /**
+     * Remove the event ending at [end] and decode it, or null if it is not
+     * valid UTF-8.
+     *
+     * Strictly. String(bytes, UTF_8) substitutes U+FFFD for malformed input, so
+     * one bad byte inside an otherwise valid event became a replacement
+     * character that passed every later check and reached the mesh as content
+     * nobody sent. Counted, never repaired.
+     */
+    private fun takeEvent(end: Int): String? {
+        val bytes = buffer.substring(0, end).toByteArray(Charsets.ISO_8859_1)
+        buffer.delete(0, end)
+        val text = String(bytes, Charsets.UTF_8)
+        if (!text.toByteArray(Charsets.UTF_8).contentEquals(bytes)) {
+            malformed++
+            return null
+        }
+        return text
     }
 
     /**
@@ -90,6 +112,13 @@ class CotStream(private val maxEventBytes: Int = MAX_EVENT_BYTES) {
      * Not a clear(): the bytes after a runaway document are as likely to begin
      * a good event as anything else, and discarding them means one malformed
      * document costs every event that shared a read with it.
+     *
+     * Searches from index 1, so it always makes progress -- the start tag at
+     * index 0 is the one being abandoned. This is also why a terminated
+     * oversized span is resynchronised from inside rather than deleted whole:
+     * the usual way to get one is an unterminated event followed by a real
+     * one, where the closing tag belongs to the second and dropping the span
+     * would take the good event with it.
      */
     private fun resynchronise() {
         val next = buffer.indexOf(EVENT_OPEN, 1)

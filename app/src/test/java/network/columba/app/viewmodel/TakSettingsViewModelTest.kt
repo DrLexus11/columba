@@ -1,5 +1,6 @@
 package network.columba.app.viewmodel
 
+import io.mockk.coEvery
 import io.mockk.every
 import io.mockk.mockk
 import kotlinx.coroutines.Dispatchers
@@ -36,8 +37,11 @@ class TakSettingsViewModelTest {
         team: String = "Cyan",
         secret: String? = null,
     ): TakSettingsViewModel {
+        // Strict: every flow the view model reads and every setter it can call
+        // is stubbed below, so a new dependency shows up as a failing test
+        // rather than as a silently defaulted value.
         val settings =
-            mockk<SettingsRepository>(relaxed = true) {
+            mockk<SettingsRepository> {
                 every { takEndpointEnabledFlow } returns flowOf(enabled)
                 every { takTeamFlow } returns flowOf(team)
                 every { takFleetSecretFlow } returns flowOf(secret)
@@ -45,12 +49,22 @@ class TakSettingsViewModelTest {
                 every { positionReportIntervalMinutesFlow } returns flowOf(1)
                 every { positionGatewayHashFlow } returns flowOf(null)
                 every { lastPositionReportTimeFlow } returns flowOf(null)
+                coEvery { saveTakEndpointEnabled(any()) } returns Unit
+                coEvery { saveTakTeam(any()) } returns Unit
+                coEvery { saveTakFleetSecret(any()) } returns Unit
+                coEvery { savePositionReportEnabled(any()) } returns Unit
+                coEvery { savePositionReportIntervalMinutes(any()) } returns Unit
+                coEvery { savePositionGatewayHash(any()) } returns Unit
             }
         val endpoint =
             mockk<CotEndpointManager> {
                 every { state } returns MutableStateFlow(CotEndpointManager.State.Stopped)
             }
-        return TakSettingsViewModel(settings, mockk<PositionReportManager>(relaxed = true), endpoint)
+        val reports =
+            mockk<PositionReportManager> {
+                coEvery { reportNow() } returns true
+            }
+        return TakSettingsViewModel(settings, reports, endpoint)
     }
 
     @Test

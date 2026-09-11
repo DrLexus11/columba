@@ -143,6 +143,25 @@ object CotTier2 {
         return text
     }
 
+    /**
+     * One inflate pass, with both ways it can fail named where they happen.
+     *
+     * Split out so the loop above reads as the shape of the stream rather than
+     * as error handling, and so a new failure mode lands here beside the two
+     * that exist instead of adding another branch to the loop.
+     */
+    private fun inflateOnce(inflater: Inflater, buffer: ByteArray): Int {
+        val written = try {
+            inflater.inflate(buffer)
+        } catch (error: DataFormatException) {
+            throw IllegalArgumentException("tier 2 payload did not decompress", error)
+        }
+        // Nothing written and nothing left to read from: the frame stops in the
+        // middle of a deflate stream.
+        require(written > 0 || !inflater.needsInput()) { "tier 2 payload is truncated" }
+        return written
+    }
+
     private fun inflate(body: ByteArray): ByteArray {
         val inflater = Inflater(true)
         try {
@@ -157,20 +176,13 @@ object CotTier2 {
             val out = ByteArrayOutputStream(body.size * 3)
             val buffer = ByteArray(4096)
             while (!inflater.finished()) {
-                val written = try {
-                    inflater.inflate(buffer)
-                } catch (error: DataFormatException) {
-                    throw IllegalArgumentException("tier 2 payload did not decompress", error)
-                }
-                if (written == 0) {
-                    if (inflater.needsInput()) {
-                        throw IllegalArgumentException("tier 2 payload is truncated")
-                    }
-                    break
-                }
+                val written = inflateOnce(inflater, buffer)
+                // Zero written with input still in hand means the stream ended
+                // cleanly; inflateOnce has already refused the truncated case.
+                if (written == 0) break
                 out.write(buffer, 0, written)
-                if (out.size() > MAX_DECOMPRESSED) {
-                    throw IllegalArgumentException("tier 2 payload expands beyond the tier 2 bound")
+                require(out.size() <= MAX_DECOMPRESSED) {
+                    "tier 2 payload expands beyond the tier 2 bound"
                 }
             }
             // Trailing bytes after the deflate stream ends are not part of

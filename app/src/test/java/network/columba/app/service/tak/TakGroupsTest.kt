@@ -3,6 +3,7 @@ package network.columba.app.service.tak
 import org.json.JSONObject
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -134,5 +135,45 @@ class TakGroupsTest {
         assertTrue(runCatching { TakGroups.secretBytes("too short") }.isFailure)
         assertTrue(runCatching { TakGroups.normaliseTeam("   ") }.isFailure)
         assertTrue(runCatching { TakGroups.groupKey(team, ByteArray(15)) }.isFailure)
+    }
+
+    /**
+     * The card gates Save on this, and the derivation gates the key on
+     * secretBytes. Counting trimmed characters instead disabled Save on a
+     * multibyte secret that was comfortably long enough in bytes.
+     */
+    @Test
+    fun `secretIsUsable agrees with secretBytes on a multibyte secret`() {
+        // Ten characters, thirty bytes: short by character count, fine by bytes.
+        val multibyte = "\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9"
+        assertTrue("ten two-byte characters is twenty bytes", multibyte.length < TakGroups.MIN_SECRET_BYTES)
+
+        assertTrue(TakGroups.secretIsUsable(multibyte))
+        assertEquals(20, TakGroups.secretBytes(multibyte).size)
+    }
+
+    @Test
+    fun `secretIsUsable refuses what secretBytes refuses`() {
+        val tooShort = "short"
+
+        assertFalse(TakGroups.secretIsUsable(tooShort))
+        assertTrue(
+            runCatching { TakGroups.secretBytes(tooShort) }.exceptionOrNull() is IllegalArgumentException,
+        )
+    }
+
+    /**
+     * Unicode whitespace is not stripped by the derivation, so it must not be
+     * stripped by the check either -- otherwise the card and the key disagree
+     * about what the operator typed.
+     */
+    @Test
+    fun `a non-breaking space counts toward the secret on both paths`() {
+        // Fifteen ASCII characters plus a non-breaking space: String.trim()
+        // would remove it and call this too short.
+        val padded = "abcdefghijklmno\u00a0"
+
+        assertTrue(TakGroups.secretIsUsable(padded))
+        assertEquals(TakGroups.secretBytes(padded).size, padded.toByteArray(Charsets.UTF_8).size)
     }
 }

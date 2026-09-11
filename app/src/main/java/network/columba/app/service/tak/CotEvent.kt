@@ -47,11 +47,7 @@ object CotEvent {
      */
     fun rewriteSelfUid(cotXml: String, atakUid: String?, ourUid: String?): String {
         if (atakUid.isNullOrEmpty() || ourUid.isNullOrEmpty()) return cotXml
-        val event = parse(cotXml)
-        if (event.getAttribute("uid") != atakUid) return cotXml
-        val end = startTagEnd(cotXml)
-        val head = if (end < 0) cotXml else cotXml.substring(0, end)
-        val span = attributeValueSpan(head, "uid") ?: return cotXml
+        val span = selfReportUidSpan(cotXml, atakUid) ?: return cotXml
         // Substituted in place rather than re-serialised from the DOM. A round
         // trip through a Transformer is free to reorder attributes, and the
         // tier 2 dictionary was built from the attribute order ATAK actually
@@ -63,6 +59,22 @@ object CotEvent {
     }
 
     /**
+     * Span of the root uid value, but only when the event is [atakUid]'s own
+     * self-report.
+     *
+     * Every way of declining to rewrite is one null from here, so the caller
+     * states the substitution once. A further condition on what may be
+     * rewritten belongs in this function, not as another early return beside
+     * the substitution.
+     */
+    private fun selfReportUidSpan(cotXml: String, atakUid: String): Pair<Int, Int>? {
+        if (parse(cotXml).getAttribute("uid") != atakUid) return null
+        val end = startTagEnd(cotXml)
+        val head = if (end < 0) cotXml else cotXml.substring(0, end)
+        return attributeValueSpan(head, "uid")
+    }
+
+    /**
      * The UID this ATAK calls itself, learned from a self-report.
      *
      * Nothing configures it: ATAK announces its own identifier in every
@@ -71,19 +83,23 @@ object CotEvent {
      * self-report, which includes every marker and every relayed event.
      */
     fun learnAtakUid(cotXml: String): String? {
-        val event = try {
-            parse(cotXml)
-        } catch (_: IllegalArgumentException) {
-            return null
-        }
-        val uid = event.getAttribute("uid")
-        if (uid.isEmpty()) return null
+        val event = parseOrNull(cotXml) ?: return null
         // A self-report describes a unit; ATAK's carries <takv>, which
         // identifies the reporting software. A marker never does, which keeps
         // a marker created here from being mistaken for the device that made it.
-        val detail = childElement(event, "detail") ?: return null
-        return if (childElement(detail, "takv") != null) uid else null
+        val isSelfReport =
+            childElement(event, "detail")
+                ?.let { childElement(it, "takv") != null } == true
+        return event.getAttribute("uid").takeIf { it.isNotEmpty() && isSelfReport }
     }
+
+    /** [parse], but null for input that is not a CoT event at all. */
+    private fun parseOrNull(cotXml: String): Element? =
+        try {
+            parse(cotXml)
+        } catch (_: IllegalArgumentException) {
+            null
+        }
 
     /** Parse a CoT event, refusing the XML features CoT never needs. */
     fun parse(cotXml: String): Element {

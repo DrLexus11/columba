@@ -80,6 +80,18 @@ object TakGroups {
     fun secretBytes(secret: String): ByteArray =
         requireSecret(secret.trim { it in ASCII_WHITESPACE }.toByteArray(Charsets.UTF_8))
 
+    /**
+     * Whether the secret as typed would derive a usable key.
+     *
+     * The same trimming and the same byte count [secretBytes] applies, so the
+     * UI cannot disagree with the derivation about what is acceptable. Counting
+     * characters instead rejected a short multibyte secret that is perfectly
+     * long enough in bytes, and treated Unicode whitespace differently from the
+     * path that actually derives the key.
+     */
+    fun secretIsUsable(secret: String): Boolean =
+        secret.trim { it in ASCII_WHITESPACE }.toByteArray(Charsets.UTF_8).size >= MIN_SECRET_BYTES
+
     /** The shared symmetric key for a team. */
     fun groupKey(team: String, secret: ByteArray): ByteArray =
         hmac(requireSecret(secret), DOMAIN + teamBytes(team)).copyOf(GROUP_KEY_BYTES)

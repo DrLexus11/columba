@@ -198,29 +198,38 @@ class CotEndpointManager
             }
         }
 
+        /**
+         * A setup step that did not succeed, as the one exception
+         * [runEndpoint] retries on.
+         *
+         * Every step below fails for the same reason -- the backend is not
+         * ready yet -- and each has to say which step it was. One helper rather
+         * than a throw per step means the next step added is one line, and the
+         * retry contract stays stated in a single place.
+         */
+        private fun <T> Result<T>.orFail(step: String): T =
+            getOrElse { throw IOException("$step: ${it.message}", it) }
+
         private suspend fun serve(keys: Keys) {
             val identity =
-                rnsCore.identityFromPrivateKey(keys.identityKey).getOrElse { error ->
-                    throw IOException("could not derive the team identity: ${error.message}")
-                }
+                rnsCore.identityFromPrivateKey(keys.identityKey)
+                    .orFail("could not derive the team identity")
             // IN and OUT are separate objects in RNS even though a group is
             // symmetric -- every member both speaks and listens on it. Both are
             // built from the same derived identity so every member lands on the
             // same address.
             val inbound =
                 rnsCore.createGroupDestination(identity, Direction.IN, TakGroups.APP, keys.aspects, keys.groupKey)
-                    .getOrElse { throw IOException("could not join the team: ${it.message}") }
+                    .orFail("could not join the team")
             val outbound =
                 rnsCore.createGroupDestination(identity, Direction.OUT, TakGroups.APP, keys.aspects, keys.groupKey)
-                    .getOrElse { throw IOException("could not address the team: ${it.message}") }
+                    .orFail("could not address the team")
             // The UID names *this node*, never the team. Deriving it from
             // `inbound` -- the group destination -- gave every member of the
             // team the same UID, which ATAK draws as one track teleporting
             // between everybody's positions.
             val nodeIdentity =
-                rnsLxmf.getLxmfIdentity().getOrElse {
-                    throw IOException("no node identity yet: ${it.message}")
-                }
+                rnsLxmf.getLxmfIdentity().orFail("no node identity yet")
             val node =
                 rnsCore.createDestination(
                     nodeIdentity,
@@ -228,7 +237,7 @@ class CotEndpointManager
                     DestinationType.SINGLE,
                     TakIdentity.NODE_APP,
                     TakIdentity.NODE_ASPECTS,
-                ).getOrElse { throw IOException("could not claim a node address: ${it.message}") }
+                ).orFail("could not claim a node address")
 
             // One pipeline per run: the learned ATAK UID belongs to this
             // endpoint's lifetime, not to the process.

@@ -18,6 +18,12 @@ object TakIdentity {
     const val ANNOUNCE_VERSION: Byte = 1
     const val MAX_CALLSIGN = 44
     const val MAX_TEAM = 24
+
+    /** Version byte plus the two declared lengths; the role's is implied. */
+    private const val ANNOUNCE_HEADER = 3
+
+    /** Lower-case hex only, so one destination has exactly one UID. */
+    private const val CANONICAL_HEX = "0123456789abcdef"
     const val DEFAULT_TEAM = "Cyan"
     const val DEFAULT_ROLE = "Team Member"
 
@@ -53,23 +59,35 @@ object TakIdentity {
      * marker for a peer it can address.
      */
     fun destinationFor(uid: String?): ByteArray? {
+        val body = canonicalUidBody(uid) ?: return null
+        // Every character is canonical hex and the length is exact, so the
+        // conversion below cannot fail -- the catch that used to be here could
+        // never fire and only hid which check was doing the work.
+        return ByteArray(DESTINATION_HASH_LENGTH) {
+            body.substring(it * 2, it * 2 + 2).toInt(16).toByte()
+        }
+    }
+
+    /**
+     * The hex body of one of our UIDs, or null for anything else.
+     *
+     * Checked character by character rather than left to toInt(16), which
+     * accepts more than canonical hex -- upper case, and a leading sign -- so
+     * "AB".repeat(16) and bodies containing '+' converted happily and gave an
+     * address for a UID this function reports as invalid. A UID is emitted
+     * lower case; accepting other spellings means one destination has several
+     * UIDs and a peer shows up as two tracks.
+     *
+     * Every reason a UID is not ours is one null from here, so adding another
+     * does not add a branch to the conversion.
+     */
+    private fun canonicalUidBody(uid: String?): String? {
         if (uid == null || !uid.startsWith(UID_PREFIX)) return null
         val body = uid.removePrefix(UID_PREFIX)
-        if (body.length != DESTINATION_HASH_LENGTH * 2) return null
-        // Checked character by character before conversion. toInt(16) accepts
-        // more than canonical hex -- upper case, and a leading sign -- so
-        // "AB".repeat(16) and bodies containing '+' converted happily and gave
-        // an address for a UID this function reports as invalid. A UID is
-        // emitted lower case; accepting other spellings means one destination
-        // has several UIDs and a peer shows up as two tracks.
-        if (body.any { it !in "0123456789abcdef" }) return null
-        return try {
-            ByteArray(DESTINATION_HASH_LENGTH) {
-                body.substring(it * 2, it * 2 + 2).toInt(16).toByte()
-            }
-        } catch (_: NumberFormatException) {
-            null
-        }
+        val canonical =
+            body.length == DESTINATION_HASH_LENGTH * 2 &&
+                body.all { it in CANONICAL_HEX }
+        return body.takeIf { canonical }
     }
 
     /** Encode callsign, team and role for a Reticulum announce's app_data. */
@@ -101,23 +119,41 @@ object TakIdentity {
      * error.
      */
     fun parseAnnounce(payload: ByteArray?): Claims? {
-        if (payload == null || payload.size < 6) return null
-        if (payload[0] != ANNOUNCE_VERSION) return null
-        val callsignLength = payload[1].toInt() and 0xFF
-        val teamLength = payload[2].toInt() and 0xFF
-        val body = payload.copyOfRange(3, payload.size)
-        val roleLength = body.size - callsignLength - teamLength
-        if (callsignLength < 1 || teamLength < 1 || roleLength < 1) return null
-        if (callsignLength > MAX_CALLSIGN || teamLength > MAX_TEAM || roleLength > MAX_TEAM) return null
+        if (payload == null || payload.size < ANNOUNCE_HEADER + 3 || payload[0] != ANNOUNCE_VERSION) return null
+        val lengths = announceLengths(payload) ?: return null
+        val body = payload.copyOfRange(ANNOUNCE_HEADER, payload.size)
         return try {
             Claims(
-                callsign = decodeStrict(body, 0, callsignLength),
-                team = decodeStrict(body, callsignLength, teamLength),
-                role = decodeStrict(body, callsignLength + teamLength, roleLength),
+                callsign = decodeStrict(body, 0, lengths.callsign),
+                team = decodeStrict(body, lengths.callsign, lengths.team),
+                role = decodeStrict(body, lengths.callsign + lengths.team, lengths.role),
             )
         } catch (_: IllegalArgumentException) {
             null
         }
+    }
+
+    /** The three field lengths an announce declares, or null if they disagree. */
+    private class Lengths(val callsign: Int, val team: Int, val role: Int)
+
+    /**
+     * Read the declared lengths and check all three at once.
+     *
+     * Together rather than in sequence: the role's length is whatever the
+     * payload has left, so it is only meaningful once the other two are known,
+     * and a fourth field later is one more line here rather than one more
+     * early return in the caller.
+     */
+    private fun announceLengths(payload: ByteArray): Lengths? {
+        val callsign = payload[1].toInt() and 0xFF
+        val team = payload[2].toInt() and 0xFF
+        val role = payload.size - ANNOUNCE_HEADER - callsign - team
+        val declared = Lengths(callsign, team, role)
+        val fits =
+            callsign in 1..MAX_CALLSIGN &&
+                team in 1..MAX_TEAM &&
+                role in 1..MAX_TEAM
+        return declared.takeIf { fits }
     }
 
     private fun decodeStrict(source: ByteArray, offset: Int, length: Int): String {

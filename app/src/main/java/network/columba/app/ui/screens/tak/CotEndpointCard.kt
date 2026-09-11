@@ -36,6 +36,7 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import network.columba.app.service.tak.CotEndpointManager
+import network.columba.app.service.tak.TakGroups
 import network.columba.app.ui.components.CollapsibleSettingsCard
 
 /**
@@ -65,6 +66,11 @@ fun CotEndpointCard(
     // rather than "the stored secret is empty".
     var secretField by remember { mutableStateOf("") }
     var secretVisible by remember { mutableStateOf(false) }
+    // Asked of TakGroups rather than counted here. The derivation trims ASCII
+    // whitespace and measures UTF-8 bytes; counting trimmed characters instead
+    // disabled Save on a multibyte secret that was long enough, and disagreed
+    // with the derivation about Unicode whitespace.
+    val secretIsUsable = TakGroups.secretIsUsable(secretField)
 
     CollapsibleSettingsCard(
         title = "Local CoT endpoint",
@@ -156,13 +162,13 @@ fun CotEndpointCard(
                     )
                 }
             },
-            isError = secretField.isNotEmpty() && secretField.trim().length < MIN_SECRET_CHARS,
+            isError = secretField.isNotEmpty() && !secretIsUsable,
             supportingText = {
                 Text(
                     text =
                         when {
-                            secretField.isNotEmpty() && secretField.trim().length < MIN_SECRET_CHARS ->
-                                "At least $MIN_SECRET_CHARS characters"
+                            secretField.isNotEmpty() && !secretIsUsable ->
+                                "At least ${TakGroups.MIN_SECRET_BYTES} bytes"
                             secretTooShort -> "The stored secret is too short to use"
                             hasFleetSecret -> "A secret is stored. Leave blank to keep it."
                             // Not a hint to invent one: every node in the fleet
@@ -189,7 +195,7 @@ fun CotEndpointCard(
                     secretField = ""
                     secretVisible = false
                 },
-                enabled = secretField.trim().length >= MIN_SECRET_CHARS,
+                enabled = secretIsUsable,
                 modifier = Modifier.weight(1f),
             ) {
                 Text("Save secret")
@@ -302,4 +308,3 @@ private fun EndpointStatus(
 }
 
 /** Matches TakGroups.MIN_SECRET_BYTES; ASCII, so characters and bytes agree. */
-private const val MIN_SECRET_CHARS = 16
