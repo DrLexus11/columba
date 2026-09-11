@@ -24,6 +24,9 @@ import kotlinx.coroutines.withContext
 import network.columba.app.di.ApplicationScope
 import network.columba.app.repository.SettingsRepository
 import network.columba.app.service.PositionCodec
+import java.text.SimpleDateFormat
+import java.util.Locale
+import java.util.TimeZone
 import network.columba.app.rns.api.RnsCore
 import network.columba.app.rns.api.RnsLxmf
 import network.columba.app.rns.api.model.Destination
@@ -406,13 +409,18 @@ class CotEndpointManager
         }
 
         private suspend fun forwardToMesh(cotXml: String, session: Session) {
-            // Our own position takes the typed path: 94% of what ATAK emits is
-            // a position report, and as compressed CoT addressed to every
-            // member that is most of a LoRa channel. The echo guard is asked
-            // first, through the pipeline's own check rather than a second copy
-            // of it.
-            if (session.pipeline.atakUid != null && CotPosition.isPosition(cotXml)) {
-                if (!session.pipeline.isEcho(cotXml) && forwardPosition(cotXml, session)) return
+            // The typed codecs come first, and the echo guard is asked once
+            // for both rather than once each -- through the pipeline's own
+            // check, not a second copy of it.
+            //
+            // Position because 94% of what ATAK emits is a position report, and
+            // as compressed CoT addressed to every member that is most of a
+            // LoRa channel. Chat because a real GeoChat line compresses to more
+            // than one packet, so on tier 2 it is not expensive, it is
+            // undeliverable.
+            if (session.pipeline.atakUid != null && !session.pipeline.isEcho(cotXml)) {
+                if (CotPosition.isPosition(cotXml) && forwardPosition(cotXml, session)) return
+                if (forwardChat(cotXml, session)) return
             }
             val known = session.pipeline.atakUid
             val frame = session.pipeline.frame(cotXml) ?: return
@@ -436,6 +444,20 @@ class CotEndpointManager
                 ?: return false
             if (!session.gate.allows(fix, System.currentTimeMillis())) return true
             fanOut(PositionCodec.encode(fix), session)
+            return true
+        }
+
+        /**
+         * Send a chat line or a receipt as tens of bytes, if it is one.
+         *
+         * True when this event was handled here, so it does not then also go
+         * out as CoT.
+         */
+        private suspend fun forwardChat(cotXml: String, session: Session): Boolean {
+            val frame =
+                CotChat.chatFromCot(cotXml, TakMembership.senderIdFor(session.node.hash))
+                    ?: return false
+            fanOut(frame, session)
             return true
         }
 
@@ -476,13 +498,15 @@ class CotEndpointManager
         private suspend fun pumpMeshToClients(session: Session) {
             rnsCore.observePackets().collect { packet ->
                 if (!packet.destination.hash.contentEquals(session.node.hash)) return@collect
-                // Byte zero is the format version of whichever codec produced
-                // this, and the two in use differ: tier 2 frames open with 1,
-                // position reports with 2. Cheap, and asserted in the tests so
-                // the day they collide is the day a test fails rather than the
-                // day a track lands in the wrong place.
-                if (packet.data.firstOrNull()?.toInt() == PositionCodec.WIRE_VERSION) {
-                    if (renderPosition(packet.data, session)) return@collect
+                // Byte zero says which codec produced this. One namespace
+                // shared by all of them rather than three independent version
+                // counters -- see TakPayload for why that distinction matters.
+                when (TakPayload.kindOf(packet.data)) {
+                    TakPayload.POSITION_V2 ->
+                        if (renderPosition(packet.data, session)) return@collect
+                    TakPayload.CHAT_V1 ->
+                        if (renderChat(packet.data, session)) return@collect
+                    else -> Unit
                 }
                 val xml =
                     try {
@@ -516,6 +540,34 @@ class CotEndpointManager
             )
             return true
         }
+
+        /** Render a peer's chat line or receipt as CoT for the local ATAK. */
+        private suspend fun renderChat(raw: ByteArray, session: Session): Boolean {
+            val message = CotChat.decode(raw) ?: return false
+            val sender =
+                session.registry.resolveSenderId(message.senderId, System.currentTimeMillis())
+                    // Chat from a node this team has never heard announce.
+                    // Dropping it is the honest option: putting words on an
+                    // operator's screen under an identity we cannot name is
+                    // worse than not showing them at all.
+                    ?: return true
+            val claims = session.registry.describe(sender)
+            writeToClients(
+                CotChat.buildChatCot(
+                    message,
+                    TakIdentity.uidFor(sender),
+                    claims?.callsign ?: "UNKNOWN",
+                    cotTime(System.currentTimeMillis()),
+                ).toByteArray(Charsets.UTF_8),
+            )
+            return true
+        }
+
+        /** CoT wants ISO 8601 in UTC with a Z, to millisecond precision. */
+        private fun cotTime(millis: Long): String =
+            SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US)
+                .apply { timeZone = TimeZone.getTimeZone("UTC") }
+                .format(java.util.Date(millis))
 
         private suspend fun writeToClients(payload: ByteArray) {
             // Set on whichever IO thread does the writing, for the same reason.
