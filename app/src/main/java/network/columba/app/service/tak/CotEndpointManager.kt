@@ -23,6 +23,7 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import network.columba.app.di.ApplicationScope
 import network.columba.app.repository.SettingsRepository
+import network.columba.app.service.PositionCodec
 import network.columba.app.rns.api.RnsCore
 import network.columba.app.rns.api.RnsLxmf
 import network.columba.app.rns.api.model.Destination
@@ -45,10 +46,17 @@ import javax.inject.Singleton
  * moment the command post went away, including two people standing next to each
  * other.
  *
- * Everything ATAK sends goes to the team's GROUP destination; everything the
- * team sends is written back to every connected client. Command is a member of
- * the group rather than a hop in it, which is what lets a team keep working
- * with command out of range.
+ * Everything ATAK sends is addressed to each member of the team; everything
+ * the team sends is written back to every connected client. Command is a member
+ * rather than a hop, which is what lets a team keep working with command out of
+ * range.
+ *
+ * Not a GROUP destination, which is what this used to be. Pivot 5 of
+ * TAKIntegrationPivots.md, measured: a group packet reaches only peers on the
+ * same interface as the sender, and any intermediary at all -- including a
+ * shared Reticulum instance on the same host -- spends its single hop. A team
+ * is a membership set instead, learned from announces, and addressed traffic
+ * routes.
  */
 @Singleton
 class CotEndpointManager
@@ -106,13 +114,37 @@ class CotEndpointManager
              * actually wrong.
              */
             private const val SOCKET_TAG = 0x7A4B
+
+            /**
+             * How often this node re-announces its membership.
+             *
+             * Announces are how Reticulum learns paths and are deliberately
+             * expensive, so this is not a heartbeat. Members are kept far
+             * longer than this, so a missed announce costs nothing.
+             */
+            private const val ANNOUNCE_INTERVAL_MS = 30L * 60 * 1000
+
+            /**
+             * How long a peer's position is worth drawing before the track
+             * should go grey.
+             *
+             * Twice the report floor: one missed report is a radio being a
+             * radio, two is worth an operator noticing. A track that never goes
+             * stale is a marker where somebody used to be, still being trusted.
+             */
+            private const val POSITION_STALE_MS = 2 * CotPosition.DEFAULT_INTERVAL_MS
         }
 
         /** What the endpoint is doing, for the settings screen. */
         sealed interface State {
             data object Stopped : State
 
-            data class Listening(val team: String, val destinationHash: String, val clients: Int) : State
+            data class Listening(
+                val team: String,
+                val destinationHash: String,
+                val clients: Int,
+                val members: Int = 0,
+            ) : State
 
             data class Failed(val reason: String) : State
         }
@@ -211,25 +243,12 @@ class CotEndpointManager
             getOrElse { throw IOException("$step: ${it.message}", it) }
 
         private suspend fun serve(keys: Keys) {
-            val identity =
-                rnsCore.identityFromPrivateKey(keys.identityKey)
-                    .orFail("could not derive the team identity")
-            // IN and OUT are separate objects in RNS even though a group is
-            // symmetric -- every member both speaks and listens on it. Both are
-            // built from the same derived identity so every member lands on the
-            // same address.
-            val inbound =
-                rnsCore.createGroupDestination(identity, Direction.IN, TakGroups.APP, keys.aspects, keys.groupKey)
-                    .orFail("could not join the team")
-            val outbound =
-                rnsCore.createGroupDestination(identity, Direction.OUT, TakGroups.APP, keys.aspects, keys.groupKey)
-                    .orFail("could not address the team")
-            // The UID names *this node*, never the team. Deriving it from
-            // `inbound` -- the group destination -- gave every member of the
-            // team the same UID, which ATAK draws as one track teleporting
-            // between everybody's positions.
-            val nodeIdentity =
-                rnsLxmf.getLxmfIdentity().orFail("no node identity yet")
+            // No group destination. Pivot 5: a group packet reaches only peers
+            // on the same interface as the sender, so a team is a membership
+            // set and traffic for it is addressed to each member.
+            //
+            // The UID names *this node*, never the team.
+            val nodeIdentity = rnsLxmf.getLxmfIdentity().orFail("no node identity yet")
             val node =
                 rnsCore.createDestination(
                     nodeIdentity,
@@ -239,9 +258,16 @@ class CotEndpointManager
                     TakIdentity.NODE_ASPECTS,
                 ).orFail("could not claim a node address")
 
-            // One pipeline per run: the learned ATAK UID belongs to this
-            // endpoint's lifetime, not to the process.
-            val pipeline = CotOutbound(TakIdentity.uidFor(node.hash))
+            // One session per run: the learned ATAK UID, the member list and
+            // the position cadence all belong to this endpoint's lifetime
+            // rather than to the process.
+            val session = Session(
+                node = node,
+                team = keys.team,
+                pipeline = CotOutbound(TakIdentity.uidFor(node.hash)),
+                registry = TakMembership.Registry(keys.team, keys.secret, ownHash = node.hash),
+                payload = TakMembership.memberPayload(keys.team, keys.secret, keys.callsign),
+            )
 
             withContext(Dispatchers.IO) {
                 // Applies to every socket this thread opens from here on,
@@ -264,19 +290,23 @@ class CotEndpointManager
                     listener.bind(java.net.InetSocketAddress(InetAddress.getByName(BIND_HOST), PORT), 8)
                     Log.i(
                         TAG,
-                        "Team ${keys.team} on ${inbound.hexHash} as ${pipeline.ourUid}; " +
+                        "Team ${keys.team}, this node is ${session.pipeline.ourUid}; " +
                             "point ATAK at $BIND_HOST:$PORT, TCP, no SSL",
                     )
-                    publishState(keys.team, inbound, clientsLock.withLock { clients.size })
+                    publishState(session, clientsLock.withLock { clients.size })
 
-                    val fromMesh = launch { pumpMeshToClients(inbound) }
+                    val fromMesh = launch { pumpMeshToClients(session) }
+                    val fromAnnounces = launch { learnMembers(session) }
+                    val beacon = launch { announceForever(session) }
                     try {
                         while (isActive) {
                             val connection = listener.accept()
                             connection.tcpNoDelay = true
-                            launch { serveClient(connection, outbound, pipeline, keys.team, inbound) }
+                            launch { serveClient(connection, session) }
                         }
                     } finally {
+                        beacon.cancel()
+                        fromAnnounces.cancel()
                         fromMesh.cancel()
                         // NonCancellable because this finally runs *during*
                         // cancellation, and a suspending call there would be
@@ -289,26 +319,79 @@ class CotEndpointManager
             }
         }
 
+        // ---- membership ----
+
+        /**
+         * Say who we are, so peers can address us.
+         *
+         * Without this the UID derived in pivot 1 decodes to a destination
+         * nothing has a path to: correct, and unreachable. The payload carries
+         * an HMAC of the team rather than its name, so announcing does not undo
+         * what TakGroups goes to trouble to hide.
+         */
+        private suspend fun announce(session: Session) {
+            rnsCore.announceDestination(session.node, session.payload)
+                .onFailure { Log.w(TAG, "Announce failed: ${it.message}") }
+        }
+
+        private suspend fun announceForever(session: Session) {
+            announce(session)
+            while (currentCoroutineContext().isActive) {
+                delay(ANNOUNCE_INTERVAL_MS)
+                announce(session)
+            }
+        }
+
+        /**
+         * Learn team members from the announces this node already hears.
+         *
+         * Most of what arrives here is not ours -- another team, or software
+         * that is not this project. The registry decides, and a payload it does
+         * not recognise is ordinary.
+         */
+        private suspend fun learnMembers(session: Session) {
+            rnsCore.observeAnnounces().collect { announceEvent ->
+                val arrival =
+                    session.registry.remember(
+                        announceEvent.destinationHash,
+                        announceEvent.appData,
+                        System.currentTimeMillis(),
+                    )
+                if (arrival != TakMembership.Arrival.NEW) return@collect
+                val claims = session.registry.describe(announceEvent.destinationHash)
+                Log.i(
+                    TAG,
+                    "Team member ${claims?.callsign ?: "?"} is " +
+                        TakIdentity.uidFor(announceEvent.destinationHash),
+                )
+                publishState(session, clientsLock.withLock { clients.size })
+                // Say who we are back. A node that starts late hears everyone
+                // who announces after it and nobody who announced before, so
+                // without this the first node up stays invisible to the second
+                // until the next re-announce -- half an hour of a team that
+                // cannot see its own members. Greeting only happens for a
+                // member that was not already known, so the reply it provokes
+                // finds a known member and goes no further.
+                if (session.registry.shouldGreet(System.currentTimeMillis())) {
+                    announce(session)
+                }
+            }
+        }
+
         // ---- ATAK -> mesh ----
 
-        private suspend fun serveClient(
-            connection: Socket,
-            outbound: Destination,
-            pipeline: CotOutbound,
-            team: String,
-            inbound: Destination,
-        ) {
+        private suspend fun serveClient(connection: Socket, session: Session) {
             TrafficStats.setThreadStatsTag(SOCKET_TAG)
             val stream = CotStream()
             val buffer = ByteArray(READ_BUFFER)
-            publishState(team, inbound, clientsLock.withLock { clients.add(connection); clients.size })
+            publishState(session, clientsLock.withLock { clients.add(connection); clients.size })
             try {
                 val input = connection.getInputStream()
                 while (true) {
                     val read = input.read(buffer)
                     if (read <= 0) break
                     for (event in stream.feed(buffer, read)) {
-                        forwardToMesh(event, outbound, pipeline)
+                        forwardToMesh(event, session)
                     }
                 }
             } catch (_: IOException) {
@@ -317,41 +400,121 @@ class CotEndpointManager
                 withContext(NonCancellable) {
                     val remaining = clientsLock.withLock { clients.remove(connection); clients.size }
                     runCatching { connection.close() }
-                    publishState(team, inbound, remaining)
+                    publishState(session, remaining)
                 }
             }
         }
 
-        private suspend fun forwardToMesh(
-            cotXml: String,
-            outbound: Destination,
-            pipeline: CotOutbound,
-        ) {
-            val known = pipeline.atakUid
-            val frame = pipeline.frame(cotXml) ?: return
-            if (known == null) {
-                pipeline.atakUid?.let { Log.i(TAG, "This ATAK calls itself $it") }
+        private suspend fun forwardToMesh(cotXml: String, session: Session) {
+            // Our own position takes the typed path: 94% of what ATAK emits is
+            // a position report, and as compressed CoT addressed to every
+            // member that is most of a LoRa channel. The echo guard is asked
+            // first, through the pipeline's own check rather than a second copy
+            // of it.
+            if (session.pipeline.atakUid != null && CotPosition.isPosition(cotXml)) {
+                if (!session.pipeline.isEcho(cotXml) && forwardPosition(cotXml, session)) return
             }
-            rnsCore.sendPacket(outbound, frame)
-                .onFailure { Log.w(TAG, "Could not send to the team: ${it.message}") }
+            val known = session.pipeline.atakUid
+            val frame = session.pipeline.frame(cotXml) ?: return
+            if (known == null) {
+                session.pipeline.atakUid?.let { Log.i(TAG, "This ATAK calls itself $it") }
+            }
+            fanOut(frame, session)
+        }
+
+        /**
+         * Send a position as twenty-one bytes, if it is due.
+         *
+         * True when this event was handled here, whether or not anything went
+         * on the air: a suppressed report is handled, and must not then also be
+         * sent as CoT.
+         */
+        private suspend fun forwardPosition(cotXml: String, session: Session): Boolean {
+            val fix = CotPosition.fixFromCot(cotXml, TakMembership.senderIdFor(session.node.hash))
+                // Shaped like a position and carrying none. Not ours to encode,
+                // so it falls through to tier 2 rather than being dropped.
+                ?: return false
+            if (!session.gate.allows(fix, System.currentTimeMillis())) return true
+            fanOut(PositionCodec.encode(fix), session)
+            return true
+        }
+
+        /**
+         * Send one frame to every member of the team.
+         *
+         * One routed unicast each, because that is the only thing that crosses
+         * a hop. The airtime is real and is why position does not come this way
+         * as CoT: a marker is an operator action and rare, a position report is
+         * a beacon.
+         */
+        private suspend fun fanOut(frame: ByteArray, session: Session) {
+            val now = System.currentTimeMillis()
+            for (memberHash in session.registry.members(now)) {
+                val identity = rnsCore.recallIdentity(memberHash)
+                if (identity == null) {
+                    // Heard the announce, lost the identity -- possible after a
+                    // restart. Ask for the path; the next event will find it.
+                    rnsCore.requestPath(memberHash)
+                    continue
+                }
+                val destination =
+                    rnsCore.createDestination(
+                        identity,
+                        Direction.OUT,
+                        DestinationType.SINGLE,
+                        TakIdentity.NODE_APP,
+                        TakIdentity.NODE_ASPECTS,
+                    ).getOrNull() ?: continue
+                // One unreachable member must not cost the others their copy.
+                rnsCore.sendPacket(destination, frame)
+                    .onFailure { Log.w(TAG, "Could not reach a member: ${it.message}") }
+            }
         }
 
         // ---- mesh -> ATAK ----
 
-        private suspend fun pumpMeshToClients(inbound: Destination) {
+        private suspend fun pumpMeshToClients(session: Session) {
             rnsCore.observePackets().collect { packet ->
-                if (!packet.destination.hash.contentEquals(inbound.hash)) return@collect
+                if (!packet.destination.hash.contentEquals(session.node.hash)) return@collect
+                // Byte zero is the format version of whichever codec produced
+                // this, and the two in use differ: tier 2 frames open with 1,
+                // position reports with 2. Cheap, and asserted in the tests so
+                // the day they collide is the day a test fails rather than the
+                // day a track lands in the wrong place.
+                if (packet.data.firstOrNull()?.toInt() == PositionCodec.WIRE_VERSION) {
+                    if (renderPosition(packet.data, session)) return@collect
+                }
                 val xml =
                     try {
                         CotTier2.decode(packet.data)
                     } catch (_: IllegalArgumentException) {
-                        // A frame we cannot read is ordinary on a shared
-                        // destination: an older node, a newer dictionary, or
-                        // simply not ours.
+                        // A frame we cannot read is ordinary: an older node, a
+                        // newer dictionary, or simply not ours.
                         return@collect
                     }
                 writeToClients(xml.toByteArray(Charsets.UTF_8))
             }
+        }
+
+        /** Render a peer's position report as CoT for the local ATAK. */
+        private suspend fun renderPosition(raw: ByteArray, session: Session): Boolean {
+            val fix = PositionCodec.decode(raw) ?: return false
+            // Four bytes of identity is a lookup key here, not an identity.
+            // Membership is the table that turns it back into a whole
+            // destination hash, so a peer's track carries the same UID as
+            // everything else that node sends rather than a track of its own.
+            val sender = session.registry.resolveSenderId(fix.senderId, System.currentTimeMillis())
+                ?: return true
+            val claims = session.registry.describe(sender)
+            writeToClients(
+                CotPosition.buildCot(
+                    fix,
+                    TakIdentity.uidFor(sender),
+                    claims?.callsign ?: "UNKNOWN",
+                    POSITION_STALE_MS,
+                ).toByteArray(Charsets.UTF_8),
+            )
+            return true
         }
 
         private suspend fun writeToClients(payload: ByteArray) {
@@ -385,20 +548,47 @@ class CotEndpointManager
             for (client in closing) runCatching { client.close() }
         }
 
-        private fun publishState(team: String, inbound: Destination, clientCount: Int) {
-            _state.value = State.Listening(team, inbound.hexHash, clientCount)
+        private fun publishState(session: Session, clientCount: Int) {
+            _state.value = State.Listening(
+                session.team,
+                session.node.hexHash,
+                clientCount,
+                session.registry.size,
+            )
         }
 
         /**
-         * Everything derived from the team name and the fleet secret.
+         * Everything one run of the endpoint owns.
+         *
+         * Grouped rather than passed as five parameters: every one of these has
+         * the lifetime of a single serve() call, and a member list or a learned
+         * ATAK UID surviving a team change would be a claim about a team this
+         * node is no longer on.
+         */
+        private class Session(
+            val node: Destination,
+            val team: String,
+            val pipeline: CotOutbound,
+            val registry: TakMembership.Registry,
+            val payload: ByteArray,
+            val gate: CotPosition.PositionGate = CotPosition.PositionGate(),
+        )
+
+        /**
+         * What the team name and the fleet secret derive.
          *
          * Computed once per endpoint rather than per packet: these are HMACs
          * over a secret, and recomputing them in a send path would be both
          * waste and one more place for the secret to be held.
          */
-        private class Keys(val team: String, secret: ByteArray) {
-            val groupKey: ByteArray = TakGroups.groupKey(team, secret)
-            val identityKey: ByteArray = TakGroups.groupIdentityKey(team, secret)
-            val aspects: List<String> = TakGroups.groupAspects(team, secret)
+        private class Keys(val team: String, val secret: ByteArray) {
+            /**
+             * How this node identifies itself to the team.
+             *
+             * Derived rather than configured for now: a callsign setting is UI
+             * that PR B does not have yet, and a node announcing nothing at all
+             * would be worse than one announcing a name nobody chose.
+             */
+            val callsign: String = "COLUMBA"
         }
     }

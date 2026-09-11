@@ -28,6 +28,15 @@ class CotOutbound(val ourUid: String) {
      * Null is ordinary and covers three cases: our own event coming back,
      * something that is not CoT at all, and an event we could not encode.
      */
+    /**
+     * Whether this event is our own, come back to us.
+     *
+     * Exposed so a caller routing an event to a different codec can ask the
+     * same question [frame] asks, rather than reimplementing the guard and
+     * getting the order wrong -- which is the bug this class exists to stop.
+     */
+    fun isEcho(cotXml: String): Boolean = CotEvent.isSelfAddressed(cotXml, ourUid)
+
     fun frame(cotXml: String): ByteArray? {
         // Validated here rather than relied on downstream. rewriteSelfUid
         // returns early -- without parsing -- until an ATAK UID has been
