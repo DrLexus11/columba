@@ -59,6 +59,27 @@ object TakGroups {
         return secret
     }
 
+    /**
+     * ASCII whitespace, matching bytes.strip()'s default on the Python side.
+     *
+     * Spelled out rather than left to String.trim(), which is Unicode-aware
+     * and strips more than this. A non-breaking space in a pasted secret would
+     * then be removed here and kept there, deriving two different keys from
+     * what an operator typed once.
+     */
+    private const val ASCII_WHITESPACE = " \t\n\r\u000B\u000C"
+
+    /**
+     * The exact bytes the Python side derives from, given the same secret.
+     *
+     * `tools/tak_groups.py` strips whichever way the secret arrived: a file
+     * written with `echo` carries a trailing newline, and an operator pasting
+     * the same characters into a phone may add a space. Both must reach the
+     * same key, or each member broadcasts happily and hears nothing.
+     */
+    fun secretBytes(secret: String): ByteArray =
+        requireSecret(secret.trim { it in ASCII_WHITESPACE }.toByteArray(Charsets.UTF_8))
+
     /** The shared symmetric key for a team. */
     fun groupKey(team: String, secret: ByteArray): ByteArray =
         hmac(requireSecret(secret), DOMAIN + teamBytes(team)).copyOf(GROUP_KEY_BYTES)
