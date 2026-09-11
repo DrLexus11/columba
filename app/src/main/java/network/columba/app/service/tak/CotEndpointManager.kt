@@ -1,5 +1,6 @@
 package network.columba.app.service.tak
 
+import android.net.TrafficStats
 import android.util.Log
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -93,6 +94,18 @@ class CotEndpointManager
              * instance during a restart, which clears on its own.
              */
             private const val RETRY_DELAY_MS = 5_000L
+
+            /**
+             * Socket tag for the endpoint's own sockets.
+             *
+             * Android raises an UntaggedSocketViolation for every socket
+             * opened without one. This traffic is loopback, so the accounting
+             * it enables is of no interest -- but an untagged socket logs a
+             * StrictMode violation on every accept, and a log that cries wolf
+             * on healthy behaviour is one nobody reads when something is
+             * actually wrong.
+             */
+            private const val SOCKET_TAG = 0x7A4B
         }
 
         /** What the endpoint is doing, for the settings screen. */
@@ -222,6 +235,9 @@ class CotEndpointManager
             val pipeline = CotOutbound(TakIdentity.uidFor(node.hash))
 
             withContext(Dispatchers.IO) {
+                // Applies to every socket this thread opens from here on,
+                // which is the listener and each connection accepted from it.
+                TrafficStats.setThreadStatsTag(SOCKET_TAG)
                 ServerSocket().use { listener ->
                     // accept() blocks in a way cancellation cannot reach, so
                     // closing the socket is the only thing that unblocks it.
@@ -273,6 +289,7 @@ class CotEndpointManager
             team: String,
             inbound: Destination,
         ) {
+            TrafficStats.setThreadStatsTag(SOCKET_TAG)
             val stream = CotStream()
             val buffer = ByteArray(READ_BUFFER)
             publishState(team, inbound, clientsLock.withLock { clients.add(connection); clients.size })
@@ -329,6 +346,8 @@ class CotEndpointManager
         }
 
         private suspend fun writeToClients(payload: ByteArray) {
+            // Set on whichever IO thread does the writing, for the same reason.
+            TrafficStats.setThreadStatsTag(SOCKET_TAG)
             // Snapshot under the lock, write outside it. A client whose
             // receive window has filled blocks on write for as long as it
             // takes, and holding the lock across that would stall the accept
