@@ -64,6 +64,32 @@ class TakIdentityTest {
     }
 
     @Test
+    fun `a uid body must be canonical hex`() {
+        // toInt(16) accepts more than canonical hex -- upper case, and a
+        // leading sign -- so these converted happily and produced an address
+        // for a UID this function reports as invalid. A UID is emitted lower
+        // case; other spellings mean one destination has several UIDs.
+        for (body in listOf(
+            "AB".repeat(16),
+            "+0".repeat(16),
+            "0".repeat(30) + "  ",
+            " " + "0".repeat(31),
+        )) {
+            assertEquals(TakIdentity.DESTINATION_HASH_LENGTH * 2, body.length)
+            assertNull(body, TakIdentity.destinationFor(TakIdentity.UID_PREFIX + body))
+        }
+    }
+
+    @Test
+    fun `anything returned is a whole destination hash`() {
+        val uid = TakIdentity.UID_PREFIX + "ab".repeat(TakIdentity.DESTINATION_HASH_LENGTH)
+        assertEquals(
+            TakIdentity.DESTINATION_HASH_LENGTH,
+            TakIdentity.destinationFor(uid)!!.size,
+        )
+    }
+
+    @Test
     fun `a hash of the wrong length is refused rather than padded`() {
         assertTrue(runCatching { TakIdentity.uidFor(ByteArray(8)) }.isFailure)
         assertTrue(runCatching { TakIdentity.uidFor(ByteArray(0)) }.isFailure)

@@ -56,6 +56,13 @@ object TakIdentity {
         if (uid == null || !uid.startsWith(UID_PREFIX)) return null
         val body = uid.removePrefix(UID_PREFIX)
         if (body.length != DESTINATION_HASH_LENGTH * 2) return null
+        // Checked character by character before conversion. toInt(16) accepts
+        // more than canonical hex -- upper case, and a leading sign -- so
+        // "AB".repeat(16) and bodies containing '+' converted happily and gave
+        // an address for a UID this function reports as invalid. A UID is
+        // emitted lower case; accepting other spellings means one destination
+        // has several UIDs and a peer shows up as two tracks.
+        if (body.any { it !in "0123456789abcdef" }) return null
         return try {
             ByteArray(DESTINATION_HASH_LENGTH) {
                 body.substring(it * 2, it * 2 + 2).toInt(16).toByte()
