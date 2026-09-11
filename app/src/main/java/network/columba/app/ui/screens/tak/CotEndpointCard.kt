@@ -101,7 +101,7 @@ fun CotEndpointCard(
 
         Spacer(modifier = Modifier.height(12.dp))
 
-        EndpointStatus(endpointState)
+        EndpointStatus(endpointState, hasFleetSecret)
 
         Spacer(modifier = Modifier.height(12.dp))
 
@@ -244,7 +244,10 @@ fun CotEndpointCard(
 }
 
 @Composable
-private fun EndpointStatus(state: CotEndpointManager.State) {
+private fun EndpointStatus(
+    state: CotEndpointManager.State,
+    hasFleetSecret: Boolean,
+) {
     val (headline, detail, tone) =
         when (state) {
             is CotEndpointManager.State.Listening ->
@@ -264,11 +267,23 @@ private fun EndpointStatus(state: CotEndpointManager.State) {
                 Triple("Not listening", state.reason, MaterialTheme.colorScheme.error)
 
             CotEndpointManager.State.Stopped ->
-                Triple(
-                    "Off",
-                    "Set a team and a fleet secret, then turn this on.",
-                    MaterialTheme.colorScheme.onSurfaceVariant,
-                )
+                // Saving a secret and turning the endpoint on are two actions
+                // at opposite ends of the card, and the second is easy to miss
+                // -- it was, the first time this ran on hardware. Once a secret
+                // is stored, say plainly that the only thing left is the switch.
+                if (hasFleetSecret) {
+                    Triple(
+                        "Off -- ready to start",
+                        "Fleet secret stored. Turn on the switch above to start listening.",
+                        MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                } else {
+                    Triple(
+                        "Off",
+                        "Set a team and a fleet secret, then turn this on.",
+                        MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
         }
 
     Column(modifier = Modifier.fillMaxWidth()) {
