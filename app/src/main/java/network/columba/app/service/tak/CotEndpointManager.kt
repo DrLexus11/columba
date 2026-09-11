@@ -421,6 +421,7 @@ class CotEndpointManager
             if (session.pipeline.atakUid != null && !session.pipeline.isEcho(cotXml)) {
                 if (CotPosition.isPosition(cotXml) && forwardPosition(cotXml, session)) return
                 if (forwardChat(cotXml, session)) return
+                if (forwardMarker(cotXml, session)) return
             }
             val known = session.pipeline.atakUid
             val frame = session.pipeline.frame(cotXml) ?: return
@@ -457,6 +458,30 @@ class CotEndpointManager
             val frame =
                 CotChat.chatFromCot(cotXml, TakMembership.senderIdFor(session.node.hash))
                     ?: return false
+            fanOut(frame, session)
+            return true
+        }
+
+        /**
+         * Send a point marker as tens of bytes, if it is one.
+         *
+         * SPI passes a cadence gate first. It is a pointer being dragged across
+         * a map -- 121 of the 853 captured events -- so most of what ATAK emits
+         * is a position it has already superseded, and sending every one would
+         * spend the channel on a cursor.
+         */
+        private suspend fun forwardMarker(cotXml: String, session: Session): Boolean {
+            val frame = CotMarker.markerFromCot(cotXml, TakMembership.senderIdFor(session.node.hash))
+                ?: return false
+            val marker = CotMarker.decode(frame)
+            if (marker != null && marker.type == CotMarker.SPI_TYPE) {
+                val fix = PositionCodec.Fix(latE7 = marker.latE7, lonE7 = marker.lonE7)
+                if (!session.spiGate.allows(fix, System.currentTimeMillis())) {
+                    // Handled: suppressed rather than falling through to tier 2,
+                    // which would spend more airtime than the codec just saved.
+                    return true
+                }
+            }
             fanOut(frame, session)
             return true
         }
@@ -506,6 +531,8 @@ class CotEndpointManager
                         if (renderPosition(packet.data, session)) return@collect
                     TakPayload.CHAT_V1 ->
                         if (renderChat(packet.data, session)) return@collect
+                    TakPayload.MARKER_V1 ->
+                        if (renderMarker(packet.data, session)) return@collect
                     else -> Unit
                 }
                 val xml =
@@ -536,6 +563,31 @@ class CotEndpointManager
                     TakIdentity.uidFor(sender),
                     claims?.callsign ?: "UNKNOWN",
                     POSITION_STALE_MS,
+                ).toByteArray(Charsets.UTF_8),
+            )
+            return true
+        }
+
+        /** Render a peer's marker as CoT for the local ATAK. */
+        private suspend fun renderMarker(raw: ByteArray, session: Session): Boolean {
+            val marker = CotMarker.decode(raw) ?: return false
+            val sender =
+                session.registry.resolveSenderId(marker.senderId, System.currentTimeMillis())
+                    // A marker from a node this team has never heard announce.
+                    // Drawing it under an invented identity puts an object on
+                    // the map nobody can be asked about.
+                    ?: return true
+            val claims = session.registry.describe(sender)
+            val now = System.currentTimeMillis()
+            writeToClients(
+                CotMarker.buildMarkerCot(
+                    marker,
+                    TakIdentity.uidFor(sender),
+                    claims?.callsign ?: "UNKNOWN",
+                    cotTime(now),
+                    // The author's own stale, not one invented here: a spot
+                    // marker is good for a year and an SPI for twenty seconds.
+                    cotTime(now + marker.staleSeconds * 1000L),
                 ).toByteArray(Charsets.UTF_8),
             )
             return true
@@ -624,6 +676,9 @@ class CotEndpointManager
             val registry: TakMembership.Registry,
             val payload: ByteArray,
             val gate: CotPosition.PositionGate = CotPosition.PositionGate(),
+            /** Shorter than position's: a pointer moves continuously. */
+            val spiGate: CotPosition.PositionGate =
+                CotPosition.PositionGate(intervalMs = 5_000),
         )
 
         /**
