@@ -24,6 +24,7 @@ object TakPayload {
     const val COT_TIER2 = 1
     const val POSITION_V2 = 2
     const val CHAT_V1 = 3
+    const val MARKER_V1 = 4
 
     /**
      * Every kind that may appear as byte zero, and what produced it. A reader
@@ -36,6 +37,7 @@ object TakPayload {
             COT_TIER2 to "cot-tier2",
             POSITION_V2 to "position-v2",
             CHAT_V1 to "chat-v1",
+            MARKER_V1 to "marker-v1",
         )
 
     /** The kind byte of a frame, or null if it is empty or unknown. */
@@ -54,5 +56,6 @@ object TakPayload {
         require(CotTier2.VERSION.toInt() in KINDS) { "the tier 2 version is not a registered kind" }
         require(PositionCodec.WIRE_VERSION in KINDS) { "the position version is not a registered kind" }
         require(CotChat.VERSION in KINDS) { "the chat version is not a registered kind" }
+        require(CotMarker.VERSION in KINDS) { "the marker version is not a registered kind" }
     }
 }
