@@ -66,14 +66,30 @@ internal class BoundRnsCore(
                         .toHex(),
                 )
                 appDestinations.registrations().forEach { destination ->
-                    backend.core
-                        .createDestination(
-                            destination.identity,
-                            destination.direction,
-                            destination.type,
-                            destination.appName,
-                            destination.aspects,
-                        ).getOrThrow()
+                    // A GROUP destination cannot be replayed through
+                    // createDestination: it refuses the type, because rebuilding
+                    // one without its key yields a destination that registers,
+                    // announces, receives and decrypts nothing.
+                    val groupKey = appDestinations.groupKeyFor(destination)
+                    if (groupKey != null) {
+                        backend.core
+                            .createGroupDestination(
+                                destination.identity,
+                                destination.direction,
+                                destination.appName,
+                                destination.aspects,
+                                groupKey,
+                            ).getOrThrow()
+                    } else {
+                        backend.core
+                            .createDestination(
+                                destination.identity,
+                                destination.direction,
+                                destination.type,
+                                destination.appName,
+                                destination.aspects,
+                            ).getOrThrow()
+                    }
                 }
             }
         }
@@ -153,6 +169,9 @@ internal class BoundRnsCore(
 
     override suspend fun recallIdentity(hash: ByteArray): Identity? = awaitBound().core.recallIdentity(hash)
 
+    override suspend fun identityFromPrivateKey(privateKey: ByteArray): Result<Identity> =
+        awaitBound().core.identityFromPrivateKey(privateKey)
+
     override suspend fun createIdentityWithName(displayName: String): Map<String, Any> = awaitBound().core.createIdentityWithName(displayName)
 
     override suspend fun importIdentityFile(
@@ -190,6 +209,30 @@ internal class BoundRnsCore(
                     .createDestination(identity, direction, type, appName, aspects)
                     .getOrThrow()
                     .also(appDestinations::remember)
+            }
+        }
+
+    override suspend fun createGroupDestination(
+        identity: Identity,
+        direction: Direction,
+        appName: String,
+        aspects: List<String>,
+        groupKey: ByteArray,
+    ): Result<Destination> =
+        destinationLifecycle.withLock {
+            val backend = awaitBound()
+            runCatching {
+                appDestinations.activateOwner(
+                    backend.lxmf
+                        .getLxmfIdentity()
+                        .getOrThrow()
+                        .hash
+                        .toHex(),
+                )
+                backend.core
+                    .createGroupDestination(identity, direction, appName, aspects, groupKey)
+                    .getOrThrow()
+                    .also { appDestinations.remember(it, groupKey) }
             }
         }
 

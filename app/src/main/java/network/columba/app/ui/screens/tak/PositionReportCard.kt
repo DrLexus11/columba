@@ -1,4 +1,4 @@
-package network.columba.app.ui.screens.settings.cards
+package network.columba.app.ui.screens.tak
 
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column

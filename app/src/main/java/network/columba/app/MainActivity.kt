@@ -1674,6 +1674,9 @@ fun ColumbaNavigation(
                                     onNavigateToNotifications = {
                                         navController.navigate("notification_settings")
                                     },
+                                    onNavigateToTak = {
+                                        navController.navigate("tak_settings")
+                                    },
                                     onNavigateToCustomThemes = {
                                         navController.navigate("theme_management")
                                     },
@@ -2131,6 +2134,12 @@ fun ColumbaNavigation(
 
                             appComposable(AppDestination.NOTIFICATION_SETTINGS) {
                                 NotificationSettingsScreen(
+                                    onNavigateBack = { navController.popBackStack() },
+                                )
+                            }
+
+                            appComposable(AppDestination.TAK_SETTINGS) {
+                                network.columba.app.ui.screens.tak.TakSettingsScreen(
                                     onNavigateBack = { navController.popBackStack() },
                                 )
                             }

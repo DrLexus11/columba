@@ -125,14 +125,16 @@ class NativePacketOperationsTest {
         }
 
     /**
-     * sendPacket re-derives the destination as SINGLE. createDestination does
-     * honour GROUP and PLAIN, so a caller can hold one of those legitimately
-     * and reach sendPacket with it -- and before the type check that arrived as
-     * "Destination hash mismatch", which points at the hash rather than at the
-     * reason the hash was never going to match.
+     * PLAIN carries no identity to derive an address from and nothing creates
+     * one, so it is refused by name rather than silently re-derived as
+     * something else -- which used to surface as "Destination hash mismatch",
+     * pointing at the hash rather than at why it was never going to match.
+     *
+     * GROUP was refused here too until the TAK endpoint needed to address its
+     * team; it is now sent with its registered key, covered above.
      */
     @Test
-    fun `a non-SINGLE destination is refused by type rather than by hash`() =
+    fun `a PLAIN destination is refused by type rather than by hash`() =
         runTest {
             val native =
                 network.reticulum.identity.Identity
@@ -149,25 +151,132 @@ class NativePacketOperationsTest {
                         listOf("tak", "task"),
                     ).getOrThrow()
             try {
-                for (type in listOf(DestinationType.GROUP, DestinationType.PLAIN)) {
-                    val wrongType = destination.copy(direction = Direction.OUT, type = type)
+                val wrongType = destination.copy(direction = Direction.OUT, type = DestinationType.PLAIN)
 
-                    val error = backend.sendPacket(wrongType, byteArrayOf(1, 2, 3)).exceptionOrNull()
+                val error = backend.sendPacket(wrongType, byteArrayOf(1, 2, 3)).exceptionOrNull()
 
-                    assertNotNull("sending to a $type destination must fail", error)
-                    val message = error!!.message.orEmpty()
-                    assertTrue(
-                        "the error should name the type, but was: $message",
-                        message.contains(type.name),
-                    )
-                    assertFalse(
-                        "the type failure must not masquerade as a hash mismatch: $message",
-                        message.contains("hash mismatch"),
-                    )
-                }
+                assertNotNull("sending to a PLAIN destination must fail", error)
+                val message = error!!.message.orEmpty()
+                assertTrue(
+                    "the error should name the type, but was: $message",
+                    message.contains(DestinationType.PLAIN.name),
+                )
+                assertFalse(
+                    "the type failure must not masquerade as a hash mismatch: $message",
+                    message.contains("hash mismatch"),
+                )
             } finally {
                 Transport.findDestination(destination.hash)?.let(Transport::deregisterDestination)
             }
+        }
+
+    /**
+     * The TAK endpoint addresses its team with a GROUP destination, so refusing
+     * every non-SINGLE send made the endpoint receive-only: each event ATAK
+     * produced was logged as a send failure while the map kept drawing everyone
+     * else. The model alone cannot carry the group, since the symmetric key is
+     * not part of it -- the send has to recover the key it was registered with.
+     */
+    @Test
+    fun `a group destination is sent with the key it was registered with`() =
+        runTest {
+            val native =
+                network.reticulum.identity.Identity
+                    .create()
+            val identity = Identity(native.hash, native.getPublicKey(), native.getPrivateKey())
+            val backend = NativeRnsBackendImpl()
+            val groupKey = ByteArray(64) { (it + 1).toByte() }
+            val outbound =
+                backend
+                    .createGroupDestination(
+                        identity,
+                        Direction.OUT,
+                        "rnstransport",
+                        listOf("tak", "group", "abcd"),
+                        groupKey,
+                    ).getOrThrow()
+            assertEquals(DestinationType.GROUP, outbound.type)
+
+            var emitted: network.reticulum.packet.Packet? = null
+            mockkObject(Transport)
+            every { Transport.outbound(any()) } answers {
+                emitted = firstArg()
+                false
+            }
+            try {
+                val receipt = backend.sendPacket(outbound, byteArrayOf(1, 2, 3)).getOrThrow()
+
+                assertNotNull("a group send must reach the transport", emitted)
+                assertArrayEquals(outbound.hash, emitted!!.destinationHash)
+                assertArrayEquals(emitted!!.getHash(), receipt.hash)
+            } finally {
+                unmockkObject(Transport)
+                Transport.findDestination(outbound.hash)?.let(Transport::deregisterDestination)
+            }
+        }
+
+    /**
+     * Sending to a group this backend never registered would encrypt to
+     * something no member can read, which on the mesh is indistinguishable from
+     * sending nothing. It has to say so instead.
+     */
+    @Test
+    fun `a group with no registered key is refused by name`() =
+        runTest {
+            val native =
+                network.reticulum.identity.Identity
+                    .create()
+            val identity = Identity(native.hash, native.getPublicKey(), native.getPrivateKey())
+            val backend = NativeRnsBackendImpl()
+            val stranger =
+                network.columba.app.rns.api.model.Destination(
+                    hash = ByteArray(16) { 0x5a },
+                    hexHash = "5a".repeat(16),
+                    identity = identity,
+                    direction = Direction.OUT,
+                    type = DestinationType.GROUP,
+                    appName = "rnstransport",
+                    aspects = listOf("tak", "group", "ffff"),
+                )
+
+            val error = backend.sendPacket(stranger, byteArrayOf(1)).exceptionOrNull()
+
+            assertNotNull(error)
+            assertTrue(
+                "the error should name the missing key, but was: ${error!!.message}",
+                error.message.orEmpty().contains("group key"),
+            )
+        }
+
+    /**
+     * The Python backend and the interface contract both refuse this. A group
+     * registered without its key registers, announces, receives and decrypts
+     * nothing -- which reads as a peer gone quiet rather than a wrong call.
+     */
+    @Test
+    fun `createDestination refuses a group and points at the keyed call`() =
+        runTest {
+            val native =
+                network.reticulum.identity.Identity
+                    .create()
+            val identity = Identity(native.hash, native.getPublicKey(), native.getPrivateKey())
+            val backend = NativeRnsBackendImpl()
+
+            val error =
+                backend
+                    .createDestination(
+                        identity,
+                        Direction.IN,
+                        DestinationType.GROUP,
+                        "rnstransport",
+                        listOf("tak", "group", "dead"),
+                    ).exceptionOrNull()
+
+            assertNotNull("a keyless group must be refused", error)
+            assertTrue(
+                "the error should name the right call, but was: ${error!!.message}",
+                error.message.orEmpty().contains("createGroupDestination"),
+            )
         }
 
     @Test

@@ -84,6 +84,9 @@ class SettingsRepository
             val POSITION_REPORT_INTERVAL_MINUTES = intPreferencesKey("position_report_interval_minutes")
             val POSITION_GATEWAY_HASH = stringPreferencesKey("position_gateway_hash")
             val POSITION_REPORT_LAST = longPreferencesKey("position_report_last")
+            val TAK_ENDPOINT_ENABLED = booleanPreferencesKey("tak_endpoint_enabled")
+            val TAK_TEAM = stringPreferencesKey("tak_team")
+            val TAK_FLEET_SECRET = stringPreferencesKey("tak_fleet_secret")
             val AUTO_ANNOUNCE_INTERVAL_MINUTES = intPreferencesKey("auto_announce_interval_minutes") // Legacy, for migration
             val AUTO_ANNOUNCE_INTERVAL_HOURS = intPreferencesKey("auto_announce_interval_hours")
             val LAST_AUTO_ANNOUNCE_TIME = longPreferencesKey("last_auto_announce_time")
@@ -718,6 +721,84 @@ class SettingsRepository
                     preferences.remove(PreferencesKeys.POSITION_GATEWAY_HASH)
                 } else {
                     preferences[PreferencesKeys.POSITION_GATEWAY_HASH] = cleaned
+                }
+            }
+        }
+
+        /**
+         * Flow of whether the local CoT endpoint is listening.
+         *
+         * Off by default. The endpoint opens a listening socket and joins a
+         * team broadcast, and neither should begin because the app was
+         * installed -- the same reasoning as position reporting above.
+         */
+        val takEndpointEnabledFlow: Flow<Boolean> =
+            context.dataStore.data
+                .map { preferences ->
+                    preferences[PreferencesKeys.TAK_ENDPOINT_ENABLED] ?: false
+                }.distinctUntilChanged()
+
+        /** Save whether the local CoT endpoint listens. */
+        suspend fun saveTakEndpointEnabled(enabled: Boolean) {
+            context.dataStore.edit { preferences ->
+                preferences[PreferencesKeys.TAK_ENDPOINT_ENABLED] = enabled
+            }
+        }
+
+        /**
+         * Flow of the TAK team name, which selects the group destination.
+         *
+         * Stored as typed; TakGroups normalises case and spacing when deriving
+         * keys, so "Cyan" and "cyan " are one team rather than two that cannot
+         * hear each other.
+         */
+        val takTeamFlow: Flow<String> =
+            context.dataStore.data
+                .map { preferences ->
+                    preferences[PreferencesKeys.TAK_TEAM] ?: "Cyan"
+                }.distinctUntilChanged()
+
+        /** Save the TAK team name. Blank restores the default. */
+        suspend fun saveTakTeam(team: String) {
+            context.dataStore.edit { preferences ->
+                val cleaned = team.trim()
+                if (cleaned.isEmpty()) {
+                    preferences.remove(PreferencesKeys.TAK_TEAM)
+                } else {
+                    preferences[PreferencesKeys.TAK_TEAM] = cleaned
+                }
+            }
+        }
+
+        /**
+         * Flow of the fleet secret every team key derives from, or null.
+         *
+         * Null is the meaningful default, exactly as for the gateway hash: a
+         * device that has not been provisioned with a fleet secret has no team
+         * to join, and must not invent one.
+         *
+         * Stored in app-private preferences rather than the Keystore. That is
+         * the same posture this app already takes with IFAC passphrases, and
+         * for the same reason: it is a *fleet* secret held identically by every
+         * node including the ones with no keystore at all, so wrapping this
+         * copy protects nothing the fleet has not already spread. It is not the
+         * device identity key, which is Keystore-wrapped and stays that way.
+         */
+        val takFleetSecretFlow: Flow<String?> =
+            context.dataStore.data
+                .map { preferences -> preferences[PreferencesKeys.TAK_FLEET_SECRET] }
+                .distinctUntilChanged()
+
+        /** Save the fleet secret. Blank clears it, which disarms the endpoint. */
+        suspend fun saveTakFleetSecret(secret: String) {
+            context.dataStore.edit { preferences ->
+                // Not trimmed. The secret is shared with nodes that read it
+                // from a file, and trimming here would silently derive a
+                // different key from the same provisioning material.
+                if (secret.isEmpty()) {
+                    preferences.remove(PreferencesKeys.TAK_FLEET_SECRET)
+                } else {
+                    preferences[PreferencesKeys.TAK_FLEET_SECRET] = secret
                 }
             }
         }

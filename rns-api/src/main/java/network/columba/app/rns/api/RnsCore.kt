@@ -50,6 +50,23 @@ interface RnsCore {
     suspend fun recallIdentity(hash: ByteArray): Identity?
 
     /**
+     * Derive an [Identity] from a 64-byte private key, storing nothing.
+     *
+     * A team's identity is derived from the team name and the fleet secret, so
+     * every member computes the same one without being told about the others
+     * (see `TakGroups`). It is not one of the user's identities: it must not be
+     * named, must not reach the identity database, and must not appear in any
+     * picker -- which is why this exists alongside [importIdentityFile] rather
+     * than reusing it.
+     *
+     * Derivation happens in the backend on purpose. The public halves and the
+     * hash must match Reticulum's own derivation exactly, and a reimplementation
+     * that drifts yields an identity that looks entirely valid while addressing
+     * a destination nobody else is on.
+     */
+    suspend fun identityFromPrivateKey(privateKey: ByteArray): Result<Identity>
+
+    /**
      * Multi-identity management.
      *
      * These methods never write plaintext private keys to the app's internal
@@ -103,6 +120,26 @@ interface RnsCore {
         type: DestinationType,
         appName: String,
         aspects: List<String>,
+    ): Result<Destination>
+
+    /**
+     * Create a GROUP destination and load its symmetric key.
+     *
+     * [createDestination] refuses [DestinationType.GROUP] because it has no way
+     * to carry a key, and a group destination without one is the worst kind of
+     * broken: it registers, it announces, it receives packets, and it decrypts
+     * none of them. That reads as a peer that has gone quiet rather than as a
+     * configuration error.
+     *
+     * The key is derived from the team name and the fleet secret, so every
+     * member computes it without being told; see `TakGroups`.
+     */
+    suspend fun createGroupDestination(
+        identity: Identity,
+        direction: Direction,
+        appName: String,
+        aspects: List<String>,
+        groupKey: ByteArray,
     ): Result<Destination>
 
     suspend fun announceDestination(

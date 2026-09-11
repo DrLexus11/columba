@@ -581,6 +581,7 @@ class NativeRnsBackendImpl(
                 destination.type,
                 destination.appName,
                 destination.aspects,
+                appDestinations.groupKeyFor(destination),
             )
         }
     }
@@ -1146,6 +1147,17 @@ class NativeRnsBackendImpl(
             }
         }
 
+    override suspend fun identityFromPrivateKey(privateKey: ByteArray): Result<ColumbaIdentity> =
+        withContext(Dispatchers.IO) {
+            runCatching {
+                // No buildIdentityResult, no database row, no display name: a
+                // derived team identity is not one of the user's identities and
+                // must never turn up in a picker beside them.
+                NativeIdentity.fromBytes(privateKey)?.toColumba()
+                    ?: error("Invalid identity private key")
+            }
+        }
+
     override suspend fun saveIdentity(
         identity: ColumbaIdentity,
         path: String,
@@ -1579,6 +1591,15 @@ class NativeRnsBackendImpl(
         destinationLifecycle.withLock {
             withContext(Dispatchers.IO) {
                 runCatching {
+                    // Matches the Python backend and the interface contract. A
+                    // group registered through here gets groupKey = null, and a
+                    // GROUP destination without its symmetric key is the worst
+                    // shape available: it registers, announces and receives, and
+                    // decrypts nothing -- which reads as a peer gone quiet, not
+                    // as a caller that used the wrong function.
+                    require(type != DestinationType.GROUP) {
+                        "A GROUP destination needs its symmetric key; use createGroupDestination"
+                    }
                     registerDestination(identity, direction, type, appName, aspects)
                         .also(appDestinations::remember)
                 }
@@ -1591,6 +1612,7 @@ class NativeRnsBackendImpl(
         type: DestinationType,
         appName: String,
         aspects: List<String>,
+        groupKey: ByteArray? = null,
     ): ColumbaDestination {
         val nativeIdentity = deliveryIdentity?.takeIf { it.hash.contentEquals(identity.hash) } ?: identity.toNative()
         val nativeDir =
@@ -1614,6 +1636,14 @@ class NativeRnsBackendImpl(
             } else {
                 createNativeDestination(nativeIdentity, nativeDir, nativeType, appName, aspects)
             }
+        if (groupKey != null) {
+            // The symmetric key lives on the destination object itself, so it
+            // must be loaded onto every one built for the group -- the IN and
+            // the OUT, and again after every restart. A group destination
+            // without it registers, announces, receives packets and decrypts
+            // none of them, which reads as a peer gone quiet.
+            dest.loadPrivateKey(groupKey)
+        }
         val model = dest.toColumba(identity)
         if (direction == Direction.IN) {
             dest.packetCallback = { data, _ ->
@@ -1622,6 +1652,23 @@ class NativeRnsBackendImpl(
         }
         return model
     }
+
+    override suspend fun createGroupDestination(
+        identity: ColumbaIdentity,
+        direction: Direction,
+        appName: String,
+        aspects: List<String>,
+        groupKey: ByteArray,
+    ): Result<ColumbaDestination> =
+        destinationLifecycle.withLock {
+            withContext(Dispatchers.IO) {
+                runCatching {
+                    registerDestination(
+                        identity, direction, DestinationType.GROUP, appName, aspects, groupKey,
+                    ).also { appDestinations.remember(it, groupKey) }
+                }
+            }
+        }
 
     private fun announceLocalPeerDestinations(
         appData: ByteArray?,
@@ -1671,26 +1718,10 @@ class NativeRnsBackendImpl(
         withContext(Dispatchers.IO) {
             runCatching {
                 require(packetType == PacketType.DATA) { "Only DATA packets are supported" }
-                // Re-derived as SINGLE below, so anything else must be refused
-                // here rather than silently sent with the wrong semantics.
-                // createDestination() does honour GROUP and PLAIN, so a caller
-                // can hold one of those legitimately and reach this point; the
-                // hash it derives would then not match and the failure arrived
-                // as "Destination hash mismatch", which says nothing about the
-                // actual cause. Mapping the type instead would be guessing:
-                // nothing in the app creates a non-SINGLE destination, so that
-                // path has never been exercised, and a GROUP destination keys
-                // on a shared secret rather than the identity used here.
-                require(destination.type == DestinationType.SINGLE) {
-                    "Only SINGLE destinations can be sent to, but this one is ${destination.type}"
-                }
-                val native = createNativeDestination(
-                    destination.identity.toNative(), DestinationDirection.OUT,
-                    NativeDestinationType.SINGLE, destination.appName, destination.aspects,
-                )
+                val native = outboundNativeDestination(destination)
                 require(native.hash.contentEquals(destination.hash)) {
-                    "Destination hash mismatch: ${destination.hexHash} is not the SINGLE destination " +
-                        "derived from its own identity, app name and aspects"
+                    "Destination hash mismatch: ${destination.hexHash} is not the ${destination.type} " +
+                        "destination derived from its own identity, app name and aspects"
                 }
                 val packet = network.reticulum.packet.Packet.create(native, data)
                 val receipt = packet.send()
@@ -1700,6 +1731,50 @@ class NativeRnsBackendImpl(
                     timestamp = System.currentTimeMillis(),
                 )
             }
+        }
+
+    /**
+     * The live native destination to send this one through.
+     *
+     * A destination model is a description, not a handle: an OUT destination is
+     * not registered with Transport, so it has to be rebuilt here from what the
+     * model carries. For a group that is not enough on its own -- the symmetric
+     * key is not part of the model and never crosses IPC, so it comes from the
+     * registry that createGroupDestination wrote it to.
+     *
+     * Rebuilding every group send as SINGLE was not an option, and neither was
+     * refusing them: the TAK endpoint addresses its team with a GROUP
+     * destination, so refusing made the endpoint receive-only -- every event
+     * ATAK produced was logged as a send failure while the map kept drawing
+     * everyone else's.
+     */
+    private fun outboundNativeDestination(destination: ColumbaDestination): NativeDestination =
+        when (destination.type) {
+            DestinationType.SINGLE ->
+                createNativeDestination(
+                    destination.identity.toNative(), DestinationDirection.OUT,
+                    NativeDestinationType.SINGLE, destination.appName, destination.aspects,
+                )
+
+            DestinationType.GROUP -> {
+                // Without the key this would encrypt to nothing any member
+                // could read, which is indistinguishable on the mesh from
+                // sending nothing at all.
+                val groupKey =
+                    appDestinations.groupKeyFor(destination)
+                        ?: error(
+                            "No group key for ${destination.hexHash}; it was not created " +
+                                "through createGroupDestination on this backend",
+                        )
+                createNativeDestination(
+                    destination.identity.toNative(), DestinationDirection.OUT,
+                    NativeDestinationType.GROUP, destination.appName, destination.aspects,
+                ).also { it.loadPrivateKey(groupKey) }
+            }
+
+            // PLAIN carries no identity to derive from, and nothing in the app
+            // creates one. Refused rather than guessed at.
+            else -> error("Cannot send to a ${destination.type} destination")
         }
 
     override fun observePackets(): Flow<ReceivedPacket> = _packets.asSharedFlow()

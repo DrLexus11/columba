@@ -82,6 +82,7 @@ enum class AppDestination(
     ),
     INTERFACE_STATS("interface_stats/{interfaceId}", "interface_stats/1"),
     NOTIFICATION_SETTINGS("notification_settings"),
+    TAK_SETTINGS("tak_settings"),
     BLOCKED_USERS("blocked_users"),
     THEME_MANAGEMENT("theme_management"),
     THEME_EDITOR_NEW("theme_editor"),

@@ -801,6 +801,32 @@ object TestController {
         }
     }
 
+    /**
+     * Turn the local CoT endpoint on or off.
+     *
+     * Only the switch, never the fleet secret: a secret passed as a broadcast
+     * extra would sit in this machine's shell history and in the phone's
+     * process listing, which is exactly what provisioning it by hand avoids.
+     * The secret is typed once on the TAK settings page; this is the part a
+     * harness needs to drive.
+     */
+    fun handleSetTakEndpoint(context: Context, enabled: Boolean) {
+        ensureInit(context)
+        scope.launch {
+            val secret = settingsRepository!!.takFleetSecretFlow.first()
+            if (enabled && secret.isNullOrEmpty()) {
+                Log.i(LOGCAT_TAG, "tak_endpoint_err reason=no_fleet_secret")
+                return@launch
+            }
+            settingsRepository!!.saveTakEndpointEnabled(enabled)
+            val team = settingsRepository!!.takTeamFlow.first()
+            Log.i(
+                LOGCAT_TAG,
+                "tak_endpoint_set enabled=$enabled team=${escape(team)}",
+            )
+        }
+    }
+
     /** Adds a new TCP-client interface targeting host:port. If an interface
      * with the same name already exists, replaces it (delete-then-insert)
      * so repeat invocations are idempotent. */

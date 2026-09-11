@@ -125,6 +125,7 @@ class PythonRnsCore(
                             destination.type,
                             destination.appName,
                             destination.aspects,
+                            appDestinations.groupKeyFor(destination),
                         )
                     }
                     _networkStatus.value = NetworkStatus.READY
@@ -172,6 +173,19 @@ class PythonRnsCore(
             val identityClass = runtime.rnsModule["Identity"] ?: return@pyCall null
             val recalled = identityClass.callAttr("recall", hash.toPyBytes()) ?: return@pyCall null
             recalled.toModelIdentity().also { runtime.identities[it.hash.toHex()] = recalled }
+        }
+
+    override suspend fun identityFromPrivateKey(privateKey: ByteArray): Result<Identity> =
+        pyResult {
+            val identityClass = runtime.rnsModule["Identity"] ?: error("RNS.Identity missing")
+            val pyId = identityClass.callAttr("from_bytes", privateKey.toPyBytes())
+                ?: throw RnsException(RnsError.Generic("Identity.from_bytes returned None", null))
+            // Cached like any other identity so resolveIdentity() finds it
+            // instead of reconstructing it for every destination, but
+            // deliberately not handed to buildIdentityResult: that is what
+            // makes a *named* identity, and a derived team identity is not one
+            // of the user's.
+            pyId.toModelIdentity().also { runtime.identities[it.hash.toHex()] = pyId }
         }
 
     override suspend fun createIdentityWithName(displayName: String): Map<String, Any> =
@@ -285,8 +299,27 @@ class PythonRnsCore(
         destinationLifecycle.withLock {
             pyResult {
                 runtime.requireRunning()
+                require(type != DestinationType.GROUP) {
+                    "A GROUP destination needs its symmetric key; use createGroupDestination"
+                }
                 registerDestination(identity, direction, type, appName, aspects)
                     .also(appDestinations::remember)
+            }
+        }
+
+    override suspend fun createGroupDestination(
+        identity: Identity,
+        direction: Direction,
+        appName: String,
+        aspects: List<String>,
+        groupKey: ByteArray,
+    ): Result<Destination> =
+        destinationLifecycle.withLock {
+            pyResult {
+                runtime.requireRunning()
+                registerDestination(
+                    identity, direction, DestinationType.GROUP, appName, aspects, groupKey,
+                ).also { appDestinations.remember(it, groupKey) }
             }
         }
 
@@ -298,6 +331,7 @@ class PythonRnsCore(
         type: DestinationType,
         appName: String,
         aspects: List<String>,
+        groupKey: ByteArray? = null,
     ): Destination {
         val destClass = runtime.rnsModule["Destination"] ?: error("RNS.Destination missing")
         val pyIdentity = resolveIdentity(identity)
@@ -318,6 +352,12 @@ class PythonRnsCore(
         val pyDest =
             runtime.destinations[hash]
                 ?: runtime.rnsModule.callAttr("Destination", *args.toTypedArray())
+        if (groupKey != null) {
+            // RNS keeps the group's symmetric key on the destination itself, so
+            // this has to happen for every object built for the group -- the IN
+            // one and the OUT one alike, and again after every restart.
+            pyDest.callAttr("load_private_key", groupKey.toPyBytes())
+        }
         val model = pyDest.toModelDestination(identity, direction, type, appName, aspects)
         runtime.destinations[model.hexHash] = pyDest
         if (direction == Direction.IN) {

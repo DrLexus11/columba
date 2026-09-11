@@ -115,6 +115,14 @@ internal class ClientRnsCore(
         Unit
     }
 
+    override suspend fun identityFromPrivateKey(privateKey: ByteArray): Result<Identity> = runCatching {
+        val bundle = awaitResult { cb -> remote.identityFromPrivateKey(privateKey, cb) }
+        bundle.classLoader = Identity::class.java.classLoader
+        @Suppress("DEPRECATION")
+        bundle.getParcelable<Identity>(BundleKeys.IDENTITY)
+            ?: throw RnsException(RnsError.Generic("identityFromPrivateKey payload missing 'identity'", null))
+    }
+
     override suspend fun recallIdentity(hash: ByteArray): Identity? {
         val bundle = awaitResult { cb -> remote.recallIdentity(hash, cb) }
         bundle.classLoader = Identity::class.java.classLoader
@@ -144,6 +152,24 @@ internal class ClientRnsCore(
 
     override suspend fun signWithIdentity(data: ByteArray): ByteArray? =
         awaitNullableByteArray { cb -> remote.signWithIdentity(data, cb) }
+
+    override suspend fun createGroupDestination(
+        identity: Identity,
+        direction: Direction,
+        appName: String,
+        aspects: List<String>,
+        groupKey: ByteArray,
+    ): Result<Destination> = runCatching {
+        val bundle = awaitResult { cb ->
+            remote.createGroupDestination(identity, direction, appName, aspects, groupKey, cb)
+        }
+        bundle.classLoader = Destination::class.java.classLoader
+        @Suppress("DEPRECATION")
+        bundle.getParcelable<Destination>(BundleKeys.DESTINATION)
+            ?: throw RnsException(
+                RnsError.Generic("createGroupDestination payload missing 'destination'", null),
+            )
+    }
 
     override suspend fun createDestination(
         identity: Identity,

@@ -92,6 +92,9 @@ class ColumbaApplication : Application() {
     lateinit var positionReportManager: network.columba.app.service.PositionReportManager
 
     @Inject
+    lateinit var cotEndpointManager: network.columba.app.service.tak.CotEndpointManager
+
+    @Inject
     lateinit var taskManager: network.columba.app.service.TaskManager
 
     @Inject
@@ -407,6 +410,7 @@ class ColumbaApplication : Application() {
                         autoAnnounceManager.start()
                         timeAuthorityManager.start()
                         positionReportManager.start()
+                        cotEndpointManager.start()
                         taskManager.start()
                         identityResolutionManager.start(applicationScope)
                         propagationNodeManager.start()
@@ -588,6 +592,7 @@ class ColumbaApplication : Application() {
                         autoAnnounceManager.start()
                         timeAuthorityManager.start()
                         positionReportManager.start()
+                        cotEndpointManager.start()
                         taskManager.start()
                         identityResolutionManager.start(applicationScope)
                         propagationNodeManager.start()
@@ -619,6 +624,7 @@ class ColumbaApplication : Application() {
         autoAnnounceManager.stop()
         timeAuthorityManager.stop()
         positionReportManager.stop()
+        cotEndpointManager.stop()
         taskManager.stop()
         messageCollector.stopCollecting()
         identityResolutionManager.stop()

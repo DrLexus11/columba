@@ -52,6 +52,7 @@ import network.columba.app.rns.api.model.DeliveryMethod
  *   network.columba.test.ENABLE_INTERFACE   --es name -> interface_enabled  name=<…> id=<n> applied=true
  *   network.columba.test.ADD_TCP_CLIENT     --es name,host,port -> interface_added name=<…> id=<n> type=TCPClient … applied=true
  *   network.columba.test.REMOVE_INTERFACE   --es name -> interface_removed name=<…> id=<n> applied=true
+ *   network.columba.test.SET_TAK_ENDPOINT  --es on   -> tak_endpoint_set enabled=<bool> team=<…> | tak_endpoint_err …
  *   network.columba.test.SET_PROP_NODE      --es hex  -> prop_node_set hex=<…> | prop_node_err …
  *   network.columba.test.SYNC_PROP                    -> prop_sync_started state=<n> messages_received=<n>
  *   network.columba.test.SEND_IMAGE  --es to,text,path,fmt          -> img_sent id=<hex> | img_send_err …
@@ -289,6 +290,18 @@ class TestReceiver : BroadcastReceiver() {
                     )
                 } else {
                     TestController.handleSetInterfaceEnabled(app, name, enabled = true)
+                }
+            }
+
+            "network.columba.test.SET_TAK_ENDPOINT" -> {
+                val on = intent.getStringExtra("on")?.lowercase()
+                if (on != "true" && on != "false") {
+                    Log.i(
+                        TestController.LOGCAT_TAG,
+                        "tak_endpoint_err reason=missing_or_invalid_on on=$on",
+                    )
+                } else {
+                    TestController.handleSetTakEndpoint(app, on == "true")
                 }
             }
 
