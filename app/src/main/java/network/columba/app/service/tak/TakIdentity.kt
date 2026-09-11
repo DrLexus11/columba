@@ -21,6 +21,21 @@ object TakIdentity {
     const val DEFAULT_TEAM = "Cyan"
     const val DEFAULT_ROLE = "Team Member"
 
+    /**
+     * This node's own destination, which is what a UID must name.
+     *
+     * Not the team's group destination: every member derives that same address
+     * by design, so a UID built from it is the same string on every node --
+     * one track on the map for the whole team, jumping between everyone's
+     * positions. Observed on hardware before this existed.
+     *
+     * SINGLE, so it routes: unlike a GROUP address it goes through Reticulum's
+     * path table and survives more than one hop, which is what makes a UID
+     * usable for addressing a peer rather than merely naming one.
+     */
+    const val NODE_APP = "rnstransport"
+    val NODE_ASPECTS = listOf("tak", "node")
+
     /** The stable ATAK UID for a Reticulum destination. */
     fun uidFor(destinationHash: ByteArray): String {
         require(destinationHash.size == DESTINATION_HASH_LENGTH) {

@@ -23,7 +23,9 @@ import kotlinx.coroutines.withContext
 import network.columba.app.di.ApplicationScope
 import network.columba.app.repository.SettingsRepository
 import network.columba.app.rns.api.RnsCore
+import network.columba.app.rns.api.RnsLxmf
 import network.columba.app.rns.api.model.Destination
+import network.columba.app.rns.api.model.DestinationType
 import network.columba.app.rns.api.model.Direction
 import java.io.IOException
 import java.net.InetAddress
@@ -53,6 +55,7 @@ class CotEndpointManager
     constructor(
         private val settingsRepository: SettingsRepository,
         private val rnsCore: RnsCore,
+        private val rnsLxmf: RnsLxmf,
         @ApplicationScope private val scope: CoroutineScope,
     ) {
         companion object {
@@ -129,6 +132,16 @@ class CotEndpointManager
                         // from the map.
                         .collectLatest { (enabled, team, secret) ->
                             if (!enabled || secret.isNullOrEmpty()) {
+                                // Logged rather than passed over in silence.
+                                // "Configured but switched off" and "never
+                                // started at all" look identical from outside
+                                // the process otherwise, and telling them apart
+                                // was the first thing needed on hardware.
+                                Log.i(
+                                    TAG,
+                                    "Not listening: " +
+                                        if (!enabled) "endpoint is switched off" else "no fleet secret",
+                                )
                                 _state.value = State.Stopped
                                 return@collectLatest
                             }
@@ -187,9 +200,26 @@ class CotEndpointManager
             val outbound =
                 rnsCore.createGroupDestination(identity, Direction.OUT, TakGroups.APP, keys.aspects, keys.groupKey)
                     .getOrElse { throw IOException("could not address the team: ${it.message}") }
+            // The UID names *this node*, never the team. Deriving it from
+            // `inbound` -- the group destination -- gave every member of the
+            // team the same UID, which ATAK draws as one track teleporting
+            // between everybody's positions.
+            val nodeIdentity =
+                rnsLxmf.getLxmfIdentity().getOrElse {
+                    throw IOException("no node identity yet: ${it.message}")
+                }
+            val node =
+                rnsCore.createDestination(
+                    nodeIdentity,
+                    Direction.IN,
+                    DestinationType.SINGLE,
+                    TakIdentity.NODE_APP,
+                    TakIdentity.NODE_ASPECTS,
+                ).getOrElse { throw IOException("could not claim a node address: ${it.message}") }
+
             // One pipeline per run: the learned ATAK UID belongs to this
             // endpoint's lifetime, not to the process.
-            val pipeline = CotOutbound(TakIdentity.uidFor(inbound.hash))
+            val pipeline = CotOutbound(TakIdentity.uidFor(node.hash))
 
             withContext(Dispatchers.IO) {
                 ServerSocket().use { listener ->

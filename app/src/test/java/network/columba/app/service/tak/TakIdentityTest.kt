@@ -70,6 +70,31 @@ class TakIdentityTest {
     }
 
     @Test
+    fun `the node destination naming matches the python side`() {
+        // A UID is built from this; if the two sides name the destination
+        // differently they derive different addresses from the same identity,
+        // and each shows the other as a node it cannot reach.
+        assertEquals(identity.getString("node_app"), TakIdentity.NODE_APP)
+        val aspects = identity.getJSONArray("node_aspects")
+        assertEquals(aspects.length(), TakIdentity.NODE_ASPECTS.size)
+        for (index in 0 until aspects.length()) {
+            assertEquals(aspects.getString(index), TakIdentity.NODE_ASPECTS[index])
+        }
+    }
+
+    @Test
+    fun `the node destination is not the team destination`() {
+        // The collision seen on hardware: both ends derived their UID from the
+        // group destination, so the whole team reported as one track. These
+        // must never be the same pair of app name and aspects.
+        assertTrue(
+            "node and team destinations must differ",
+            TakIdentity.NODE_APP != TakGroups.APP ||
+                TakIdentity.NODE_ASPECTS != TakGroups.ASPECTS,
+        )
+    }
+
+    @Test
     fun `the announce payload matches the python side`() {
         assertEquals(
             identity.getString("announce"),
