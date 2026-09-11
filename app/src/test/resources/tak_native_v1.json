@@ -25,5 +25,17 @@
     "identity_key": "1c640d22658bf1a9329bc93f7df3450b88fc98cc8728bbda552c42b7eaf92a1babe9019de90531f73dd7dd338a27076f4289c5f8b3cc5d1ad945007be0f919ee",
     "aspect": "1679e76b5d19c38d7eb2f36cdc545d7c",
     "destination_hash": "65985cd6f565b5c40638d94c6b955281"
+  },
+  "membership": {
+    "secret": "a fleet secret long enough to pass",
+    "team": "Cyan",
+    "version": 2,
+    "team_tag": "1fcdd98639cfe4d7",
+    "team_tag_bytes": 8,
+    "callsign": "LEXUS",
+    "role": "Team Member",
+    "payload": "021fcdd98639cfe4d7050b4c455855535465616d204d656d626572",
+    "greet_min_interval_seconds": 20,
+    "expiry_seconds": 21600
   }
 }
