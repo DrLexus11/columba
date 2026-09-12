@@ -94,7 +94,23 @@ class CotChatTest {
             decoded, "urtn-" + "ab".repeat(16), "LEXUS",
             "2026-09-11T20:00:00.000Z", "2026-09-11T21:00:00.000Z",
         )
-        assertEquals(decoded, CotChat.decode(CotChat.chatFromCot(rebuilt, sender)))
+        val again = CotChat.decode(CotChat.chatFromCot(rebuilt, sender))!!
+        // Everything that *is* the message survives. The chatroom is the one
+        // field that legitimately differs, because it names the other party
+        // and that differs on each side of a direct message. Presentation,
+        // not content -- and idempotent from the second application on.
+        assertEquals(decoded.copy(room = again.room), again)
+        assertEquals("LEXUS", again.room)
+        val third = CotChat.decode(
+            CotChat.chatFromCot(
+                CotChat.buildChatCot(
+                    again, "urtn-" + "ab".repeat(16), "LEXUS",
+                    "2026-09-11T20:00:00.000Z", "2026-09-11T21:00:00.000Z",
+                ),
+                sender,
+            ),
+        )!!
+        assertEquals(again, third)
     }
 
     @Test
@@ -276,6 +292,30 @@ class CotChatTest {
         val decoded = CotChat.decode(CotChat.chatFromCot(addressedTo(peer), sender))!!
         assertEquals(peer, decoded.recipient)
         assertNotNull(TakIdentity.destinationFor(decoded.recipient))
+    }
+
+    @Test
+    fun `a direct message is headed by its sender`() {
+        // The chatroom names the other party, and that is a different string
+        // on each side. Replaying the author's verbatim gave the recipient a
+        // thread named after themselves -- seen on hardware 2026-09-12, where
+        // a line from DECK opened a conversation headed COLUMBA on COLUMBA's
+        // own phone.
+        val decoded = CotChat.decode(CotChat.chatFromCot(chat.getString("message"), sender))!!
+        val rebuilt = CotChat.buildChatCot(decoded, "urtn-x", "DECK", "2026-09-12T09:00:00.000Z", "2026-09-12T10:00:00.000Z")
+        assertTrue(rebuilt, rebuilt.contains("""chatroom="DECK""""))
+        assertTrue(rebuilt, !rebuilt.contains("""chatroom="Inquisitor""""))
+    }
+
+    @Test
+    fun `a room line keeps its room`() {
+        // A room really is the same string for everybody, so re-heading one
+        // would split a shared conversation into a thread per sender.
+        val event = addressedTo("All Chat Rooms")
+            .replace("""chatroom="Inquisitor"""", """chatroom="All Chat Rooms"""")
+        val decoded = CotChat.decode(CotChat.chatFromCot(event, sender))!!
+        val rebuilt = CotChat.buildChatCot(decoded, "urtn-x", "DECK", "2026-09-12T09:00:00.000Z", "2026-09-12T10:00:00.000Z")
+        assertTrue(rebuilt, rebuilt.contains("""chatroom="All Chat Rooms""""))
     }
 
     @Test

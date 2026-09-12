@@ -350,7 +350,17 @@ object CotChat {
         whenIso: String,
         staleIso: String,
     ): String {
-        val room = escape(message.room)
+        // The chatroom names *the other party*, which is not the same string
+        // on both sides of a direct message. The author wrote their
+        // recipient's callsign there; replaying that verbatim gives the
+        // recipient a thread named after themselves, with the sender's name
+        // buried inside it. Observed on hardware 2026-09-12: a line from DECK
+        // opened a conversation headed COLUMBA on COLUMBA's own device.
+        //
+        // So a direct message is re-headed with the sender's callsign on the
+        // way in. A room line keeps its room, because there the room really is
+        // the same string for everybody.
+        val room = escape(if (message.recipient.isNotEmpty()) callsign else message.room)
         val sender = escape(senderUid)
         // A message's uid is three identifiers concatenated, which is how ATAK
         // threads a conversation; a receipt's uid is the id of the message it

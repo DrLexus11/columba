@@ -329,10 +329,13 @@ class CotEndpointManager
                     val fromLxmf =
                         launch {
                             session.lxmf.frames().collect { frame ->
+                                Log.i(TAG, "TAK chat arrived over LXMF, ${frame.size} bytes")
                                 val rendered =
                                     session.renderer.render(frame, System.currentTimeMillis())
                                 if (rendered is CotRenderer.Rendered.Cot) {
                                     writeToClients(rendered.xml.toByteArray(Charsets.UTF_8))
+                                } else {
+                                    Log.w(TAG, "LXMF frame did not render: $rendered")
                                 }
                             }
                         }
@@ -632,6 +635,8 @@ class CotEndpointManager
         private suspend fun pumpMeshToClients(session: Session) {
             rnsCore.observePackets().collect { packet ->
                 if (!packet.destination.hash.contentEquals(session.node.hash)) return@collect
+                Log.i(TAG, "mesh packet for this node: ${packet.data.size} bytes, " +
+                    "kind=${TakPayload.nameOf(packet.data)}")
                 val payload =
                     when (val rendered = session.renderer.render(packet.data, System.currentTimeMillis())) {
                         is CotRenderer.Rendered.Cot -> rendered.xml
@@ -653,6 +658,8 @@ class CotEndpointManager
         }
 
         private suspend fun writeToClients(payload: ByteArray) {
+            Log.i(TAG, "-> ATAK: ${payload.size} bytes to " +
+                "${clientsLock.withLock { clients.size }} client(s)")
             // Set on whichever IO thread does the writing, for the same reason.
             TrafficStats.setThreadStatsTag(SOCKET_TAG)
             // Snapshot under the lock, write outside it. A client whose
