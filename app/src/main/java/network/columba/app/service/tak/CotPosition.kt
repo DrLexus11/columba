@@ -84,9 +84,8 @@ object CotPosition {
         } catch (_: IllegalArgumentException) {
             return null
         }
-        val point = childElement(event, "point") ?: return null
-        val latitude = point.getAttribute("lat").toDoubleOrNull() ?: return null
-        val longitude = point.getAttribute("lon").toDoubleOrNull() ?: return null
+        val coordinates = coordinatesOf(event) ?: return null
+        val (point, latitude, longitude) = coordinates
         val altitude = measured(point.getAttribute("hae"))
         val track = childElement(event, "detail")?.let { childElement(it, "track") }
         val course = track?.let { measured(it.getAttribute("course")) }
@@ -95,7 +94,12 @@ object CotPosition {
             latE7 = Math.round(latitude * 1e7).toInt(),
             lonE7 = Math.round(longitude * 1e7).toInt(),
             senderId = senderId,
-            fixUnixSeconds = 0,
+            // The event's own time, not zero. buildCot at the far end prefers
+            // this over receipt time precisely so a replayed or delayed fix is
+            // not stamped as newly taken -- and every report carried zero, so
+            // that preference never once applied. Zero remains the fallback
+            // and is the format's word for "not stated".
+            fixUnixSeconds = epochSeconds(event.getAttribute("time")),
             // 0 is the format's own word for unreported. ATAK's 9999999 as
             // metres of accuracy would be a claim about the whole planet.
             accuracyM = measured(point.getAttribute("ce"))
@@ -170,6 +174,59 @@ object CotPosition {
             "<detail>$detail</detail></event>"
     }
 
+    /** The point element and the two coordinates that make it a position. */
+    private data class Coordinates(
+        val point: org.w3c.dom.Element,
+        val latitude: Double,
+        val longitude: Double,
+    )
+
+    /**
+     * The point and its coordinates, or null if any of the three is missing.
+     *
+     * Taken together because none is usable alone: a report with one coordinate
+     * is not half a position, it is not a position. Keeping them in one place
+     * leaves [fixFromCot] a single reason to decline rather than three.
+     */
+    private fun coordinatesOf(event: org.w3c.dom.Element): Coordinates? {
+        val point = childElement(event, "point") ?: return null
+        val latitude = point.getAttribute("lat").toDoubleOrNull()
+        val longitude = point.getAttribute("lon").toDoubleOrNull()
+        return if (latitude != null && longitude != null) {
+            Coordinates(point, latitude, longitude)
+        } else {
+            null
+        }
+    }
+
+    /**
+     * A CoT timestamp as epoch seconds, or 0 if it does not parse.
+     *
+     * CoT writes UTC ISO-8601 with a Z. ATAK emits milliseconds; the standard
+     * permits them to be absent, and a peer running something else may omit
+     * them, so both are accepted. Anything else is not a timestamp we can act
+     * on, and 0 is the wire format's own word for unstated -- better than a
+     * guess, which would claim a fix was taken at a time nobody reported.
+     */
+    internal fun epochSeconds(cotTime: String?): Long {
+        if (cotTime.isNullOrBlank()) return 0
+        for (pattern in TIME_PATTERNS) {
+            val parsed =
+                runCatching {
+                    SimpleDateFormat(pattern, Locale.US)
+                        .apply {
+                            timeZone = TimeZone.getTimeZone("UTC")
+                            isLenient = false
+                        }.parse(cotTime.trim())
+                }.getOrNull()
+            if (parsed != null) return parsed.time / 1000
+        }
+        return 0
+    }
+
+    private val TIME_PATTERNS =
+        listOf("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", "yyyy-MM-dd'T'HH:mm:ss'Z'")
+
     private fun measured(text: String?): Double? {
         val value = text?.toDoubleOrNull() ?: return null
         // ATAK's sentinel for "not known". Treating it as a measurement is how
@@ -207,29 +264,43 @@ object CotPosition {
         private val intervalMs: Long = DEFAULT_INTERVAL_MS,
         private val moveThresholdE7: Int = MOVE_THRESHOLD_E7,
     ) {
+        /**
+         * Guards the cadence state below.
+         *
+         * One gate is shared by every accepted connection, and the decision is
+         * a read-modify-write over four fields: two reports arriving together
+         * could both find themselves due, both pass, and then leave lastSent
+         * and the last coordinates describing neither of them. The limit this
+         * exists to enforce is exactly the thing concurrent reports defeat.
+         *
+         * A plain lock, not a Mutex: the section below never suspends.
+         */
+        private val lock = Any()
         private var lastSent: Long? = null
         private var lastLatE7: Int? = null
         private var lastLonE7: Int? = null
+        private var suppressedCount: Long = 0L
 
-        var suppressed: Long = 0L
-            private set
+        val suppressed: Long get() = synchronized(lock) { suppressedCount }
 
         /** True if this fix should go out, and records it if so. */
-        fun allows(fix: PositionCodec.Fix, now: Long): Boolean {
-            val lastLat = lastLatE7
-            val lastLon = lastLonE7
-            val moved = lastLat != null && lastLon != null &&
-                (Math.abs(fix.latE7.toLong() - lastLat) >= moveThresholdE7 ||
-                    Math.abs(fix.lonE7.toLong() - lastLon) >= moveThresholdE7)
-            val due = lastSent?.let { now - it >= intervalMs } ?: true
-            if (!due && !moved) {
-                suppressed++
-                return false
+        fun allows(fix: PositionCodec.Fix, now: Long): Boolean =
+            synchronized(lock) {
+                val lastLat = lastLatE7
+                val lastLon = lastLonE7
+                val moved = lastLat != null && lastLon != null &&
+                    (Math.abs(fix.latE7.toLong() - lastLat) >= moveThresholdE7 ||
+                        Math.abs(fix.lonE7.toLong() - lastLon) >= moveThresholdE7)
+                val due = lastSent?.let { now - it >= intervalMs } ?: true
+                if (due || moved) {
+                    lastSent = now
+                    lastLatE7 = fix.latE7
+                    lastLonE7 = fix.lonE7
+                    true
+                } else {
+                    suppressedCount++
+                    false
+                }
             }
-            lastSent = now
-            lastLatE7 = fix.latE7
-            lastLonE7 = fix.lonE7
-            return true
-        }
     }
 }

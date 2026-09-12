@@ -3,6 +3,7 @@ package network.columba.app.service.tak
 import org.json.JSONObject
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -181,7 +182,7 @@ class TakMembershipTest {
         val payload = TakMembership.memberPayload(team, secret, "PEER")
         assertEquals(TakMembership.Arrival.NEW, registry.remember(peer, payload, 100))
         assertEquals(TakMembership.Arrival.KNOWN, registry.remember(peer, payload, 200))
-        assertEquals(1, registry.size)
+        assertEquals(1, registry.size(200))
     }
 
     @Test
@@ -241,5 +242,108 @@ class TakMembershipTest {
         registry.remember(first, payload, 100)
         registry.remember(second, payload, 100)
         assertNull(registry.resolveSenderId(TakMembership.senderIdFor(first), 100))
+    }
+
+    /**
+     * The question a send path has to ask, and the one it was not asking.
+     * TakIdentity.destinationFor reverses the uid encoding and establishes
+     * nothing about who is on the team, so a local or hostile CoT client could
+     * name any well-formed uid and have team traffic routed to it.
+     */
+    @Test
+    fun `isMember answers for the team, not for the spelling`() {
+        val registry = TakMembership.Registry(team, secret)
+        val peer = ByteArray(16) { 1 }
+        val stranger = ByteArray(16) { 9 }
+        registry.remember(peer, TakMembership.memberPayload(team, secret, "PEER"), 100)
+
+        assertTrue(registry.isMember(peer, 200))
+        // Never announced: well-formed as a uid, not a member.
+        assertFalse(registry.isMember(stranger, 200))
+        // Heard once, long ago. Not addressable now.
+        assertFalse(registry.isMember(peer, 100 + TakMembership.DEFAULT_EXPIRY_MS + 1))
+    }
+
+    /**
+     * The count shown to the operator was the raw map size, so it only ever
+     * grew: every node ever heard from stayed in it for the endpoint's whole
+     * lifetime and was reported as the size of their team.
+     */
+    @Test
+    fun `the member count is time aware`() {
+        val registry = TakMembership.Registry(team, secret)
+        val first = ByteArray(16) { 1 }
+        val second = ByteArray(16) { 2 }
+        registry.remember(first, TakMembership.memberPayload(team, secret, "ONE"), 100)
+        registry.remember(second, TakMembership.memberPayload(team, secret, "TWO"), 200)
+
+        assertEquals(2, registry.size(300))
+        // Both past expiry: a team of nobody, reported as nobody.
+        assertEquals(0, registry.size(200 + TakMembership.DEFAULT_EXPIRY_MS + 1))
+        assertEquals(registry.members(300).size, registry.size(300))
+    }
+
+    /** An entry nothing should be addressed to is dropped, not accumulated. */
+    @Test
+    fun `an expired member is pruned by a later announce`() {
+        val registry = TakMembership.Registry(team, secret)
+        val gone = ByteArray(16) { 1 }
+        val present = ByteArray(16) { 2 }
+        registry.remember(gone, TakMembership.memberPayload(team, secret, "GONE"), 0)
+
+        val later = TakMembership.DEFAULT_EXPIRY_MS + 1
+        registry.remember(present, TakMembership.memberPayload(team, secret, "HERE"), later)
+
+        assertEquals(1, registry.size(later))
+        assertEquals(1, registry.members(later).size)
+        assertFalse(registry.isMember(gone, later))
+    }
+
+    /**
+     * One registry is written by the announce collector and read by the accept
+     * loop, every client coroutine and both render paths, all on
+     * Dispatchers.IO. An announce landing during a fan-out iteration used to be
+     * free to rehash the map underneath it.
+     */
+    @Test
+    fun `concurrent announces and reads do not corrupt the registry`() {
+        val registry = TakMembership.Registry(team, secret)
+        val payload = TakMembership.memberPayload(team, secret, "PEER")
+        val failures = java.util.concurrent.ConcurrentLinkedQueue<Throwable>()
+        val writers = 4
+        val readers = 4
+        val iterations = 500
+        val start = java.util.concurrent.CountDownLatch(1)
+
+        val threads =
+            (0 until writers).map { worker ->
+                Thread {
+                    start.await()
+                    runCatching {
+                        for (round in 0 until iterations) {
+                            val hash = ByteArray(16) { (worker * 31 + round % 7).toByte() }
+                            registry.remember(hash, payload, 1_000L + round)
+                        }
+                    }.onFailure(failures::add)
+                }
+            } +
+                (0 until readers).map {
+                    Thread {
+                        start.await()
+                        runCatching {
+                            for (round in 0 until iterations) {
+                                val now = 1_000L + round
+                                registry.members(now).forEach { registry.isMember(it, now) }
+                                registry.size(now)
+                            }
+                        }.onFailure(failures::add)
+                    }
+                }
+
+        threads.forEach(Thread::start)
+        start.countDown()
+        threads.forEach { it.join(30_000) }
+
+        assertTrue("concurrent access threw: ${failures.toList()}", failures.isEmpty())
     }
 }

@@ -133,6 +133,23 @@ class CotPositionTest {
         assertEquals(1800, CotPosition.fixFromCot(withTrack("180.0"), senderId = 1)!!.courseDdeg)
     }
 
+    /**
+     * The <track> element of a rendered report, or null.
+     *
+     * A helper rather than four levels of loop inside the assertion: the DOM
+     * walk is incidental to what the test is about, which is that a heading
+     * survives the round trip.
+     */
+    private fun trackOf(cotXml: String): org.w3c.dom.Element? =
+        childrenOf(CotEvent.parse(cotXml))
+            .firstOrNull { it.tagName == "detail" }
+            ?.let { detail -> childrenOf(detail).firstOrNull { it.tagName == "track" } }
+
+    private fun childrenOf(parent: org.w3c.dom.Element): List<org.w3c.dom.Element> {
+        val nodes = parent.childNodes
+        return (0 until nodes.length).mapNotNull { nodes.item(it) as? org.w3c.dom.Element }
+    }
+
     @Test
     fun `a heading survives the whole round trip`() {
         // Through the codec and back out as CoT. This is the assertion that
@@ -142,21 +159,7 @@ class CotPositionTest {
             val fix = CotPosition.fixFromCot(withTrack("%.1f".format(degrees)), senderId = 1)!!
             val back = PositionCodec.decode(PositionCodec.encode(fix))!!
             val rendered = CotPosition.buildCot(back, "urtn-x", "PEER", 120_000)
-            val track = CotEvent.parse(rendered).let { event ->
-                val detail = event.childNodes
-                var found: org.w3c.dom.Element? = null
-                for (i in 0 until detail.length) {
-                    val node = detail.item(i)
-                    if (node is org.w3c.dom.Element && node.tagName == "detail") {
-                        val kids = node.childNodes
-                        for (j in 0 until kids.length) {
-                            val kid = kids.item(j)
-                            if (kid is org.w3c.dom.Element && kid.tagName == "track") found = kid
-                        }
-                    }
-                }
-                found
-            }
+            val track = trackOf(rendered)
             assertNotNull("no track for $degrees", track)
             val got = track!!.getAttribute("course").toDouble()
             // The wire carries 2-degree units, so a heading lands within one.
@@ -245,5 +248,56 @@ class CotPositionTest {
         // at different rates for no reason anyone could see.
         assertEquals(25, CotPosition.MOVE_THRESHOLD_M)
         assertEquals(2245, CotPosition.MOVE_THRESHOLD_E7)
+    }
+
+    /**
+     * The wire timestamp was hard-coded to zero, so buildCot's preference for
+     * the author's own time never once applied and a replayed or delayed fix
+     * was stamped as newly taken.
+     */
+    @Test
+    fun `the event time reaches the wire`() {
+        val cot =
+            "<event version=\"2.0\" uid=\"ANDROID-1\" type=\"a-f-G-U-C\" how=\"m-g\"" +
+                " time=\"2026-09-12T09:00:00.000Z\" start=\"2026-09-12T09:00:00.000Z\"" +
+                " stale=\"2026-09-12T09:10:00.000Z\">" +
+                "<point lat=\"41.0\" lon=\"29.0\" hae=\"100.0\" ce=\"10.0\" le=\"9999999.0\"/>" +
+                "<detail><contact callsign=\"LEXUS\"/></detail></event>"
+
+        val fix = CotPosition.fixFromCot(cot, senderId = 7)!!
+
+        // 2026-09-12T09:00:00Z
+        assertEquals(CotPosition.epochSeconds("2026-09-12T09:00:00.000Z"), fix.fixUnixSeconds)
+        assertTrue("the time must not be discarded", fix.fixUnixSeconds > 0)
+    }
+
+    /**
+     * CoT writes UTC with a Z. ATAK emits milliseconds; the standard permits
+     * them to be absent, so a peer running something else may omit them.
+     */
+    @Test
+    fun `both CoT time spellings parse and junk does not`() {
+        val withMillis = CotPosition.epochSeconds("2026-09-12T09:00:00.000Z")
+        val withoutMillis = CotPosition.epochSeconds("2026-09-12T09:00:00Z")
+
+        assertEquals(withMillis, withoutMillis)
+        assertTrue(withMillis > 0)
+        // 0 is the wire format's own word for unstated, which beats a guess.
+        assertEquals(0L, CotPosition.epochSeconds("not a timestamp"))
+        assertEquals(0L, CotPosition.epochSeconds(""))
+        assertEquals(0L, CotPosition.epochSeconds(null))
+    }
+
+    /** An event with no time attribute still encodes, as unstated. */
+    @Test
+    fun `a missing event time is zero rather than invented`() {
+        val cot =
+            "<event version=\"2.0\" uid=\"ANDROID-1\" type=\"a-f-G-U-C\" how=\"m-g\">" +
+                "<point lat=\"41.0\" lon=\"29.0\" hae=\"100.0\" ce=\"10.0\" le=\"9999999.0\"/>" +
+                "</event>"
+
+        val fix = CotPosition.fixFromCot(cot, senderId = 7)!!
+
+        assertEquals(0L, fix.fixUnixSeconds)
     }
 }

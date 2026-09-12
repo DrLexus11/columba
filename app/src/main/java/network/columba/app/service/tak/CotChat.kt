@@ -79,7 +79,18 @@ object CotChat {
          * nothing if every line is stamped with the moment it was replayed.
          */
         val sentUnix: Long = 0,
-    )
+    ) {
+        /**
+         * Whether this line is for [uid].
+         *
+         * An empty recipient is a room broadcast and is for everybody. A
+         * non-empty one names a single node, and the packet arriving on our
+         * destination is a claim about routing rather than about intent -- a
+         * frame misrouted, or sent here deliberately by another member, is
+         * still not ours to show.
+         */
+        fun isAddressedTo(uid: String): Boolean = recipient.isEmpty() || recipient == uid
+    }
 
     /** Pack a chat message or a receipt. */
     fun encode(
@@ -135,36 +146,66 @@ object CotChat {
     fun decode(frame: ByteArray?): Message? {
         if (frame == null || frame.size < HEADER_BYTES) return null
         val buffer = ByteBuffer.wrap(frame).order(ByteOrder.BIG_ENDIAN)
-        if ((buffer.get().toInt() and 0xFF) != VERSION) return null
-        val kind = buffer.get().toInt() and 0xFF
-        if (kind !in COT_TYPES) return null
-        val senderId = buffer.int
-        val sentUnix = buffer.int.toLong() and 0xFFFFFFFFL
-        val rawId = ByteArray(MESSAGE_ID_BYTES).also { buffer.get(it) }
-        val roomLength = buffer.get().toInt() and 0xFF
-        val recipientLength = buffer.get().toInt() and 0xFF
-        val textLength = buffer.short.toInt() and 0xFFFF
-        if (roomLength < 1 || roomLength > MAX_ROOM) return null
-        if (recipientLength > MAX_RECIPIENT || textLength > MAX_TEXT) return null
-        // The lengths describe the whole body. Trailing bytes mean this is not
-        // the frame it claims to be.
-        if (buffer.remaining() != roomLength + recipientLength + textLength) return null
-        // A message with no words, or a receipt carrying some. Either way it is
-        // not what its own kind says it is, and a caller trusting `kind` would
-        // act on the wrong thing.
-        if ((kind == KIND_MESSAGE) != (textLength > 0)) return null
+        val header = readHeader(buffer) ?: return null
         val body = ByteArray(buffer.remaining()).also { buffer.get(it) }
         return try {
             Message(
-                kind = kind,
-                senderId = senderId,
-                messageId = uuidString(rawId),
-                room = decodeStrict(body, 0, roomLength),
-                text = decodeStrict(body, roomLength + recipientLength, textLength),
-                recipient = decodeStrict(body, roomLength, recipientLength),
-                sentUnix = sentUnix,
+                kind = header.kind,
+                senderId = header.senderId,
+                messageId = uuidString(header.rawId),
+                room = decodeStrict(body, 0, header.room),
+                text = decodeStrict(body, header.room + header.recipient, header.text),
+                recipient = decodeStrict(body, header.room, header.recipient),
+                sentUnix = header.sentUnix,
             )
         } catch (_: IllegalArgumentException) {
+            null
+        }
+    }
+
+    /** A frame's fixed part, once every field in it agrees with the others. */
+    private class Header(
+        val kind: Int,
+        val senderId: Int,
+        val sentUnix: Long,
+        val rawId: ByteArray,
+        val room: Int,
+        val recipient: Int,
+        val text: Int,
+    )
+
+    /**
+     * Read the fixed header and accept it only if it is self-consistent.
+     *
+     * Every way a frame can be malformed is one null from here, so the caller
+     * states the decode once. The checks belong together because none of them
+     * means anything alone: the lengths have to describe the body exactly, and
+     * the kind has to agree with whether there is any text.
+     */
+    private fun readHeader(buffer: ByteBuffer): Header? {
+        if ((buffer.get().toInt() and 0xFF) != VERSION) return null
+        val kind = buffer.get().toInt() and 0xFF
+        val senderId = buffer.int
+        val sentUnix = buffer.int.toLong() and 0xFFFFFFFFL
+        val rawId = ByteArray(MESSAGE_ID_BYTES).also { buffer.get(it) }
+        val room = buffer.get().toInt() and 0xFF
+        val recipient = buffer.get().toInt() and 0xFF
+        val text = buffer.short.toInt() and 0xFFFF
+        val consistent =
+            kind in COT_TYPES &&
+                room in 1..MAX_ROOM &&
+                recipient <= MAX_RECIPIENT &&
+                text <= MAX_TEXT &&
+                // The lengths describe the whole body. Trailing bytes mean this
+                // is not the frame it claims to be.
+                buffer.remaining() == room + recipient + text &&
+                // A message with no words, or a receipt carrying some. Either
+                // way it is not what its own kind says it is, and a caller
+                // trusting `kind` would act on the wrong thing.
+                (kind == KIND_MESSAGE) == (text > 0)
+        return if (consistent) {
+            Header(kind, senderId, sentUnix, rawId, room, recipient, text)
+        } else {
             null
         }
     }
@@ -181,40 +222,12 @@ object CotChat {
         } catch (_: IllegalArgumentException) {
             return null
         }
-        val kind = COT_TYPES.entries.firstOrNull { it.value == event.getAttribute("type") }?.key
-            ?: return null
-        val detail = childElement(event, "detail") ?: return null
-        val chat = childElement(detail, "__chat") ?: childElement(detail, "__chatreceipt")
-            ?: return null
-        val messageId = chat.getAttribute("messageId").takeIf { it.isNotEmpty() } ?: return null
-        val room = chat.getAttribute("chatroom").takeIf { it.isNotEmpty() } ?: return null
-        // Who this is actually for. ATAK puts the recipient's callsign in the
-        // chatroom field for a direct message, so the room alone cannot tell
-        // "everyone" from "one person" -- and treating every line as a
-        // broadcast delivers private messages to the whole team.
-        var recipient = chat.getAttribute("id")
-        val group = childElement(chat, "chatgrp")
-        if (group != null) {
-            // chatgrp enumerates participants, so a uid2 means three or more
-            // of them: a room, and no one person this line is for. Reading
-            // uid1 as a recipient there would narrow a room conversation to
-            // whoever happened to be listed second.
-            if (group.getAttribute("uid2").isNotEmpty()) {
-                recipient = ""
-            } else if (recipient.isEmpty()) {
-                recipient = group.getAttribute("uid1")
-            }
-        }
-        if (recipient in BROADCAST_IDS || recipient == room) recipient = ""
-        val remarks = childElement(detail, "remarks")
-        var text = ""
-        if (kind == KIND_MESSAGE) {
-            text = remarks?.textContent.orEmpty()
-            if (text.isEmpty()) return null
-        }
-        val sentUnix = sentUnix(remarks?.getAttribute("time"), event.getAttribute("time"))
+        val parts = EventReader(event).parts() ?: return null
         return try {
-            encode(kind, senderId, messageId, room, text, recipient, sentUnix)
+            encode(
+                parts.kind, senderId, parts.messageId, parts.room,
+                parts.text, parts.recipient, parts.sentUnix,
+            )
         } catch (_: IllegalArgumentException) {
             // A room or a line longer than this codec carries. Tier 2 takes it
             // instead rather than this silently truncating somebody's words.
@@ -222,13 +235,121 @@ object CotChat {
         }
     }
 
+    /** Everything a chat frame needs, pulled out of one CoT event. */
+    private class Parts(
+        val kind: Int,
+        val messageId: String,
+        val room: String,
+        val recipient: String,
+        val text: String,
+        val sentUnix: Long,
+    )
+
+    /**
+     * Pull a chat line out of a CoT event, or null if it is not one.
+     *
+     * Every reason an event is not chat -- wrong type, no detail, no chat
+     * element, no id, no room, a message with no words -- is one null from
+     * here, so the caller is left with the encode and nothing else. A further
+     * field to extract goes in this function rather than adding another early
+     * return beside the encode.
+     */
+    /**
+     * Pulls a chat line out of one CoT event.
+     *
+     * A class for the same reason [CotMarker.Packer] is one: the pieces refer
+     * to each other -- the recipient is only meaningful against the room -- and
+     * keeping them together means the object above holds the codec's API rather
+     * than the DOM walk behind it.
+     */
+    private class EventReader(private val event: Element) {
+        /** Null when this event is not chat, which is most of what ATAK emits. */
+        fun parts(): Parts? =
+            try {
+                required()
+            } catch (_: IllegalArgumentException) {
+                null
+            }
+
+        /**
+         * The same extraction, stated as requirements.
+         *
+         * Six things have to be present and none is a special case, so they
+         * read as a list of requirements rather than six early returns. One
+         * catch above turns any of them into "not chat" -- the shape
+         * [CotEvent.parse] already uses.
+         */
+        private fun required(): Parts {
+            val kind =
+                requireNotNull(
+                    COT_TYPES.entries.firstOrNull { it.value == event.getAttribute("type") }?.key,
+                ) { "not a chat type" }
+            val detail = requireNotNull(childElement(event, "detail")) { "no detail" }
+            val chat =
+                requireNotNull(
+                    childElement(detail, "__chat") ?: childElement(detail, "__chatreceipt"),
+                ) { "no chat element" }
+            val messageId = chat.getAttribute("messageId")
+            require(messageId.isNotEmpty()) { "no message id" }
+            val room = chat.getAttribute("chatroom")
+            require(room.isNotEmpty()) { "no chatroom" }
+            val remarks = childElement(detail, "remarks")
+            val text = if (kind == KIND_MESSAGE) remarks?.textContent.orEmpty() else ""
+            // A message with no words is not a message, whatever its type says.
+            require(kind != KIND_MESSAGE || text.isNotEmpty()) { "a message with no words" }
+            return Parts(
+                kind = kind,
+                messageId = messageId,
+                room = room,
+                recipient = recipientOf(chat, room),
+                text = text,
+                sentUnix = sentUnix(remarks?.getAttribute("time"), event.getAttribute("time")),
+            )
+        }
+
+        /**
+         * Who a line is actually for, empty for a room.
+         *
+         * ATAK puts the recipient's callsign in the chatroom field for a direct
+         * message, so the room alone cannot tell "everyone" from "one person"
+         * -- and treating every line as a broadcast delivers private messages
+         * to the whole team.
+         */
+        private fun recipientOf(chat: Element, room: String): String {
+            val group = childElement(chat, "chatgrp")
+            val stated =
+                when {
+                    group == null -> chat.getAttribute("id")
+                    // chatgrp enumerates participants, so a uid2 means three or
+                    // more of them: a room, and no one person this line is for.
+                    // Reading uid1 as a recipient there would narrow a room
+                    // conversation to whoever happened to be listed second.
+                    group.getAttribute("uid2").isNotEmpty() -> ""
+                    else ->
+                        chat.getAttribute("id").takeIf { it.isNotEmpty() }
+                            ?: group.getAttribute("uid1")
+                }
+            return if (stated in BROADCAST_IDS || stated == room) "" else stated
+        }
+    }
+
     /**
      * Rebuild an event ATAK accepts from a decoded chat frame.
      *
-     * `when` is an ISO-8601 CoT timestamp, produced by the caller so this stays
-     * a pure function of its inputs and the tests need not freeze a clock.
+     * Both timestamps are ISO-8601 CoT stamps produced by the caller, so this
+     * stays a pure function of its inputs and the tests need not freeze a
+     * clock.
+     *
+     * @param whenIso when this line is being delivered, as CoT time and start.
+     * @param staleIso when ATAK may stop showing it; must be after [whenIso].
      */
-    fun buildChatCot(message: Message, senderUid: String, callsign: String, whenIso: String): String {
+    fun buildChatCot(
+        message: Message,
+        senderUid: String,
+        callsign: String,
+        whenIso: String,
+        staleIso: String,
+    ): String {
         val room = escape(message.room)
         val sender = escape(senderUid)
         // A message's uid is three identifiers concatenated, which is how ATAK
@@ -263,8 +384,13 @@ object CotChat {
             )
         }
         detail.append("<marti><dest callsign=\"$room\"/></marti>")
+        // stale must be in the future. It was whenIso -- the event's own time --
+        // so every rebuilt line and receipt arrived already expired, and ATAK
+        // is entitled to drop an expired event rather than draw it. A chat
+        // message that never appears is indistinguishable from one that never
+        // arrived, which is the worst way for this to fail.
         return "<event version=\"2.0\" uid=\"${escape(uid)}\" type=\"${COT_TYPES[message.kind]}\"" +
-            " how=\"h-g-i-g-o\" time=\"$whenIso\" start=\"$whenIso\" stale=\"$whenIso\">" +
+            " how=\"h-g-i-g-o\" time=\"$whenIso\" start=\"$whenIso\" stale=\"$staleIso\">" +
             "<point lat=\"0.0\" lon=\"0.0\" hae=\"9999999.0\" ce=\"9999999.0\" le=\"9999999.0\"/>" +
             "<detail>$detail</detail></event>"
     }

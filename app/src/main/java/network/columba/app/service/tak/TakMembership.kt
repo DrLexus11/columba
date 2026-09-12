@@ -119,26 +119,42 @@ object TakMembership {
      * other software entirely. A payload that is not ours is ordinary.
      */
     fun parseMember(payload: ByteArray?): Claims? {
-        if (payload == null || payload.size < HEADER_BYTES) return null
-        if (payload[0] != VERSION) return null
-        val tag = payload.copyOfRange(1, 1 + TEAM_TAG_BYTES)
-        val callsignLength = payload[1 + TEAM_TAG_BYTES].toInt() and 0xFF
-        val roleLength = payload[2 + TEAM_TAG_BYTES].toInt() and 0xFF
-        if (callsignLength < 1 || roleLength < 1) return null
-        if (callsignLength > MAX_CALLSIGN || roleLength > MAX_ROLE) return null
+        if (payload == null || payload.size < HEADER_BYTES || payload[0] != VERSION) return null
+        val lengths = fieldLengths(payload) ?: return null
         val body = payload.copyOfRange(HEADER_BYTES, payload.size)
-        // The lengths describe the whole body. Anything after it is not
-        // something this version knows how to read.
-        if (body.size != callsignLength + roleLength) return null
         return try {
             Claims(
-                tag = tag,
-                callsign = decodeStrict(body, 0, callsignLength),
-                role = decodeStrict(body, callsignLength, roleLength),
+                tag = payload.copyOfRange(1, 1 + TEAM_TAG_BYTES),
+                callsign = decodeStrict(body, 0, lengths.callsign),
+                role = decodeStrict(body, lengths.callsign, lengths.role),
             )
         } catch (_: IllegalArgumentException) {
             null
         }
+    }
+
+    /** The two declared field lengths an announce carries. */
+    private class FieldLengths(val callsign: Int, val role: Int)
+
+    /**
+     * Read the declared lengths and check them against each other and the body.
+     *
+     * Checked together rather than one condition at a time: the lengths are
+     * only meaningful as a set -- they have to describe the whole body and
+     * nothing after it -- and a third field later is one more line here rather
+     * than two more early returns in the caller.
+     */
+    private fun fieldLengths(payload: ByteArray): FieldLengths? {
+        val callsign = payload[1 + TEAM_TAG_BYTES].toInt() and 0xFF
+        val role = payload[2 + TEAM_TAG_BYTES].toInt() and 0xFF
+        val body = payload.size - HEADER_BYTES
+        val fits =
+            callsign in 1..MAX_CALLSIGN &&
+                role in 1..MAX_ROLE &&
+                // Anything past the declared lengths is not something this
+                // version knows how to read.
+                body == callsign + role
+        return if (fits) FieldLengths(callsign, role) else null
     }
 
     private fun decodeStrict(source: ByteArray, offset: Int, length: Int): String {
@@ -166,6 +182,21 @@ object TakMembership {
         private val ownHash: ByteArray? = null,
     ) {
         private val tag = teamTag(team, secret)
+
+        /**
+         * Guards everything below it.
+         *
+         * One session's registry is written by the announce collector and read
+         * by the accept loop, every client coroutine and both render paths --
+         * all on Dispatchers.IO, so genuinely in parallel. An announce landing
+         * during a fan-out iteration was free to rehash the map underneath it:
+         * ConcurrentModificationException at best, a lookup that silently
+         * missed a member at worst.
+         *
+         * A plain lock rather than a Mutex because nothing in here suspends;
+         * every critical section is a handful of map operations.
+         */
+        private val lock = Any()
         private val members = linkedMapOf<String, Entry>()
         private var lastGreet: Long? = null
 
@@ -182,33 +213,98 @@ object TakMembership {
          * same way, including around expiry.
          */
         fun remember(destinationHash: ByteArray, appData: ByteArray?, now: Long): Arrival? {
-            val claims = parseMember(appData) ?: return null
-            if (!constantTimeEquals(claims.tag, tag)) return null
-            if (ownHash != null && destinationHash.contentEquals(ownHash)) {
-                // Our own announce comes back through Transport like anyone
-                // else's. Addressing ourselves would double every marker and
-                // feed our own events back into our own endpoint.
-                return null
-            }
+            val claims = ourTeamsClaims(destinationHash, appData) ?: return null
             val key = destinationHash.toHex()
-            val previous = members[key]
-            // An entry past its expiry is not a member any more, so hearing
-            // from it again is a new arrival rather than a refresh -- and worth
-            // greeting, because from their side we may equally have dropped off.
-            val known = previous != null && now - previous.heard <= expiryMs
-            members[key] = Entry(claims.callsign, claims.role, now)
-            return if (known) Arrival.KNOWN else Arrival.NEW
+            return synchronized(lock) {
+                val previous = members[key]
+                // An entry past its expiry is not a member any more, so hearing
+                // from it again is a new arrival rather than a refresh -- and
+                // worth greeting, because from their side we may equally have
+                // dropped off.
+                val known = previous != null && now - previous.heard <= expiryMs
+                members[key] = Entry(claims.callsign, claims.role, now)
+                // Expired entries are dropped on the way past rather than left
+                // to accumulate. Nothing removed them before, so a long
+                // exercise with churn grew the map for the endpoint's whole
+                // lifetime and the member count shown to the operator counted
+                // everyone ever heard rather than everyone still there.
+                prune(now)
+                if (known) Arrival.KNOWN else Arrival.NEW
+            }
+        }
+
+        /**
+         * The claims in this announce if it is one we should act on, else null.
+         *
+         * Three separate reasons to ignore an announce, and all three mean the
+         * same thing to the caller: not a member of ours. Most announces a node
+         * hears land here, so this is the common path rather than an edge.
+         */
+        private fun ourTeamsClaims(destinationHash: ByteArray, appData: ByteArray?): Claims? {
+            val claims = parseMember(appData) ?: return null
+            val ours =
+                constantTimeEquals(claims.tag, tag) &&
+                    // Our own announce comes back through Transport like anyone
+                    // else's. Addressing ourselves would double every marker
+                    // and feed our own events back into our own endpoint.
+                    !(ownHash != null && destinationHash.contentEquals(ownHash))
+            return if (ours) claims else null
+        }
+
+        /**
+         * Forget entries nothing should be addressed to any more.
+         *
+         * Called under [lock] from the write path only: pruning on a read would
+         * make members(now) mutate the map it is iterating, and a read is the
+         * one place this must not happen.
+         */
+        private fun prune(now: Long) {
+            members.entries.removeAll { now - it.value.heard > expiryMs }
         }
 
         /** Destination hashes worth addressing, most recently heard first. */
         fun members(now: Long): List<ByteArray> =
-            members.entries
-                .filter { now - it.value.heard <= expiryMs }
-                .sortedByDescending { it.value.heard }
-                .map { it.key.unHex() }
+            synchronized(lock) {
+                members.entries
+                    .filter { now - it.value.heard <= expiryMs }
+                    .sortedByDescending { it.value.heard }
+                    .map { it.key.unHex() }
+            }
+
+        /**
+         * Whether this hash is a member of the team right now.
+         *
+         * The question a send path has to ask. A UID being well formed says
+         * only that it was spelled correctly: [TakIdentity.destinationFor]
+         * reverses the encoding and establishes nothing about who is on the
+         * team, so addressing its result without asking here sends team
+         * traffic to whatever a local CoT client cared to name.
+         */
+        fun isMember(destinationHash: ByteArray, now: Long): Boolean =
+            synchronized(lock) {
+                members[destinationHash.toHex()]?.let { now - it.heard <= expiryMs } == true
+            }
+
+        /**
+         * The destination for a uid that is actually on this team, else null.
+         *
+         * Two separate questions, and only the first used to be asked.
+         * [TakIdentity.destinationFor] establishes that the uid is one of ours
+         * *by shape*; it says nothing whatever about who is on the team, so a
+         * local or hostile CoT client could name any syntactically valid uid --
+         * a stale peer, another team's node -- and have team traffic routed
+         * straight out of the membership set.
+         *
+         * Both halves live here because the second one is this class's whole
+         * subject, and a send path should not be able to ask the first without
+         * the second.
+         */
+        fun memberDestination(uid: String, now: Long): ByteArray? =
+            TakIdentity.destinationFor(uid)?.takeIf { isMember(it, now) }
 
         /** Callsign and role as claimed, or null. For display, not for trust. */
-        fun describe(destinationHash: ByteArray): Entry? = members[destinationHash.toHex()]
+        fun describe(destinationHash: ByteArray): Entry? =
+            synchronized(lock) { members[destinationHash.toHex()] }
 
         /**
          * Whether to announce now because we have just met someone new.
@@ -217,12 +313,13 @@ object TakMembership {
          * together would otherwise each announce nine times, which is a lot of
          * the most expensive packet Reticulum has.
          */
-        fun shouldGreet(now: Long): Boolean {
-            val last = lastGreet
-            if (last != null && now - last < GREET_MIN_INTERVAL_MS) return false
-            lastGreet = now
-            return true
-        }
+        fun shouldGreet(now: Long): Boolean =
+            synchronized(lock) {
+                val last = lastGreet
+                val allowed = last == null || now - last >= GREET_MIN_INTERVAL_MS
+                if (allowed) lastGreet = now
+                allowed
+            }
 
         /**
          * The member a 32-bit sender id belongs to, or null.
@@ -237,7 +334,15 @@ object TakMembership {
         fun resolveSenderId(senderId: Int, now: Long): ByteArray? =
             members(now).filter { senderIdFor(it) == senderId }.singleOrNull()
 
-        val size: Int get() = members.size
+        /**
+         * How many members are current, as of [now].
+         *
+         * Takes the time because the answer depends on it. A plain `size` read
+         * the raw map and so reported everyone ever heard from -- a count that
+         * only ever grew, shown to the operator as the size of their team.
+         */
+        fun size(now: Long): Int =
+            synchronized(lock) { members.values.count { now - it.heard <= expiryMs } }
     }
 
     /** The four bytes a node puts in its own position reports. */

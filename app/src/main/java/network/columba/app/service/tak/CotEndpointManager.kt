@@ -32,6 +32,7 @@ import network.columba.app.rns.api.RnsLxmf
 import network.columba.app.rns.api.model.Destination
 import network.columba.app.rns.api.model.DestinationType
 import network.columba.app.rns.api.model.Direction
+import network.columba.app.rns.api.util.Aspects
 import java.io.IOException
 import java.net.InetAddress
 import java.net.ServerSocket
@@ -136,6 +137,17 @@ class CotEndpointManager
              * stale is a marker where somebody used to be, still being trusted.
              */
             private const val POSITION_STALE_MS = 2 * CotPosition.DEFAULT_INTERVAL_MS
+
+            /**
+             * How long a rebuilt chat line stays on screen.
+             *
+             * A day, because a chat message is a thing somebody said rather
+             * than a position that goes out of date: the reason to expire it at
+             * all is that CoT requires a stale, not that the words stop being
+             * true. It was the event's own time, which made every line arrive
+             * already expired.
+             */
+            private const val CHAT_STALE_MS = 24L * 60 * 60 * 1000
         }
 
         /** What the endpoint is doing, for the settings screen. */
@@ -264,11 +276,20 @@ class CotEndpointManager
             // One session per run: the learned ATAK UID, the member list and
             // the position cadence all belong to this endpoint's lifetime
             // rather than to the process.
+            val registry = TakMembership.Registry(keys.team, keys.secret, ownHash = node.hash)
             val session = Session(
                 node = node,
                 team = keys.team,
                 pipeline = CotOutbound(TakIdentity.uidFor(node.hash)),
-                registry = TakMembership.Registry(keys.team, keys.secret, ownHash = node.hash),
+                registry = registry,
+                renderer =
+                    CotRenderer(
+                        registry = registry,
+                        team = keys.team,
+                        nodeHash = node.hash,
+                        positionStaleMs = POSITION_STALE_MS,
+                        chatStaleMs = CHAT_STALE_MS,
+                    ),
                 payload = TakMembership.memberPayload(keys.team, keys.secret, keys.callsign),
             )
 
@@ -354,6 +375,15 @@ class CotEndpointManager
          */
         private suspend fun learnMembers(session: Session) {
             rnsCore.observeAnnounces().collect { announceEvent ->
+                // Every aspect Columba tracks arrives here, not just ours.
+                // Membership was taken from the payload alone, so a matching
+                // payload on an lxmf.delivery or lxst.telephony destination
+                // would have entered the fan-out under *that* destination's
+                // hash -- and sendTo rebuilds a TAK destination from whatever
+                // hash it is given, addressing something the peer is not
+                // listening on. The aspect is the only thing that says this
+                // hash is a TAK node.
+                if (announceEvent.aspect != Aspects.TAK_NODE) return@collect
                 val arrival =
                     session.registry.remember(
                         announceEvent.destinationHash,
@@ -434,9 +464,14 @@ class CotEndpointManager
             if (known == null) {
                 session.pipeline.atakUid?.let { Log.i(TAG, "This ATAK calls itself $it") }
             }
-            if (CotPosition.isPosition(cotXml) && forwardPosition(cotXml, session)) return
-            if (forwardChat(cotXml, session)) return
-            if (forwardMarker(cotXml, session)) return
+            // The typed codecs in order, each answering "was this mine?".
+            // A new codec is a term in this expression rather than another
+            // early return threaded through the routing.
+            val typed =
+                CotPosition.isPosition(cotXml) && forwardPosition(cotXml, session) ||
+                    forwardChat(cotXml, session) ||
+                    forwardMarker(cotXml, session)
+            if (typed) return
             val frame = session.pipeline.frame(cotXml) ?: return
             fanOut(frame, session)
         }
@@ -481,18 +516,18 @@ class CotEndpointManager
                 fanOut(frame, session)
                 return true
             }
-            // Addressed to somebody who is not a peer of ours: a server
-            // contact, or a callsign this mesh has never announced. The
-            // fan-out is not a fallback here -- broadcasting a line meant for
-            // one person is the bug this whole path exists to stop, and it
-            // would not deliver it either. Dropped, and anything reachable
-            // another way is still reached that way.
-            val destination = TakIdentity.destinationFor(recipient)
+            // Addressed to one person, so it reaches that person or nobody.
+            // The fan-out is not a fallback here -- broadcasting a line meant
+            // for one person is the bug this whole path exists to stop, and it
+            // would not deliver it either. Anything reachable another way is
+            // still reached that way.
+            val destination =
+                session.registry.memberDestination(recipient, System.currentTimeMillis())
             if (destination == null) {
                 Log.i(TAG, "Chat for a uid that is not a member of this team, not sent")
-                return true
+            } else {
+                sendTo(destination, frame)
             }
-            sendTo(destination, frame)
             return true
         }
 
@@ -568,104 +603,25 @@ class CotEndpointManager
         private suspend fun pumpMeshToClients(session: Session) {
             rnsCore.observePackets().collect { packet ->
                 if (!packet.destination.hash.contentEquals(session.node.hash)) return@collect
-                // Byte zero says which codec produced this. One namespace
-                // shared by all of them rather than three independent version
-                // counters -- see TakPayload for why that distinction matters.
-                when (TakPayload.kindOf(packet.data)) {
-                    TakPayload.POSITION_V2 ->
-                        if (renderPosition(packet.data, session)) return@collect
-                    TakPayload.CHAT_V1 ->
-                        if (renderChat(packet.data, session)) return@collect
-                    TakPayload.MARKER_V1 ->
-                        if (renderMarker(packet.data, session)) return@collect
-                    else -> Unit
-                }
-                val xml =
-                    try {
-                        CotTier2.decode(packet.data)
-                    } catch (_: IllegalArgumentException) {
-                        // A frame we cannot read is ordinary: an older node, a
-                        // newer dictionary, or simply not ours.
-                        return@collect
+                val payload =
+                    when (val rendered = session.renderer.render(packet.data, System.currentTimeMillis())) {
+                        is CotRenderer.Rendered.Cot -> rendered.xml
+                        // Ours, and deliberately not drawn. Falling through to
+                        // tier 2 here would put a frame we just declined onto
+                        // the map by another route.
+                        CotRenderer.Rendered.Handled -> return@collect
+                        CotRenderer.Rendered.NotOurs ->
+                            try {
+                                CotTier2.decode(packet.data)
+                            } catch (_: IllegalArgumentException) {
+                                // A frame we cannot read is ordinary: an older
+                                // node, a newer dictionary, or simply not ours.
+                                return@collect
+                            }
                     }
-                writeToClients(xml.toByteArray(Charsets.UTF_8))
+                writeToClients(payload.toByteArray(Charsets.UTF_8))
             }
         }
-
-        /** Render a peer's position report as CoT for the local ATAK. */
-        private suspend fun renderPosition(raw: ByteArray, session: Session): Boolean {
-            val fix = PositionCodec.decode(raw) ?: return false
-            // Four bytes of identity is a lookup key here, not an identity.
-            // Membership is the table that turns it back into a whole
-            // destination hash, so a peer's track carries the same UID as
-            // everything else that node sends rather than a track of its own.
-            val sender = session.registry.resolveSenderId(fix.senderId, System.currentTimeMillis())
-                ?: return true
-            val claims = session.registry.describe(sender)
-            writeToClients(
-                CotPosition.buildCot(
-                    fix,
-                    TakIdentity.uidFor(sender),
-                    claims?.callsign ?: "UNKNOWN",
-                    POSITION_STALE_MS,
-                    team = session.team,
-                ).toByteArray(Charsets.UTF_8),
-            )
-            return true
-        }
-
-        /** Render a peer's marker as CoT for the local ATAK. */
-        private suspend fun renderMarker(raw: ByteArray, session: Session): Boolean {
-            val marker = CotMarker.decode(raw) ?: return false
-            val sender =
-                session.registry.resolveSenderId(marker.senderId, System.currentTimeMillis())
-                    // A marker from a node this team has never heard announce.
-                    // Drawing it under an invented identity puts an object on
-                    // the map nobody can be asked about.
-                    ?: return true
-            val claims = session.registry.describe(sender)
-            val now = System.currentTimeMillis()
-            writeToClients(
-                CotMarker.buildMarkerCot(
-                    marker,
-                    TakIdentity.uidFor(sender),
-                    claims?.callsign ?: "UNKNOWN",
-                    cotTime(now),
-                    // The author's own stale, not one invented here: a spot
-                    // marker is good for a year and an SPI for twenty seconds.
-                    cotTime(now + marker.staleSeconds * 1000L),
-                ).toByteArray(Charsets.UTF_8),
-            )
-            return true
-        }
-
-        /** Render a peer's chat line or receipt as CoT for the local ATAK. */
-        private suspend fun renderChat(raw: ByteArray, session: Session): Boolean {
-            val message = CotChat.decode(raw) ?: return false
-            val sender =
-                session.registry.resolveSenderId(message.senderId, System.currentTimeMillis())
-                    // Chat from a node this team has never heard announce.
-                    // Dropping it is the honest option: putting words on an
-                    // operator's screen under an identity we cannot name is
-                    // worse than not showing them at all.
-                    ?: return true
-            val claims = session.registry.describe(sender)
-            writeToClients(
-                CotChat.buildChatCot(
-                    message,
-                    TakIdentity.uidFor(sender),
-                    claims?.callsign ?: "UNKNOWN",
-                    cotTime(System.currentTimeMillis()),
-                ).toByteArray(Charsets.UTF_8),
-            )
-            return true
-        }
-
-        /** CoT wants ISO 8601 in UTC with a Z, to millisecond precision. */
-        private fun cotTime(millis: Long): String =
-            SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US)
-                .apply { timeZone = TimeZone.getTimeZone("UTC") }
-                .format(java.util.Date(millis))
 
         private suspend fun writeToClients(payload: ByteArray) {
             // Set on whichever IO thread does the writing, for the same reason.
@@ -703,7 +659,7 @@ class CotEndpointManager
                 session.team,
                 session.node.hexHash,
                 clientCount,
-                session.registry.size,
+                session.registry.size(System.currentTimeMillis()),
             )
         }
 
@@ -720,6 +676,7 @@ class CotEndpointManager
             val team: String,
             val pipeline: CotOutbound,
             val registry: TakMembership.Registry,
+            val renderer: CotRenderer,
             val payload: ByteArray,
             val gate: CotPosition.PositionGate = CotPosition.PositionGate(),
             /** Shorter than position's: a pointer moves continuously. */

@@ -91,7 +91,9 @@ class CotChatTest {
         // recognise again, or a message relayed twice would decay.
         val decoded = CotChat.decode(CotChat.chatFromCot(chat.getString("message"), sender))!!
         val rebuilt = CotChat.buildChatCot(
-            decoded, "urtn-" + "ab".repeat(16), "LEXUS", "2026-09-11T20:00:00.000Z")
+            decoded, "urtn-" + "ab".repeat(16), "LEXUS",
+            "2026-09-11T20:00:00.000Z", "2026-09-11T21:00:00.000Z",
+        )
         assertEquals(decoded, CotChat.decode(CotChat.chatFromCot(rebuilt, sender)))
     }
 
@@ -182,7 +184,10 @@ class CotChatTest {
         val decoded =
             CotChat.decode(CotChat.encode(CotChat.KIND_MESSAGE, sender, messageId, "Cyan", nasty))!!
         val rebuilt =
-            CotChat.buildChatCot(decoded, "urtn-x", "PEER", "2026-09-11T20:00:00.000Z")
+            CotChat.buildChatCot(
+                decoded, "urtn-x", "PEER",
+                "2026-09-11T20:00:00.000Z", "2026-09-11T21:00:00.000Z",
+            )
         assertEquals(nasty, CotChat.decode(CotChat.chatFromCot(rebuilt, sender))!!.text)
     }
 
@@ -279,7 +284,10 @@ class CotChatTest {
         // message. ATAK threads on the uid.
         val decoded = CotChat.decode(CotChat.chatFromCot(chat.getString("message"), sender))!!
         val rebuilt =
-            CotChat.buildChatCot(decoded, "urtn-x", "PEER", "2026-09-12T09:00:00.000Z")
+            CotChat.buildChatCot(
+                decoded, "urtn-x", "PEER",
+                "2026-09-12T09:00:00.000Z", "2026-09-12T10:00:00.000Z",
+            )
         assertTrue(rebuilt, rebuilt.contains("uid1=\"${decoded.recipient}\""))
     }
 
@@ -298,7 +306,10 @@ class CotChatTest {
     fun `a replayed line keeps its own time`() {
         val decoded = CotChat.decode(CotChat.chatFromCot(chat.getString("message"), sender))!!
         val rebuilt =
-            CotChat.buildChatCot(decoded, "urtn-x", "PEER", "2026-09-12T09:00:00.000Z")
+            CotChat.buildChatCot(
+                decoded, "urtn-x", "PEER",
+                "2026-09-12T09:00:00.000Z", "2026-09-12T10:00:00.000Z",
+            )
         assertTrue(rebuilt, rebuilt.contains("time=\"${chat.getString("message_sent_iso")}\""))
         assertEquals(
             decoded.sentUnix,
@@ -322,5 +333,51 @@ class CotChatTest {
         assertTrue(runCatching { CotTier2.decode(chatFrame) }.isFailure)
         assertNull(CotChat.decode(CotTier2.encode("<event uid=\"a\"/>")))
         assertNotNull(CotChat.decode(chatFrame))
+    }
+
+    /**
+     * stale was the event's own time, so every rebuilt line arrived already
+     * expired and ATAK is entitled to drop an expired event rather than draw
+     * it. A chat message that never appears is indistinguishable from one that
+     * never arrived.
+     */
+    @Test
+    fun `a rebuilt line is not already stale`() {
+        val decoded =
+            CotChat.decode(
+                CotChat.encode(CotChat.KIND_MESSAGE, sender, messageId, "Cyan", "on my way"),
+            )!!
+
+        val rebuilt =
+            CotChat.buildChatCot(
+                decoded, "urtn-x", "PEER",
+                "2026-09-12T09:00:00.000Z", "2026-09-13T09:00:00.000Z",
+            )
+
+        val event = CotEvent.parse(rebuilt)
+        assertEquals("2026-09-12T09:00:00.000Z", event.getAttribute("time"))
+        assertEquals("2026-09-13T09:00:00.000Z", event.getAttribute("stale"))
+        assertTrue(
+            "stale must be after time",
+            event.getAttribute("stale") > event.getAttribute("time"),
+        )
+    }
+
+    /** A receipt is rebuilt by the same path and needs the same future stale. */
+    @Test
+    fun `a rebuilt receipt is not already stale`() {
+        val decoded =
+            CotChat.decode(
+                CotChat.encode(CotChat.KIND_DELIVERED, sender, messageId, "Cyan"),
+            )!!
+
+        val rebuilt =
+            CotChat.buildChatCot(
+                decoded, "urtn-x", "PEER",
+                "2026-09-12T09:00:00.000Z", "2026-09-13T09:00:00.000Z",
+            )
+
+        val event = CotEvent.parse(rebuilt)
+        assertTrue(event.getAttribute("stale") > event.getAttribute("time"))
     }
 }

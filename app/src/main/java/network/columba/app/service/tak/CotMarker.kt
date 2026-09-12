@@ -81,152 +81,250 @@ object CotMarker {
 
     /** Whether this event is a single point somebody put on the map. */
     fun isMarker(cotXml: String): Boolean {
-        val event = try {
-            CotEvent.parse(cotXml)
-        } catch (_: IllegalArgumentException) {
-            return false
-        }
-        val kind = event.getAttribute("type")
-        if (childElement(event, "point") == null) return false
+        val event =
+            try {
+                CotEvent.parse(cotXml)
+            } catch (_: IllegalArgumentException) {
+                null
+            }
+        return event != null &&
+            childElement(event, "point") != null &&
+            isMarkerType(event.getAttribute("type"))
+    }
+
+    /**
+     * Whether a CoT type is a single point somebody put on the map.
+     *
+     * The exclusions come first and each has its own reason, so they are named
+     * separately rather than folded into one condition -- a new exclusion is a
+     * line here instead of another early return in [isMarker].
+     */
+    private fun isMarkerType(kind: String): Boolean {
         // A unit self-report belongs to the position codec, which has its own
         // cadence; sending it both ways would double the commonest event there is.
-        if (kind.startsWith("a-") && kind.contains("-U-")) return false
+        val selfReport = kind.startsWith("a-") && kind.contains("-U-")
         // Drawings and routes are more than a point, and are PR C's problem.
-        if (kind.startsWith("u-d-") || kind.startsWith("b-m-r") || kind.startsWith("u-r-")) {
-            return false
-        }
-        return kind.startsWith("a-") || kind.startsWith("b-m-p-")
+        val drawing =
+            kind.startsWith("u-d-") || kind.startsWith("b-m-r") || kind.startsWith("u-r-")
+        val point = kind.startsWith("a-") || kind.startsWith("b-m-p-")
+        return point && !selfReport && !drawing
     }
 
-    /** Pack a marker, or null if this event is not one. */
+    /**
+     * Pack a marker, or null if this event is not one.
+     *
+     * The packing lives in [Packer], which refuses with [require] rather than
+     * by returning: a binary format has a dozen ways to not fit, and one catch
+     * at this boundary reads better than a dozen early returns threaded through
+     * the writer. Same shape as [CotEvent.parse], which this file already
+     * leans on.
+     */
     fun markerFromCot(cotXml: String, senderId: Int): ByteArray? {
         if (!isMarker(cotXml)) return null
-        val event = try {
-            CotEvent.parse(cotXml)
+        return try {
+            Packer(CotEvent.parse(cotXml), senderId).pack()
         } catch (_: IllegalArgumentException) {
-            return null
+            null
         }
-        val point = childElement(event, "point") ?: return null
-        val latitude = point.getAttribute("lat").toDoubleOrNull() ?: return null
-        val longitude = point.getAttribute("lon").toDoubleOrNull() ?: return null
-        val detail = childElement(event, "detail")
-        val callsign = detail?.let { childElement(it, "contact") }?.getAttribute("callsign").orEmpty()
-        val remarks = detail?.let { childElement(it, "remarks") }?.textContent.orEmpty()
-        val argb = detail?.let { childElement(it, "color") }?.getAttribute("argb")?.toIntOrNull()
-        val altitude = measured(point.getAttribute("hae"))
-
-        var flags = 0
-        val uid = event.getAttribute("uid")
-        var uuidBytes: ByteArray? = null
-        var suffix = ByteArray(0)
-        val parsed = runCatching { UUID.fromString(uid) }.getOrNull()
-        if (parsed != null) {
-            flags = flags or FLAG_UUID
-            uuidBytes = ByteBuffer.allocate(16).order(ByteOrder.BIG_ENDIAN)
-                .putLong(parsed.mostSignificantBits).putLong(parsed.leastSignificantBits).array()
-        } else {
-            // Not a UUID. Carry only the part after the last dot -- "SPI1" --
-            // and leave the sender's device identifier behind.
-            val tail = if (uid.contains('.')) uid.substringAfterLast('.') else uid
-            suffix = tail.toByteArray(Charsets.UTF_8)
-            if (suffix.isEmpty() || suffix.size > MAX_UID_SUFFIX) return null
-        }
-
-        if (altitude != null && Math.abs(altitude) < 32_000) flags = flags or FLAG_ALT
-        if (argb != null) flags = flags or FLAG_COLOR
-        val remarksBytes = fitUtf8(remarks, MAX_REMARKS)
-        if (remarksBytes.isNotEmpty()) flags = flags or FLAG_REMARKS
-
-        val typeBytes = event.getAttribute("type").toByteArray(Charsets.UTF_8)
-        val callsignBytes = callsign.toByteArray(Charsets.UTF_8)
-        if (typeBytes.isEmpty() || typeBytes.size > MAX_TYPE) return null
-        if (callsignBytes.size > MAX_CALLSIGN) return null
-
-        val (staleValue, inMinutes) = staleField(staleSeconds(event))
-        if (inMinutes) flags = flags or FLAG_STALE_MINUTES
-
-        val extras = (if (flags and FLAG_ALT != 0) 2 else 0) +
-            (if (flags and FLAG_COLOR != 0) 4 else 0) +
-            (if (flags and FLAG_REMARKS != 0) 1 + remarksBytes.size else 0)
-        val buffer = ByteBuffer.allocate(
-            HEADER_BYTES + (uuidBytes?.size ?: suffix.size) +
-                typeBytes.size + callsignBytes.size + extras,
-        ).order(ByteOrder.BIG_ENDIAN)
-        buffer.put(VERSION.toByte()).put(flags.toByte()).putInt(senderId)
-            .putInt(Math.round(latitude * 1e7).toInt())
-            .putInt(Math.round(longitude * 1e7).toInt())
-            .putShort(staleValue.toShort())
-            .put(typeBytes.size.toByte()).put(callsignBytes.size.toByte())
-            .put(suffix.size.toByte())
-        buffer.put(uuidBytes ?: suffix).put(typeBytes).put(callsignBytes)
-        if (flags and FLAG_ALT != 0) buffer.putShort(Math.round(altitude!!).toInt().toShort())
-        if (flags and FLAG_COLOR != 0) buffer.putInt(argb!!)
-        if (flags and FLAG_REMARKS != 0) {
-            buffer.put(remarksBytes.size.toByte()).put(remarksBytes)
-        }
-        return buffer.array()
     }
 
-    /** Unpack a marker, or null for anything that is not one. */
-    @Suppress("ReturnCount")
+    /**
+     * Builds one frame from one event.
+     *
+     * A class rather than a chain of functions so the fields are read once and
+     * then referred to, and so the flag byte and the buffer size -- which have
+     * to agree exactly or the frame is malformed -- are computed from the same
+     * values in one place.
+     */
+    private class Packer(private val event: org.w3c.dom.Element, private val senderId: Int) {
+        private val point = requireNotNull(childElement(event, "point")) { "no point" }
+        private val detail = childElement(event, "detail")
+
+        private val latitude =
+            requireNotNull(point.getAttribute("lat").toDoubleOrNull()) { "no latitude" }
+        private val longitude =
+            requireNotNull(point.getAttribute("lon").toDoubleOrNull()) { "no longitude" }
+        private val altitude = measured(point.getAttribute("hae"))
+        private val argb =
+            detail?.let { childElement(it, "color") }?.getAttribute("argb")?.toIntOrNull()
+
+        private val type = event.getAttribute("type").toByteArray(Charsets.UTF_8)
+        private val callsign =
+            detail?.let { childElement(it, "contact") }?.getAttribute("callsign")
+                .orEmpty().toByteArray(Charsets.UTF_8)
+        private val remarks =
+            fitUtf8(
+                detail?.let { childElement(it, "remarks") }?.textContent.orEmpty(),
+                MAX_REMARKS,
+            )
+
+        /**
+         * How the uid travels: sixteen raw bytes for a UUID, else the tail.
+         *
+         * ATAK's marker uids are UUIDs, which cost sixteen bytes rather than
+         * the thirty-six the text form does. Anything else keeps only the part
+         * after the last dot -- "SPI1" -- which leaves the sender's device
+         * identifier behind rather than putting it on the air.
+         */
+        private val uuid: ByteArray? =
+            runCatching { UUID.fromString(event.getAttribute("uid")) }.getOrNull()?.let {
+                ByteBuffer.allocate(16).order(ByteOrder.BIG_ENDIAN)
+                    .putLong(it.mostSignificantBits)
+                    .putLong(it.leastSignificantBits)
+                    .array()
+            }
+        private val suffix: ByteArray =
+            if (uuid != null) {
+                ByteArray(0)
+            } else {
+                val uid = event.getAttribute("uid")
+                val tail = if (uid.contains('.')) uid.substringAfterLast('.') else uid
+                tail.toByteArray(Charsets.UTF_8)
+            }
+
+        private val stale = staleField(staleSeconds(event))
+
+        private val flags: Int = run {
+            var value = 0
+            if (uuid != null) value = value or FLAG_UUID
+            if (altitude != null && Math.abs(altitude) < 32_000) value = value or FLAG_ALT
+            if (argb != null) value = value or FLAG_COLOR
+            if (remarks.isNotEmpty()) value = value or FLAG_REMARKS
+            if (stale.second) value = value or FLAG_STALE_MINUTES
+            value
+        }
+
+        /** Every limit the format imposes, checked before a byte is written. */
+        private fun requireFits() {
+            require(type.isNotEmpty() && type.size <= MAX_TYPE) { "type does not fit" }
+            require(callsign.size <= MAX_CALLSIGN) { "callsign does not fit" }
+            if (uuid == null) {
+                require(suffix.isNotEmpty() && suffix.size <= MAX_UID_SUFFIX) {
+                    "uid suffix does not fit"
+                }
+            }
+        }
+
+        fun pack(): ByteArray {
+            requireFits()
+            val extras = (if (flags and FLAG_ALT != 0) 2 else 0) +
+                (if (flags and FLAG_COLOR != 0) 4 else 0) +
+                (if (flags and FLAG_REMARKS != 0) 1 + remarks.size else 0)
+            val buffer =
+                ByteBuffer.allocate(
+                    HEADER_BYTES + (uuid?.size ?: suffix.size) +
+                        type.size + callsign.size + extras,
+                ).order(ByteOrder.BIG_ENDIAN)
+            buffer.put(VERSION.toByte()).put(flags.toByte()).putInt(senderId)
+                .putInt(Math.round(latitude * 1e7).toInt())
+                .putInt(Math.round(longitude * 1e7).toInt())
+                .putShort(stale.first.toShort())
+                .put(type.size.toByte()).put(callsign.size.toByte())
+                .put(suffix.size.toByte())
+            buffer.put(uuid ?: suffix).put(type).put(callsign)
+            if (flags and FLAG_ALT != 0) {
+                buffer.putShort(Math.round(altitude!!).toInt().toShort())
+            }
+            if (flags and FLAG_COLOR != 0) buffer.putInt(argb!!)
+            if (flags and FLAG_REMARKS != 0) {
+                buffer.put(remarks.size.toByte()).put(remarks)
+            }
+            return buffer.array()
+        }
+    }
+
+    /**
+     * Unpack a marker, or null for anything that is not one.
+     *
+     * The reading lives in [FrameReader] and refuses with [require], so a frame
+     * that stops short is caught by the stage that wanted the bytes and says
+     * which one that was -- rather than by a length check far from the read.
+     */
     fun decode(frame: ByteArray?): Marker? {
         if (frame == null || frame.size < HEADER_BYTES) return null
-        val buffer = ByteBuffer.wrap(frame).order(ByteOrder.BIG_ENDIAN)
-        if ((buffer.get().toInt() and 0xFF) != VERSION) return null
-        val flags = buffer.get().toInt() and 0xFF
-        val senderId = buffer.int
-        val latE7 = buffer.int
-        val lonE7 = buffer.int
-        val stale = buffer.short.toInt() and 0xFFFF
-        val typeLength = buffer.get().toInt() and 0xFF
-        val callsignLength = buffer.get().toInt() and 0xFF
-        val suffixLength = buffer.get().toInt() and 0xFF
-        if (typeLength !in 1..MAX_TYPE || callsignLength > MAX_CALLSIGN) return null
+        return try {
+            FrameReader(frame).read()
+        } catch (_: IllegalArgumentException) {
+            null
+        }
+    }
 
-        var uid: String? = null
-        var suffixText: String? = null
-        if (flags and FLAG_UUID != 0) {
-            // A frame claiming both a UUID and a suffix is not one we produced.
-            if (suffixLength != 0 || buffer.remaining() < 16) return null
-            uid = UUID(buffer.long, buffer.long).toString()
-        } else {
-            if (suffixLength !in 1..MAX_UID_SUFFIX || buffer.remaining() < suffixLength) return null
-            val raw = ByteArray(suffixLength).also { buffer.get(it) }
-            suffixText = decodeStrict(raw) ?: return null
-        }
-        if (buffer.remaining() < typeLength + callsignLength) return null
-        val type = decodeStrict(ByteArray(typeLength).also { buffer.get(it) }) ?: return null
-        val callsign = decodeStrict(ByteArray(callsignLength).also { buffer.get(it) }) ?: return null
+    /**
+     * Reads one frame in the order the format lays it out.
+     *
+     * Fixed header, then the uid, then the two strings, then whatever the flags
+     * say follows. Each step consumes from the same buffer, which is why this
+     * is a class: the position is the state.
+     */
+    private class FrameReader(frame: ByteArray) {
+        private val buffer = ByteBuffer.wrap(frame).order(ByteOrder.BIG_ENDIAN)
 
-        var altitude: Int? = null
-        if (flags and FLAG_ALT != 0) {
-            if (buffer.remaining() < 2) return null
-            altitude = buffer.short.toInt()
+        private fun u8(): Int = buffer.get().toInt() and 0xFF
+
+        private fun take(length: Int): ByteArray {
+            require(buffer.remaining() >= length) { "frame stops short" }
+            return ByteArray(length).also { buffer.get(it) }
         }
-        var argb: Int? = null
-        if (flags and FLAG_COLOR != 0) {
-            if (buffer.remaining() < 4) return null
-            argb = buffer.int
-        }
-        var remarks = ""
-        if (flags and FLAG_REMARKS != 0) {
-            if (buffer.remaining() < 1) return null
-            val length = buffer.get().toInt() and 0xFF
-            if (buffer.remaining() < length) return null
-            remarks = decodeStrict(ByteArray(length).also { buffer.get(it) }) ?: return null
-        }
-        // Trailing bytes mean this is not the frame it claims to be.
-        if (buffer.remaining() != 0) return null
-        return Marker(
-            senderId = senderId, uid = uid, uidSuffix = suffixText, type = type,
-            callsign = callsign, latE7 = latE7, lonE7 = lonE7,
-            staleSeconds = if (flags and FLAG_STALE_MINUTES != 0) {
-                stale * SECONDS_PER_MINUTE
+
+        fun read(): Marker {
+            require(u8() == VERSION) { "not our version" }
+            val flags = u8()
+            val senderId = buffer.int
+            val latE7 = buffer.int
+            val lonE7 = buffer.int
+            val stale = buffer.short.toInt() and 0xFFFF
+            val typeLength = u8()
+            val callsignLength = u8()
+            val suffixLength = u8()
+            require(typeLength in 1..MAX_TYPE) { "type length does not fit" }
+            require(callsignLength <= MAX_CALLSIGN) { "callsign length does not fit" }
+
+            val uuid: String?
+            val suffixText: String?
+            if (flags and FLAG_UUID != 0) {
+                // A frame claiming both a UUID and a suffix is not one we produced.
+                require(suffixLength == 0) { "a uuid frame carries no suffix" }
+                require(buffer.remaining() >= 16) { "frame stops short" }
+                uuid = UUID(buffer.long, buffer.long).toString()
+                suffixText = null
             } else {
-                stale
-            },
-            altM = altitude, argb = argb, remarks = remarks,
-        )
+                require(suffixLength in 1..MAX_UID_SUFFIX) { "uid suffix length does not fit" }
+                uuid = null
+                suffixText = requireUtf8(take(suffixLength))
+            }
+
+            val type = requireUtf8(take(typeLength))
+            val callsign = requireUtf8(take(callsignLength))
+            val altitude = if (flags and FLAG_ALT != 0) shortValue() else null
+            val argb = if (flags and FLAG_COLOR != 0) intValue() else null
+            val remarks = if (flags and FLAG_REMARKS != 0) requireUtf8(take(u8())) else ""
+            // Trailing bytes mean this is not the frame it claims to be.
+            require(buffer.remaining() == 0) { "frame has trailing data" }
+            return Marker(
+                senderId = senderId,
+                uid = uuid,
+                uidSuffix = suffixText,
+                type = type,
+                callsign = callsign,
+                latE7 = latE7,
+                lonE7 = lonE7,
+                staleSeconds =
+                    if (flags and FLAG_STALE_MINUTES != 0) stale * SECONDS_PER_MINUTE else stale,
+                altM = altitude,
+                argb = argb,
+                remarks = remarks,
+            )
+        }
+
+        private fun shortValue(): Int {
+            require(buffer.remaining() >= 2) { "frame stops short" }
+            return buffer.short.toInt()
+        }
+
+        private fun intValue(): Int {
+            require(buffer.remaining() >= 4) { "frame stops short" }
+            return buffer.int
+        }
     }
 
     /**
@@ -320,10 +418,17 @@ object CotMarker {
         return if (Math.abs(value) >= UNKNOWN) null else value
     }
 
-    private fun decodeStrict(raw: ByteArray): String? {
+    /**
+     * Bytes as text, refusing anything that is not valid UTF-8.
+     *
+     * Kotlin substitutes U+FFFD for invalid input rather than throwing, so a
+     * malformed frame would otherwise arrive as plausible-looking text and be
+     * drawn on a map as somebody's callsign.
+     */
+    private fun requireUtf8(raw: ByteArray): String {
         val text = raw.toString(Charsets.UTF_8)
-        // Kotlin substitutes U+FFFD for invalid UTF-8 rather than throwing.
-        return if (text.toByteArray(Charsets.UTF_8).contentEquals(raw)) text else null
+        require(text.toByteArray(Charsets.UTF_8).contentEquals(raw)) { "not valid UTF-8" }
+        return text
     }
 
     /**

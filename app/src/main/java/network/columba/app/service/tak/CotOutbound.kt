@@ -14,13 +14,30 @@ package network.columba.app.service.tak
  * would be a claim about an ATAK nobody has heard from since.
  */
 class CotOutbound(val ourUid: String) {
-    /** The UID this ATAK calls itself, or null until it has said. */
+    /**
+     * The UID this ATAK calls itself, or null until it has said.
+     *
+     * Volatile because one of these is shared by every accepted connection,
+     * and ATAK opens more than one. A UID learned on one client's IO thread
+     * was not guaranteed visible to another's, so a self-report arriving
+     * concurrently could read null, skip [CotEvent.rewriteSelfUid] and put the
+     * ANDROID-xxxx device identifier on the mesh -- the single thing pivot 1
+     * exists to keep off it.
+     */
+    @Volatile
     var atakUid: String? = null
         private set
 
-    /** Counted rather than logged per event; a refusing peer is loud. */
-    var dropped: Long = 0L
-        private set
+    /**
+     * Counted rather than logged per event; a refusing peer is loud.
+     *
+     * Atomic for the same reason: incremented from several client coroutines,
+     * and a count that loses updates under exactly the load that produces them
+     * is worse than no count.
+     */
+    val dropped: Long get() = droppedCount.get()
+
+    private val droppedCount = java.util.concurrent.atomic.AtomicLong()
 
     /**
      * The frame to put on the mesh, or null if this event should not go.
@@ -67,7 +84,7 @@ class CotOutbound(val ourUid: String) {
         try {
             CotEvent.parse(cotXml)
         } catch (_: IllegalArgumentException) {
-            dropped++
+            droppedCount.incrementAndGet()
             return null
         }
         // The echo guard comes first, before anything is learned from the
@@ -82,7 +99,7 @@ class CotOutbound(val ourUid: String) {
         return try {
             CotTier2.encode(CotEvent.rewriteSelfUid(cotXml, atakUid, ourUid))
         } catch (_: IllegalArgumentException) {
-            dropped++
+            droppedCount.incrementAndGet()
             null
         }
     }
