@@ -134,7 +134,7 @@ class CotStreamTest {
     fun `an event after an oversized one still arrives`() {
         val stream = CotStream(maxEventBytes = 512)
         val huge = "<event uid=\"big\">" + "x".repeat(2000) + "</event>"
-        val small = "<event uid=\"small\"/></event>"
+        val small = "<event uid=\"small\"><detail/></event>"
 
         val events = stream.feed((huge + small).toByteArray(Charsets.UTF_8))
 

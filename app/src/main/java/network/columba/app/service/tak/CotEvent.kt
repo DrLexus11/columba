@@ -14,6 +14,17 @@ import javax.xml.parsers.DocumentBuilderFactory
  * hostile and every failure leaves as IllegalArgumentException.
  */
 object CotEvent {
+    /** Heartbeats are answered on their local socket before mesh routing. */
+    fun pingReply(cotXml: String, now: java.time.Instant = java.time.Instant.now()): String? {
+        val event = parseOrNull(cotXml) ?: return null
+        if (event.getAttribute("type") != "t-x-c-t") return null
+        val uid = escapeAttribute(event.getAttribute("uid").ifEmpty { "takPong" })
+        return "<event version=\"2.0\" uid=\"$uid\" type=\"t-x-c-t-r\" " +
+            "time=\"$now\" start=\"$now\" stale=\"${now.plusSeconds(60)}\" how=\"m-g\">" +
+            "<point lat=\"0\" lon=\"0\" hae=\"0\" ce=\"9999999\" le=\"9999999\"/>" +
+            "<detail/></event>"
+    }
+
     /**
      * True when this event is the endpoint's own, echoed back.
      *
@@ -153,7 +164,7 @@ object CotEvent {
      * means forwarding our own event, which is the loop this check exists to
      * prevent.
      */
-    private fun startTagEnd(xml: String): Int {
+    internal fun startTagEnd(xml: CharSequence): Int {
         var quote = ' '
         for (index in xml.indices) {
             val character = xml[index]

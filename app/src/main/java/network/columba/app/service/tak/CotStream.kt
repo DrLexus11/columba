@@ -72,6 +72,11 @@ class CotStream(private val maxEventBytes: Int = MAX_EVENT_BYTES) {
         // Discard whatever preceded the event: XML declarations,
         // whitespace between documents, or an event we already gave up on.
         if (start > 0) buffer.delete(0, start)
+        val headEnd = CotEvent.startTagEnd(buffer)
+        if (headEnd > 0 && buffer[headEnd - 1] == '/') {
+            val end = headEnd + 1
+            return if (end > maxEventBytes) Span.Oversized else Span.Complete(end)
+        }
         val close = buffer.indexOf(EVENT_CLOSE)
         if (close < 0) {
             // An unterminated event that has outgrown the cap will never
