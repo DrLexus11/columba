@@ -3,6 +3,7 @@ package network.columba.app.service.tak
 import network.columba.app.service.PositionCodec
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -116,6 +117,66 @@ class CotPositionTest {
         val fix = CotPosition.fixFromCot(pli, senderId = 1)!!
         val event = CotEvent.parse(CotPosition.buildCot(fix, "urtn-x", "PEER", 120_000))
         assertTrue(event.getAttribute("stale") > event.getAttribute("time"))
+    }
+
+    // ---- headings ----
+    //
+    // CoT states a heading in degrees; the wire format carries tenths. Getting
+    // that wrong is silent: the frame encodes, decodes and renders, just
+    // pointing somewhere else.
+
+    private fun withTrack(course: String) =
+        pli.replace("<contact", """<track course="$course" speed="4.0"/><contact""")
+
+    @Test
+    fun `a heading is carried in tenths of a degree`() {
+        assertEquals(1800, CotPosition.fixFromCot(withTrack("180.0"), senderId = 1)!!.courseDdeg)
+    }
+
+    @Test
+    fun `a heading survives the whole round trip`() {
+        // Through the codec and back out as CoT. This is the assertion that
+        // catches a scale error: due south went out as 18 degrees, which is
+        // north-north-east, and nothing anywhere reported a fault.
+        for (degrees in listOf(0.0, 12.0, 90.0, 180.0, 271.0, 359.0)) {
+            val fix = CotPosition.fixFromCot(withTrack("%.1f".format(degrees)), senderId = 1)!!
+            val back = PositionCodec.decode(PositionCodec.encode(fix))!!
+            val rendered = CotPosition.buildCot(back, "urtn-x", "PEER", 120_000)
+            val track = CotEvent.parse(rendered).let { event ->
+                val detail = event.childNodes
+                var found: org.w3c.dom.Element? = null
+                for (i in 0 until detail.length) {
+                    val node = detail.item(i)
+                    if (node is org.w3c.dom.Element && node.tagName == "detail") {
+                        val kids = node.childNodes
+                        for (j in 0 until kids.length) {
+                            val kid = kids.item(j)
+                            if (kid is org.w3c.dom.Element && kid.tagName == "track") found = kid
+                        }
+                    }
+                }
+                found
+            }
+            assertNotNull("no track for $degrees", track)
+            val got = track!!.getAttribute("course").toDouble()
+            // The wire carries 2-degree units, so a heading lands within one.
+            val off = minOf(Math.abs(got - degrees), 360 - Math.abs(got - degrees))
+            assertTrue("$degrees degrees came back as $got", off <= 2.0)
+        }
+    }
+
+    @Test
+    fun `a full turn is north not south`() {
+        // 360 degrees is due north. The firmware normalises before scaling for
+        // this reason; the bridge has to hand it a value already in range.
+        assertEquals(0, CotPosition.fixFromCot(withTrack("360.0"), senderId = 1)!!.courseDdeg)
+    }
+
+    @Test
+    fun `speed is centimetres per second`() {
+        // Checked beside course because it is the neighbouring field with its
+        // own scale, and a unit error there would look identical.
+        assertEquals(400, CotPosition.fixFromCot(withTrack("90.0"), senderId = 1)!!.speedCms)
     }
 
     @Test

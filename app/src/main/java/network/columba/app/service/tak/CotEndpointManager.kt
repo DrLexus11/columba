@@ -418,16 +418,26 @@ class CotEndpointManager
             // LoRa channel. Chat because a real GeoChat line compresses to more
             // than one packet, so on tier 2 it is not expensive, it is
             // undeliverable.
-            if (session.pipeline.atakUid != null && !session.pipeline.isEcho(cotXml)) {
-                if (CotPosition.isPosition(cotXml) && forwardPosition(cotXml, session)) return
-                if (forwardChat(cotXml, session)) return
-                if (forwardMarker(cotXml, session)) return
-            }
+            // The echo guard first, for everything, before anything is
+            // learned from the event or spent on it. Our own self-report
+            // coming back is a well-formed self-report, and learning from it
+            // would teach this pipeline our own UID.
+            if (session.pipeline.isEcho(cotXml)) return
+            // Then learn, and only then route. This used to be a side effect
+            // of the tier-2 path, which the typed codecs return before ever
+            // reaching -- so a session that opened with an SPI put
+            // ANDROID-<device>.SPI1 on the air as tier 2, bypassing the very
+            // scrubbing the marker codec added. The typed handlers do not need
+            // the learned UID; only the tier-2 rewrite does.
             val known = session.pipeline.atakUid
-            val frame = session.pipeline.frame(cotXml) ?: return
+            session.pipeline.observe(cotXml)
             if (known == null) {
                 session.pipeline.atakUid?.let { Log.i(TAG, "This ATAK calls itself $it") }
             }
+            if (CotPosition.isPosition(cotXml) && forwardPosition(cotXml, session)) return
+            if (forwardChat(cotXml, session)) return
+            if (forwardMarker(cotXml, session)) return
+            val frame = session.pipeline.frame(cotXml) ?: return
             fanOut(frame, session)
         }
 

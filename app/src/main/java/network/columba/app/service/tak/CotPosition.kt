@@ -103,7 +103,13 @@ object CotPosition {
             altKnown = altitude != null && Math.abs(altitude) < 32_000,
             altM = altitude?.let { Math.round(it).toInt() } ?: 0,
             courseKnown = course != null,
-            courseDdeg = course?.let { (Math.round(it).toInt() % 360 + 360) % 360 } ?: 0,
+            // CoT states a heading in degrees; the wire format carries tenths
+            // (PositionReport.h scales by 3600 per turn, not 360, and
+            // PositionCodec.fromLocation already writes bearing * 10). Storing
+            // degrees unscaled made 180 encode and decode as 18, and small
+            // headings round to 0 -- a silent error in the one field where a
+            // wrong direction is unrecoverable by the person reading the map.
+            courseDdeg = course?.let { (Math.round(it * 10).toInt() % 3600 + 3600) % 3600 } ?: 0,
             speedCms = speed?.takeIf { it > 0 }?.let { Math.round(it * 100).toInt() } ?: 0,
         )
     }
@@ -145,7 +151,8 @@ object CotPosition {
         // reads as "not reported"; a track of zero reads as stationary and
         // facing north, which is a different claim.
         if (fix.courseKnown || fix.speedCms > 0) {
-            detail.append("<track course=\"").append("%.1f".format(Locale.US, fix.courseDdeg.toDouble()))
+            detail.append("<track course=\"")
+                .append("%.1f".format(Locale.US, fix.courseDdeg / 10.0))
                 .append("\" speed=\"").append("%.2f".format(Locale.US, fix.speedCms / 100.0))
                 .append("\"/>")
         }

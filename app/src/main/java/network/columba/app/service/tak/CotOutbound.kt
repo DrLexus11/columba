@@ -37,6 +37,27 @@ class CotOutbound(val ourUid: String) {
      */
     fun isEcho(cotXml: String): Boolean = CotEvent.isSelfAddressed(cotXml, ourUid)
 
+    /**
+     * Learn what this ATAK calls itself, without sending anything.
+     *
+     * Separated from [frame] because the typed codecs return early: a session
+     * that opened with a marker or a chat line never reached [frame] at all,
+     * so nothing was ever learned, and every later self-report that fell
+     * through to tier 2 kept the ANDROID-xxxx device identifier that pivot 1
+     * exists to remove.
+     *
+     * Call it on every event that survives the echo guard, whichever codec
+     * then handles it. Learning is once per session, so calling it twice costs
+     * a parse and changes nothing.
+     */
+    fun observe(cotXml: String) {
+        if (atakUid != null) return
+        // Learned, never configured: ATAK announces its own identifier in
+        // every position report, and a setting an operator must type is a
+        // setting that can be wrong.
+        CotEvent.learnAtakUid(cotXml)?.let { atakUid = it }
+    }
+
     fun frame(cotXml: String): ByteArray? {
         // Validated here rather than relied on downstream. rewriteSelfUid
         // returns early -- without parsing -- until an ATAK UID has been
@@ -57,12 +78,7 @@ class CotOutbound(val ourUid: String) {
         // ANDROID-xxxx to the whole team for the rest of the session, which is
         // the one outcome this pipeline exists to prevent.
         if (CotEvent.isSelfAddressed(cotXml, ourUid)) return null
-        if (atakUid == null) {
-            // Learned, never configured: ATAK announces its own identifier in
-            // every position report, and a setting an operator must type is a
-            // setting that can be wrong.
-            CotEvent.learnAtakUid(cotXml)?.let { atakUid = it }
-        }
+        observe(cotXml)
         return try {
             CotTier2.encode(CotEvent.rewriteSelfUid(cotXml, atakUid, ourUid))
         } catch (_: IllegalArgumentException) {

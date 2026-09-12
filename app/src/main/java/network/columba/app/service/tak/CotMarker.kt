@@ -134,9 +134,7 @@ object CotMarker {
 
         if (altitude != null && Math.abs(altitude) < 32_000) flags = flags or FLAG_ALT
         if (argb != null) flags = flags or FLAG_COLOR
-        val remarksBytes = remarks.toByteArray(Charsets.UTF_8).let {
-            if (it.size > MAX_REMARKS) it.copyOf(MAX_REMARKS) else it
-        }
+        val remarksBytes = fitUtf8(remarks, MAX_REMARKS)
         if (remarksBytes.isNotEmpty()) flags = flags or FLAG_REMARKS
 
         val typeBytes = event.getAttribute("type").toByteArray(Charsets.UTF_8)
@@ -326,6 +324,38 @@ object CotMarker {
         val text = raw.toString(Charsets.UTF_8)
         // Kotlin substitutes U+FFFD for invalid UTF-8 rather than throwing.
         return if (text.toByteArray(Charsets.UTF_8).contentEquals(raw)) text else null
+    }
+
+    /**
+     * Shown when a note was cut, so a reader can tell a truncated remark from
+     * one that simply ended. Three bytes, reserved from the limit rather than
+     * added to it.
+     */
+    private val ELLIPSIS = "\u2026".toByteArray(Charsets.UTF_8)
+
+    /**
+     * The note as UTF-8, cut at a character boundary if it is too long.
+     *
+     * Slicing encoded bytes at a fixed index splits multibyte characters, and
+     * the far end decodes strictly -- so one Turkish character landing on the
+     * boundary made decode() reject the frame and the marker vanished with no
+     * error anywhere. An operator loses the marker, not the tail of a
+     * sentence, and never learns why.
+     *
+     * Remarks truncate where chat text refuses (see [CotChat.encode]) because
+     * they are different things: a chat line *is* its text, so cutting it
+     * destroys the message, while a note annotates a marker whose position and
+     * type are the payload. Losing the marker to save the note is the wrong
+     * trade.
+     */
+    private fun fitUtf8(text: String, limit: Int): ByteArray {
+        val raw = text.toByteArray(Charsets.UTF_8)
+        if (raw.size <= limit) return raw
+        var cut = limit - ELLIPSIS.size
+        // A UTF-8 continuation byte is 0b10xxxxxx. While the first excluded
+        // byte is one, the cut is inside a character; step back until it is not.
+        while (cut > 0 && (raw[cut].toInt() and 0xC0) == 0x80) cut--
+        return raw.copyOf(cut) + ELLIPSIS
     }
 
     private fun childElement(parent: Element, name: String): Element? {

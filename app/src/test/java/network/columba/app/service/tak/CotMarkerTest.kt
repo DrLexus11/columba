@@ -217,4 +217,44 @@ class CotMarkerTest {
         assertNotNull(CotMarker.decode(frame))
         assertEquals(TakPayload.MARKER_V1, TakPayload.kindOf(frame))
     }
+    // ---- a long note must not take the marker down with it ----
+
+    private fun markerWith(remarks: String) =
+        """<event uid="7c9e6679-7425-40de-944b-e07fc1f90ae7" type="a-h-G" """ +
+            """how="h-g-i-g-o" version="2.0" """ +
+            """start="2026-09-12T09:00:00.000Z" stale="2026-09-12T09:05:00.000Z">""" +
+            """<point lat="40.9601" lon="29.1002" hae="48.0" ce="9.0" le="9.0"/>""" +
+            """<detail><contact callsign="HOSTILE.7"/>""" +
+            """<remarks>$remarks</remarks></detail></event>"""
+
+    @Test
+    fun `a long ascii note is cut and the marker survives`() {
+        val decoded = CotMarker.decode(CotMarker.markerFromCot(markerWith("A".repeat(400)), 1))
+        assertNotNull(decoded)
+        assertTrue(decoded!!.remarks.startsWith("A"))
+        assertTrue(decoded.remarks.endsWith("\u2026"))
+    }
+
+    @Test
+    fun `a note cut inside a turkish character still decodes`() {
+        // The defect: slicing encoded bytes at a fixed index splits multibyte
+        // characters, the far end decodes strictly, and the marker vanishes
+        // with no error anywhere. Two-byte characters at every offset walk the
+        // cut across a character boundary.
+        for (pad in 0 until 8) {
+            val note = "x".repeat(pad) + "\u015f".repeat(200)
+            val frame = CotMarker.markerFromCot(markerWith(note), 1)
+            assertNotNull("no frame at pad $pad", frame)
+            val decoded = CotMarker.decode(frame)
+            assertNotNull("marker lost at pad $pad", decoded)
+            assertTrue(note.startsWith(decoded!!.remarks.trimEnd('\u2026')))
+        }
+    }
+
+    @Test
+    fun `a short note is untouched`() {
+        val decoded = CotMarker.decode(
+            CotMarker.markerFromCot(markerWith("3 kat, enkaz alt\u0131nda"), 1))
+        assertEquals("3 kat, enkaz alt\u0131nda", decoded!!.remarks)
+    }
 }
