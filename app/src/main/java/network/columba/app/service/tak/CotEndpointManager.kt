@@ -458,7 +458,31 @@ class CotEndpointManager
             val frame =
                 CotChat.chatFromCot(cotXml, TakMembership.senderIdFor(session.node.hash))
                     ?: return false
-            fanOut(frame, session)
+            // A direct message goes to one member, not to the team. ATAK puts
+            // the recipient's callsign in the chatroom field, so without the
+            // recipient carried separately every private line was fanned out
+            // to everybody -- not a cost problem, a confidentiality one.
+            //
+            // This works because peers are announced under their
+            // Reticulum-rooted UID, so ATAK addresses them by it and
+            // destinationFor() reverses it. That is pivot 1 paying for itself.
+            val recipient = CotChat.decode(frame)?.recipient.orEmpty()
+            if (recipient.isEmpty()) {
+                fanOut(frame, session)
+                return true
+            }
+            // Addressed to somebody who is not a peer of ours: a server
+            // contact, or a callsign this mesh has never announced. The
+            // fan-out is not a fallback here -- broadcasting a line meant for
+            // one person is the bug this whole path exists to stop, and it
+            // would not deliver it either. Dropped, and anything reachable
+            // another way is still reached that way.
+            val destination = TakIdentity.destinationFor(recipient)
+            if (destination == null) {
+                Log.i(TAG, "Chat for a uid that is not a member of this team, not sent")
+                return true
+            }
+            sendTo(destination, frame)
             return true
         }
 
@@ -497,25 +521,36 @@ class CotEndpointManager
         private suspend fun fanOut(frame: ByteArray, session: Session) {
             val now = System.currentTimeMillis()
             for (memberHash in session.registry.members(now)) {
-                val identity = rnsCore.recallIdentity(memberHash)
-                if (identity == null) {
-                    // Heard the announce, lost the identity -- possible after a
-                    // restart. Ask for the path; the next event will find it.
-                    rnsCore.requestPath(memberHash)
-                    continue
-                }
-                val destination =
-                    rnsCore.createDestination(
-                        identity,
-                        Direction.OUT,
-                        DestinationType.SINGLE,
-                        TakIdentity.NODE_APP,
-                        TakIdentity.NODE_ASPECTS,
-                    ).getOrNull() ?: continue
-                // One unreachable member must not cost the others their copy.
-                rnsCore.sendPacket(destination, frame)
-                    .onFailure { Log.w(TAG, "Could not reach a member: ${it.message}") }
+                sendTo(memberHash, frame)
             }
+        }
+
+        /**
+         * Send one frame to one node.
+         *
+         * Shared with the fan-out so an addressed line and a broadcast line
+         * take the same path -- a second copy of this would be a second place
+         * for the recall-and-request-path dance to be got wrong.
+         */
+        private suspend fun sendTo(memberHash: ByteArray, frame: ByteArray) {
+            val identity = rnsCore.recallIdentity(memberHash)
+            if (identity == null) {
+                // Heard the announce, lost the identity -- possible after a
+                // restart. Ask for the path; the next event will find it.
+                rnsCore.requestPath(memberHash)
+                return
+            }
+            val destination =
+                rnsCore.createDestination(
+                    identity,
+                    Direction.OUT,
+                    DestinationType.SINGLE,
+                    TakIdentity.NODE_APP,
+                    TakIdentity.NODE_ASPECTS,
+                ).getOrNull() ?: return
+            // One unreachable member must not cost the others their copy.
+            rnsCore.sendPacket(destination, frame)
+                .onFailure { Log.w(TAG, "Could not reach a member: ${it.message}") }
         }
 
         // ---- mesh -> ATAK ----
@@ -563,6 +598,7 @@ class CotEndpointManager
                     TakIdentity.uidFor(sender),
                     claims?.callsign ?: "UNKNOWN",
                     POSITION_STALE_MS,
+                    team = session.team,
                 ).toByteArray(Charsets.UTF_8),
             )
             return true

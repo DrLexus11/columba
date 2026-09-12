@@ -122,6 +122,7 @@ object CotPosition {
         callsign: String,
         staleMs: Long,
         receivedAtMs: Long = System.currentTimeMillis(),
+        team: String = "Cyan",
     ): String {
         // Prefer the time the fix was taken. A node with no clock sends zero,
         // and then the only honest stamp is when we received it -- later than
@@ -129,8 +130,16 @@ object CotPosition {
         // rather than fresher than it is.
         val takenMs = if (fix.fixUnixSeconds > 0) fix.fixUnixSeconds * 1000 else receivedAtMs
         val detail = StringBuilder()
-        detail.append("<contact callsign=\"").append(escape(callsign)).append("\"/>")
-        detail.append("<__group name=\"Cyan\" role=\"Team Member\"/>")
+        // The endpoint is what makes a peer *addressable* in ATAK rather than
+        // just visible. Without it a track appears on the map and the same peer
+        // is absent from the contact list -- the list an operator picks from to
+        // start a chat, send a marker, or dispatch a CASEVAC.
+        detail.append("<contact callsign=\"").append(escape(callsign))
+            .append("\" endpoint=\"*:-1:stcp\"/>")
+        // The team this node is on, not a constant. Hard-coding "Cyan" put
+        // every peer in the wrong group on any other team, and group colour is
+        // how an operator tells their own people apart at a glance.
+        detail.append("<__group name=\"").append(escape(team)).append("\" role=\"Team Member\"/>")
         if (fix.altKnown) detail.append("<precisionlocation altsrc=\"GPS\"/>")
         // Track goes in only when there is something to say. An absent track
         // reads as "not reported"; a track of zero reads as stationary and

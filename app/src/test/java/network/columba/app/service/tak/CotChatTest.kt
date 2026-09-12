@@ -57,9 +57,15 @@ class CotChatTest {
 
     @Test
     fun `a real message becomes tens of bytes`() {
+        // This one addresses a WinTAK user, whose uid is a 44-character
+        // Windows SID, so most of the frame is the recipient. Carrying it is
+        // what stops a private line reaching the whole team, and it was
+        // measured against compacting a urtn- recipient to sixteen raw bytes:
+        // twenty-one bytes on an event an operator types by hand did not
+        // justify a second encoding and a second way to get it wrong.
         val frame = CotChat.chatFromCot(chat.getString("message"), sender)!!
-        assertTrue("frame was ${frame.size}", frame.size < 60)
-        assertTrue(frame.size < chat.getString("message").length / 20)
+        assertTrue("frame was ${frame.size}", frame.size < 100)
+        assertTrue(frame.size < chat.getString("message").length / 10)
     }
 
     @Test
@@ -195,6 +201,118 @@ class CotChatTest {
         assertNull(TakPayload.kindOf(ByteArray(0)))
         assertNull(TakPayload.kindOf(null))
         assertEquals("unknown", TakPayload.nameOf(byteArrayOf(99)))
+    }
+
+    // ---- who a line is for ----
+    //
+    // ATAK puts the recipient's *callsign* in the chatroom field for a direct
+    // message, so the room alone cannot tell "everyone" from "one person".
+    // Until the recipient was carried separately, every private line was
+    // delivered to the whole team -- not a cost problem, a confidentiality one.
+
+    /**
+     * The captured message, readdressed.
+     *
+     * Derived from the fixture rather than from a literal: the identifiers in
+     * it have been re-sanitised once already, and a hard-coded copy silently
+     * stopped matching.
+     */
+    private fun addressedTo(target: String) =
+        chat.getString("message").replace(chat.getString("message_recipient"), target)
+
+    @Test
+    fun `a direct message carries who it is for`() {
+        val decoded = CotChat.decode(CotChat.chatFromCot(chat.getString("message"), sender))!!
+        assertEquals(chat.getString("message_recipient"), decoded.recipient)
+        assertTrue(decoded.recipient != decoded.room)
+    }
+
+    @Test
+    fun `a broadcast carries no recipient`() {
+        // A line to everyone has no single addressee, and inventing one would
+        // narrow a broadcast to one person -- the same bug in reverse.
+        for (room in listOf("All Chat Rooms", "All Streaming")) {
+            val event = addressedTo(room).replace("chatroom=\"Inquisitor\"", "chatroom=\"$room\"")
+            assertEquals(room, "", CotChat.decode(CotChat.chatFromCot(event, sender))!!.recipient)
+        }
+    }
+
+    @Test
+    fun `a room with three people is not a direct message`() {
+        // chatgrp enumerates participants. Reading uid1 as a recipient in a
+        // room would narrow the conversation to whoever is listed second,
+        // which is the confidentiality bug pointing at the wrong person
+        // instead of at everybody.
+        val target = chat.getString("message_recipient")
+        val event = chat.getString("message").replace(
+            """uid1="$target"""",
+            """uid1="$target" uid2="ANDROID-1111111111111111"""",
+        )
+        assertEquals("", CotChat.decode(CotChat.chatFromCot(event, sender))!!.recipient)
+    }
+
+    @Test
+    fun `a team room is not a direct message`() {
+        // The room's own name in the id field is a room, not a person. ATAK
+        // writes it that way for a team chat.
+        val target = chat.getString("message_recipient")
+        val event = chat.getString("message")
+            .replace("""id="$target"""", """id="Inquisitor"""")
+            .replace("""uid1="$target"""", """uid1="Inquisitor"""")
+        assertEquals("", CotChat.decode(CotChat.chatFromCot(event, sender))!!.recipient)
+    }
+
+    @Test
+    fun `a uid addressed line resolves to one peer`() {
+        // Peers are announced under their Reticulum-rooted UID, so ATAK
+        // addresses them by it and destinationFor() reverses it. Pivot 1
+        // paying for itself.
+        val peer = "urtn-" + "cd".repeat(16)
+        val decoded = CotChat.decode(CotChat.chatFromCot(addressedTo(peer), sender))!!
+        assertEquals(peer, decoded.recipient)
+        assertNotNull(TakIdentity.destinationFor(decoded.recipient))
+    }
+
+    @Test
+    fun `threading uses a uid not a callsign`() {
+        // chatgrp uid1 named the room, which is a callsign for a direct
+        // message. ATAK threads on the uid.
+        val decoded = CotChat.decode(CotChat.chatFromCot(chat.getString("message"), sender))!!
+        val rebuilt =
+            CotChat.buildChatCot(decoded, "urtn-x", "PEER", "2026-09-12T09:00:00.000Z")
+        assertTrue(rebuilt, rebuilt.contains("uid1=\"${decoded.recipient}\""))
+    }
+
+    // ---- when a line was sent ----
+    //
+    // A backlog replayed to somebody who was away is worth nothing if every
+    // line is stamped with the moment it was replayed.
+
+    @Test
+    fun `the authors time is carried`() {
+        val decoded = CotChat.decode(CotChat.chatFromCot(chat.getString("message"), sender))!!
+        assertEquals(chat.getLong("message_sent_unix"), decoded.sentUnix)
+    }
+
+    @Test
+    fun `a replayed line keeps its own time`() {
+        val decoded = CotChat.decode(CotChat.chatFromCot(chat.getString("message"), sender))!!
+        val rebuilt =
+            CotChat.buildChatCot(decoded, "urtn-x", "PEER", "2026-09-12T09:00:00.000Z")
+        assertTrue(rebuilt, rebuilt.contains("time=\"${chat.getString("message_sent_iso")}\""))
+        assertEquals(
+            decoded.sentUnix,
+            CotChat.decode(CotChat.chatFromCot(rebuilt, sender))!!.sentUnix,
+        )
+    }
+
+    @Test
+    fun `an event with no time says so rather than guessing`() {
+        // Zero rather than now: a receiver can tell "not stated" from a time,
+        // and stamping the relay moment is what makes a backlog look
+        // simultaneous.
+        val event = chat.getString("message").replace(Regex("""\s*time="[^"]*""""), "")
+        assertEquals(0L, CotChat.decode(CotChat.chatFromCot(event, sender))!!.sentUnix)
     }
 
     @Test

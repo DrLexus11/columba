@@ -14,8 +14,15 @@ import java.util.UUID
  * 383-byte MDU, so on tier 2 chat was not merely expensive -- it was
  * **undeliverable**.
  *
- *     message   1100 B raw   tier 2 refused   chat  45 B,  71 ms
- *     receipt    879 B raw   tier 2 345 B     chat  35 B,  64 ms
+ *     message   1095 B raw   tier 2 refused   chat  95 B, 107 ms
+ *     receipt    875 B raw   tier 2 343 B     chat  85 B, 100 ms
+ *
+ * Most of each frame is now the recipient: the captured message addresses a
+ * WinTAK user whose uid is a 44-character Windows SID. Carrying it is what
+ * stops a private line reaching the whole team, and it was measured against
+ * compacting a urtn- recipient to sixteen raw bytes -- twenty-one bytes on an
+ * event an operator types by hand did not justify a second encoding and a
+ * second way to get it wrong.
  *
  * Almost none of a GeoChat event needs to travel. The uid is three identifiers
  * concatenated, every one of which appears again inside `detail`; the sender
@@ -40,8 +47,16 @@ object CotChat {
      */
     const val MESSAGE_ID_BYTES = 16
     const val MAX_ROOM = 64
+    const val MAX_RECIPIENT = 64
     const val MAX_TEXT = 900
-    const val HEADER_BYTES = 1 + 1 + 4 + MESSAGE_ID_BYTES + 1 + 2
+    // version, kind, sender, sent_unix, message id, room len, recipient len, text len
+    const val HEADER_BYTES = 1 + 1 + 4 + 4 + MESSAGE_ID_BYTES + 1 + 1 + 2
+
+    /**
+     * What ATAK calls the everyone-room. A line addressed to one of these is a
+     * broadcast and has no single recipient.
+     */
+    private val BROADCAST_IDS = setOf("All Chat Rooms", "All Streaming", "RootContactGroup", "")
 
     /** A decoded chat frame. Claims about who sent it are the registry's job. */
     data class Message(
@@ -50,16 +65,42 @@ object CotChat {
         val messageId: String,
         val room: String,
         val text: String,
+        /**
+         * The uid this line is for, empty for a room.
+         *
+         * What stops a private message reaching the whole team: ATAK puts the
+         * recipient's *callsign* in the room field for a direct message, so
+         * the room alone cannot tell "everyone" from "one person".
+         */
+        val recipient: String = "",
+        /**
+         * When the author sent it, not when it was relayed; zero if the event
+         * did not say. A backlog replayed to somebody who was away is worth
+         * nothing if every line is stamped with the moment it was replayed.
+         */
+        val sentUnix: Long = 0,
     )
 
     /** Pack a chat message or a receipt. */
-    fun encode(kind: Int, senderId: Int, messageId: String, room: String, text: String = ""): ByteArray {
+    fun encode(
+        kind: Int,
+        senderId: Int,
+        messageId: String,
+        room: String,
+        text: String = "",
+        recipient: String = "",
+        sentUnix: Long = 0,
+    ): ByteArray {
         require(kind in COT_TYPES) { "unknown chat kind $kind" }
         require(kind == KIND_MESSAGE || text.isEmpty()) { "a receipt carries no text" }
         val roomBytes = room.toByteArray(Charsets.UTF_8)
+        val recipientBytes = recipient.toByteArray(Charsets.UTF_8)
         val textBytes = text.toByteArray(Charsets.UTF_8)
         require(roomBytes.isNotEmpty() && roomBytes.size <= MAX_ROOM) {
             "chatroom must be 1..$MAX_ROOM UTF-8 bytes"
+        }
+        require(recipientBytes.size <= MAX_RECIPIENT) {
+            "recipient is longer than $MAX_RECIPIENT bytes"
         }
         // Longer than this is not a chat line, and tier 2 already carries
         // anything this codec will not.
@@ -67,15 +108,20 @@ object CotChat {
         require(kind != KIND_MESSAGE || textBytes.isNotEmpty()) {
             "a chat message with no text is not a message"
         }
-        return ByteBuffer.allocate(HEADER_BYTES + roomBytes.size + textBytes.size)
+        return ByteBuffer.allocate(
+            HEADER_BYTES + roomBytes.size + recipientBytes.size + textBytes.size,
+        )
             .order(ByteOrder.BIG_ENDIAN)
             .put(VERSION.toByte())
             .put(kind.toByte())
             .putInt(senderId)
+            .putInt((sentUnix and 0xFFFFFFFFL).toInt())
             .put(uuidBytes(messageId))
             .put(roomBytes.size.toByte())
+            .put(recipientBytes.size.toByte())
             .putShort(textBytes.size.toShort())
             .put(roomBytes)
+            .put(recipientBytes)
             .put(textBytes)
             .array()
     }
@@ -93,13 +139,16 @@ object CotChat {
         val kind = buffer.get().toInt() and 0xFF
         if (kind !in COT_TYPES) return null
         val senderId = buffer.int
+        val sentUnix = buffer.int.toLong() and 0xFFFFFFFFL
         val rawId = ByteArray(MESSAGE_ID_BYTES).also { buffer.get(it) }
         val roomLength = buffer.get().toInt() and 0xFF
+        val recipientLength = buffer.get().toInt() and 0xFF
         val textLength = buffer.short.toInt() and 0xFFFF
-        if (roomLength < 1 || roomLength > MAX_ROOM || textLength > MAX_TEXT) return null
+        if (roomLength < 1 || roomLength > MAX_ROOM) return null
+        if (recipientLength > MAX_RECIPIENT || textLength > MAX_TEXT) return null
         // The lengths describe the whole body. Trailing bytes mean this is not
         // the frame it claims to be.
-        if (buffer.remaining() != roomLength + textLength) return null
+        if (buffer.remaining() != roomLength + recipientLength + textLength) return null
         // A message with no words, or a receipt carrying some. Either way it is
         // not what its own kind says it is, and a caller trusting `kind` would
         // act on the wrong thing.
@@ -111,7 +160,9 @@ object CotChat {
                 senderId = senderId,
                 messageId = uuidString(rawId),
                 room = decodeStrict(body, 0, roomLength),
-                text = decodeStrict(body, roomLength, textLength),
+                text = decodeStrict(body, roomLength + recipientLength, textLength),
+                recipient = decodeStrict(body, roomLength, recipientLength),
+                sentUnix = sentUnix,
             )
         } catch (_: IllegalArgumentException) {
             null
@@ -137,13 +188,33 @@ object CotChat {
             ?: return null
         val messageId = chat.getAttribute("messageId").takeIf { it.isNotEmpty() } ?: return null
         val room = chat.getAttribute("chatroom").takeIf { it.isNotEmpty() } ?: return null
+        // Who this is actually for. ATAK puts the recipient's callsign in the
+        // chatroom field for a direct message, so the room alone cannot tell
+        // "everyone" from "one person" -- and treating every line as a
+        // broadcast delivers private messages to the whole team.
+        var recipient = chat.getAttribute("id")
+        val group = childElement(chat, "chatgrp")
+        if (group != null) {
+            // chatgrp enumerates participants, so a uid2 means three or more
+            // of them: a room, and no one person this line is for. Reading
+            // uid1 as a recipient there would narrow a room conversation to
+            // whoever happened to be listed second.
+            if (group.getAttribute("uid2").isNotEmpty()) {
+                recipient = ""
+            } else if (recipient.isEmpty()) {
+                recipient = group.getAttribute("uid1")
+            }
+        }
+        if (recipient in BROADCAST_IDS || recipient == room) recipient = ""
+        val remarks = childElement(detail, "remarks")
         var text = ""
         if (kind == KIND_MESSAGE) {
-            text = childElement(detail, "remarks")?.textContent.orEmpty()
+            text = remarks?.textContent.orEmpty()
             if (text.isEmpty()) return null
         }
+        val sentUnix = sentUnix(remarks?.getAttribute("time"), event.getAttribute("time"))
         return try {
-            encode(kind, senderId, messageId, room, text)
+            encode(kind, senderId, messageId, room, text, recipient, sentUnix)
         } catch (_: IllegalArgumentException) {
             // A room or a line longer than this codec carries. Tier 2 takes it
             // instead rather than this silently truncating somebody's words.
@@ -163,24 +234,31 @@ object CotChat {
         // A message's uid is three identifiers concatenated, which is how ATAK
         // threads a conversation; a receipt's uid is the id of the message it
         // is about, which is how ATAK matches it to the line on screen.
+        // The recipient as ATAK will see it: the peer's own uid for a direct
+        // message, the room for a broadcast. Threading depends on this being a
+        // uid and not a callsign, which is what it used to be.
+        val target = escape(message.recipient).ifEmpty { room }
         val uid =
             if (message.kind == KIND_MESSAGE) {
-                "GeoChat.$sender.$room.${message.messageId}"
+                "GeoChat.$sender.$target.${message.messageId}"
             } else {
                 message.messageId
             }
         val element = if (message.kind == KIND_MESSAGE) "__chat" else "__chatreceipt"
         val detail = StringBuilder()
         detail.append(
-            "<$element chatroom=\"$room\" groupOwner=\"false\" id=\"$room\" " +
+            "<$element chatroom=\"$room\" groupOwner=\"false\" id=\"$target\" " +
                 "messageId=\"${message.messageId}\" parent=\"RootContactGroup\" " +
                 "senderCallsign=\"${escape(callsign)}\">" +
-                "<chatgrp id=\"$room\" uid0=\"$sender\" uid1=\"$room\"/></$element>",
+                "<chatgrp id=\"$target\" uid0=\"$sender\" uid1=\"$target\"/></$element>",
         )
         detail.append("<link relation=\"p-p\" type=\"a-f-G-U-C\" uid=\"$sender\"/>")
         if (message.kind == KIND_MESSAGE) {
+            // The author's time, not the relay's. This is what makes a
+            // replayed conversation read in the order it happened.
+            val stamp = if (message.sentUnix > 0) iso(message.sentUnix) else whenIso
             detail.append(
-                "<remarks source=\"BAO.F.ATAK.$sender\" time=\"$whenIso\" to=\"$room\">" +
+                "<remarks source=\"BAO.F.ATAK.$sender\" time=\"$stamp\" to=\"$target\">" +
                     "${escape(message.text)}</remarks>",
             )
         }
@@ -190,6 +268,25 @@ object CotChat {
             "<point lat=\"0.0\" lon=\"0.0\" hae=\"9999999.0\" ce=\"9999999.0\" le=\"9999999.0\"/>" +
             "<detail>$detail</detail></event>"
     }
+
+    /**
+     * When the author sent this, or zero if the event does not say.
+     *
+     * Zero rather than now: a receiver can tell "not stated" from a time, and
+     * stamping the relay moment is what would make a replayed backlog look as
+     * though it all happened at once.
+     */
+    private fun sentUnix(remarksTime: String?, eventTime: String): Long {
+        val stamp = remarksTime?.takeIf { it.isNotEmpty() } ?: eventTime
+        if (stamp.isEmpty()) return 0
+        return runCatching { java.time.Instant.parse(stamp).epochSecond }.getOrDefault(0L)
+    }
+
+    /** A CoT timestamp from unix seconds, in the form ATAK writes. */
+    private fun iso(unixSeconds: Long): String =
+        java.text.SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", java.util.Locale.US)
+            .apply { timeZone = java.util.TimeZone.getTimeZone("UTC") }
+            .format(java.util.Date(unixSeconds * 1000))
 
     private fun uuidBytes(messageId: String): ByteArray {
         val uuid = try {

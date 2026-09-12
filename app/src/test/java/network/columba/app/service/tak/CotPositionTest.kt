@@ -119,6 +119,26 @@ class CotPositionTest {
     }
 
     @Test
+    fun `a rendered peer is addressable`() {
+        // A peer with no endpoint appears on the map and is absent from the
+        // contact list, which is the list an operator picks from to start a
+        // chat, send a marker, or dispatch a CASEVAC.
+        val fix = CotPosition.fixFromCot(pli, senderId = 1)!!
+        val rendered = CotPosition.buildCot(fix, "urtn-x", "PEER", 120_000)
+        assertTrue(rendered, rendered.contains("""endpoint="*:-1:stcp""""))
+    }
+
+    @Test
+    fun `the team is the one this node is on`() {
+        // Hard-coding Cyan put every peer in the wrong group on any other
+        // team, and group colour is how an operator tells their own people
+        // apart at a glance.
+        val fix = CotPosition.fixFromCot(pli, senderId = 1)!!
+        val rendered = CotPosition.buildCot(fix, "urtn-x", "PEER", 120_000, team = "Magenta")
+        assertTrue(rendered, rendered.contains("""name="Magenta""""))
+    }
+
+    @Test
     fun `a callsign with markup cannot escape the event`() {
         val fix = CotPosition.fixFromCot(pli, senderId = 1)!!
         val rendered = CotPosition.buildCot(fix, "urtn-x", """PEER"/><script>""", 1000)
