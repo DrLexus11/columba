@@ -29,6 +29,7 @@ import java.util.Locale
 import java.util.TimeZone
 import network.columba.app.rns.api.RnsCore
 import network.columba.app.rns.api.RnsLxmf
+import network.columba.app.rns.api.model.DeliveryMethod
 import network.columba.app.rns.api.model.Destination
 import network.columba.app.rns.api.model.DestinationType
 import network.columba.app.rns.api.model.Direction
@@ -279,6 +280,7 @@ class CotEndpointManager
             val registry = TakMembership.Registry(keys.team, keys.secret, ownHash = node.hash)
             val session = Session(
                 node = node,
+                lxmf = TakLxmf.Carrier(rnsCore, rnsLxmf, nodeIdentity),
                 team = keys.team,
                 pipeline = CotOutbound(TakIdentity.uidFor(node.hash)),
                 registry = registry,
@@ -320,6 +322,20 @@ class CotEndpointManager
                     publishState(session, clientsLock.withLock { clients.size })
 
                     val fromMesh = launch { pumpMeshToClients(session) }
+                    // The same renderer the packet path uses: a chat line is
+                    // the same chat line whichever carrier brought it, and a
+                    // second rendering here would be a second place for the
+                    // two to drift.
+                    val fromLxmf =
+                        launch {
+                            session.lxmf.frames().collect { frame ->
+                                val rendered =
+                                    session.renderer.render(frame, System.currentTimeMillis())
+                                if (rendered is CotRenderer.Rendered.Cot) {
+                                    writeToClients(rendered.xml.toByteArray(Charsets.UTF_8))
+                                }
+                            }
+                        }
                     val fromAnnounces = launch { learnMembers(session) }
                     val beacon = launch { announceForever(session) }
                     try {
@@ -332,6 +348,7 @@ class CotEndpointManager
                         beacon.cancel()
                         fromAnnounces.cancel()
                         fromMesh.cancel()
+                        fromLxmf.cancel()
                         // NonCancellable because this finally runs *during*
                         // cancellation, and a suspending call there would be
                         // cancelled before it did anything -- leaving every
@@ -511,9 +528,18 @@ class CotEndpointManager
             // This works because peers are announced under their
             // Reticulum-rooted UID, so ATAK addresses them by it and
             // destinationFor() reverses it. That is pivot 1 paying for itself.
-            val recipient = CotChat.decode(frame)?.recipient.orEmpty()
+            val message = CotChat.decode(frame)
+            val recipient = message?.recipient.orEmpty()
             if (recipient.isEmpty()) {
-                fanOut(frame, session)
+                // A receipt for a room line goes nowhere. Every member
+                // answering a broadcast with a delivery and a read receipt is
+                // two thirds of what group chat costs on the air -- 7.2 s of
+                // the 11.1 s a ten-person room spends -- for one bit of
+                // meaning each, and none of it is something an operator can
+                // act on. A direct receipt still goes, because there one peer
+                // is waiting on exactly that answer.
+                val roomReceipt = message != null && message.kind != CotChat.KIND_MESSAGE
+                if (!roomReceipt) fanOut(frame, session)
                 return true
             }
             // Addressed to one person, so it reaches that person or nobody.
@@ -525,7 +551,10 @@ class CotEndpointManager
                 session.registry.memberDestination(recipient, System.currentTimeMillis())
             if (destination == null) {
                 Log.i(TAG, "Chat for a uid that is not a member of this team, not sent")
-            } else {
+            } else if (!session.lxmf.send(destination, frame, message?.text.orEmpty())) {
+                // The bare packet is the fallback for a peer whose identity we
+                // cannot recall, not the normal route. It delivers the line
+                // and promises nothing about it.
                 sendTo(destination, frame)
             }
             return true
@@ -673,6 +702,12 @@ class CotEndpointManager
          */
         private class Session(
             val node: Destination,
+            /**
+             * How chat reaches one named peer: over LXMF, signed with the same
+             * identity the node destination is built from, which is why a peer
+             * who can address our node can also address our inbox.
+             */
+            val lxmf: TakLxmf.Carrier,
             val team: String,
             val pipeline: CotOutbound,
             val registry: TakMembership.Registry,
