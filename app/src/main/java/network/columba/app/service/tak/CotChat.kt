@@ -362,26 +362,37 @@ object CotChat {
         // the same string for everybody.
         val room = escape(if (message.recipient.isNotEmpty()) callsign else message.room)
         val sender = escape(senderUid)
-        // A message's uid is three identifiers concatenated, which is how ATAK
-        // threads a conversation; a receipt's uid is the id of the message it
-        // is about, which is how ATAK matches it to the line on screen.
-        // The recipient as ATAK will see it: the peer's own uid for a direct
-        // message, the room for a broadcast. Threading depends on this being a
-        // uid and not a callsign, which is what it used to be.
-        val target = escape(message.recipient).ifEmpty { room }
+        // The conversation this belongs to, as ATAK keys it: **the other
+        // party**. That is the recipient in an event the local ATAK *wrote*,
+        // and the sender in one it is being *handed* -- which is what this
+        // builds. Naming it after the recipient put the receiving operator in
+        // a conversation with themselves, and their reply was then addressed
+        // to their own UID and dropped by the far end as "not a member of this
+        // team". Seen on hardware 2026-09-12: messages arrived, replies went
+        // nowhere, and nothing in between said why.
+        //
+        // A room is the other party for everybody at once, so a broadcast
+        // keeps it.
+        val recipient = escape(message.recipient)
+        val conversation = if (recipient.isNotEmpty()) sender else room
+        // uid0 and uid1 are the two ends. Keeping our own UID as uid1 is what
+        // lets a reply parsed back out of ATAK carry the sender as its
+        // recipient, which is the whole point of answering.
+        val otherEnd = recipient.ifEmpty { room }
         val uid =
             if (message.kind == KIND_MESSAGE) {
-                "GeoChat.$sender.$target.${message.messageId}"
+                "GeoChat.$sender.$conversation.${message.messageId}"
             } else {
                 message.messageId
             }
         val element = if (message.kind == KIND_MESSAGE) "__chat" else "__chatreceipt"
         val detail = StringBuilder()
         detail.append(
-            "<$element chatroom=\"$room\" groupOwner=\"false\" id=\"$target\" " +
+            "<$element chatroom=\"$room\" groupOwner=\"false\" id=\"$conversation\" " +
                 "messageId=\"${message.messageId}\" parent=\"RootContactGroup\" " +
                 "senderCallsign=\"${escape(callsign)}\">" +
-                "<chatgrp id=\"$target\" uid0=\"$sender\" uid1=\"$target\"/></$element>",
+                "<chatgrp id=\"$conversation\" uid0=\"$sender\" " +
+                "uid1=\"$otherEnd\"/></$element>",
         )
         detail.append("<link relation=\"p-p\" type=\"a-f-G-U-C\" uid=\"$sender\"/>")
         if (message.kind == KIND_MESSAGE) {
@@ -389,7 +400,7 @@ object CotChat {
             // replayed conversation read in the order it happened.
             val stamp = if (message.sentUnix > 0) iso(message.sentUnix) else whenIso
             detail.append(
-                "<remarks source=\"BAO.F.ATAK.$sender\" time=\"$stamp\" to=\"$target\">" +
+                "<remarks source=\"BAO.F.ATAK.$sender\" time=\"$stamp\" to=\"$otherEnd\">" +
                     "${escape(message.text)}</remarks>",
             )
         }

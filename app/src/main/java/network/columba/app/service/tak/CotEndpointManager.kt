@@ -438,22 +438,29 @@ class CotEndpointManager
             val stream = CotStream()
             val buffer = ByteArray(READ_BUFFER)
             publishState(session, clientsLock.withLock { clients.add(connection); clients.size })
+            Log.i(TAG, "ATAK connected")
             try {
                 val input = connection.getInputStream()
                 while (true) {
                     val read = input.read(buffer)
                     if (read <= 0) break
                     for (event in stream.feed(buffer, read)) {
-                        forwardToMesh(event, session)
+                        val reply = CotEvent.pingReply(event)
+                        if (reply != null) {
+                            writeToClient(connection, reply.toByteArray(Charsets.UTF_8))
+                        } else {
+                            forwardToMesh(event, session)
+                        }
                     }
                 }
-            } catch (_: IOException) {
-                // An operator closing ATAK is the ordinary way this ends.
+            } catch (error: IOException) {
+                Log.w(TAG, "ATAK connection failed", error)
             } finally {
                 withContext(NonCancellable) {
                     val remaining = clientsLock.withLock { clients.remove(connection); clients.size }
                     runCatching { connection.close() }
                     publishState(session, remaining)
+                    Log.i(TAG, "ATAK disconnected: $remaining client(s)")
                 }
             }
         }
@@ -658,8 +665,6 @@ class CotEndpointManager
         }
 
         private suspend fun writeToClients(payload: ByteArray) {
-            Log.i(TAG, "-> ATAK: ${payload.size} bytes to " +
-                "${clientsLock.withLock { clients.size }} client(s)")
             // Set on whichever IO thread does the writing, for the same reason.
             TrafficStats.setThreadStatsTag(SOCKET_TAG)
             // Snapshot under the lock, write outside it. A client whose
@@ -667,15 +672,16 @@ class CotEndpointManager
             // takes, and holding the lock across that would stall the accept
             // loop and every other client behind the slowest one.
             val targets = clientsLock.withLock { clients.toList() }
+            if (targets.isEmpty()) {
+                Log.w(TAG, "ATAK delivery lost: ${payload.size} bytes, no connected clients")
+            }
             val dead = mutableListOf<Socket>()
             withContext(Dispatchers.IO) {
                 for (client in targets) {
                     try {
-                        client.getOutputStream().apply {
-                            write(payload)
-                            flush()
-                        }
-                    } catch (_: IOException) {
+                        writeToClient(client, payload)
+                    } catch (error: IOException) {
+                        Log.w(TAG, "ATAK write failed", error)
                         dead.add(client)
                     }
                 }
@@ -683,6 +689,17 @@ class CotEndpointManager
             if (dead.isEmpty()) return
             clientsLock.withLock { clients.removeAll(dead) }
             for (client in dead) runCatching { client.close() }
+        }
+
+        // Heartbeat replies and mesh callbacks share a stream: each complete
+        // XML event must be written before another writer can start one.
+        private fun writeToClient(client: Socket, payload: ByteArray) {
+            synchronized(client) {
+                client.getOutputStream().apply {
+                    write(payload)
+                    flush()
+                }
+            }
         }
 
         private suspend fun closeAllClients() {

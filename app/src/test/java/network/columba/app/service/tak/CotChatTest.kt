@@ -95,22 +95,14 @@ class CotChatTest {
             "2026-09-11T20:00:00.000Z", "2026-09-11T21:00:00.000Z",
         )
         val again = CotChat.decode(CotChat.chatFromCot(rebuilt, sender))!!
-        // Everything that *is* the message survives. The chatroom is the one
-        // field that legitimately differs, because it names the other party
-        // and that differs on each side of a direct message. Presentation,
-        // not content -- and idempotent from the second application on.
-        assertEquals(decoded.copy(room = again.room), again)
+        // The words and the identity of the line survive intact.
+        assertEquals(decoded.copy(room = again.room, recipient = again.recipient), again)
+        // Two fields legitimately turn around, because a rebuilt event is the
+        // *other side* of the conversation: it is headed by the sender, and
+        // reading it back the way the endpoint reads what ATAK writes gives a
+        // line addressed to that sender. That is a reply, and it is the point.
         assertEquals("LEXUS", again.room)
-        val third = CotChat.decode(
-            CotChat.chatFromCot(
-                CotChat.buildChatCot(
-                    again, "urtn-" + "ab".repeat(16), "LEXUS",
-                    "2026-09-11T20:00:00.000Z", "2026-09-11T21:00:00.000Z",
-                ),
-                sender,
-            ),
-        )!!
-        assertEquals(again, third)
+        assertEquals("urtn-" + "ab".repeat(16), again.recipient)
     }
 
     @Test
@@ -292,6 +284,32 @@ class CotChatTest {
         val decoded = CotChat.decode(CotChat.chatFromCot(addressedTo(peer), sender))!!
         assertEquals(peer, decoded.recipient)
         assertNotNull(TakIdentity.destinationFor(decoded.recipient))
+    }
+
+    @Test
+    fun `a received message is a conversation with its sender`() {
+        // ATAK keys a conversation on the other party. In an event the local
+        // ATAK wrote that is the recipient; in one it is handed it is the
+        // sender. Naming it after the recipient put the operator in a
+        // conversation with themselves, and their reply then carried their own
+        // UID and was dropped at the far end as not a member -- messages in,
+        // replies nowhere. Hardware, 2026-09-12.
+        val decoded = CotChat.decode(CotChat.chatFromCot(chat.getString("message"), sender))!!
+        val peer = "urtn-" + "ab".repeat(16)
+        val rebuilt = CotChat.buildChatCot(decoded, peer, "DECK", "2026-09-12T09:00:00.000Z", "2026-09-12T10:00:00.000Z")
+        assertTrue(rebuilt, rebuilt.contains("""id="$peer""""))
+        assertTrue(rebuilt, !rebuilt.contains("""id="${decoded.recipient}""""))
+    }
+
+    @Test
+    fun `a reply to a received message goes back to its sender`() {
+        // The test that would have caught it: read the rebuilt event back the
+        // way the endpoint reads what ATAK writes, and check the addressee is
+        // the peer rather than ourselves.
+        val decoded = CotChat.decode(CotChat.chatFromCot(chat.getString("message"), sender))!!
+        val peer = "urtn-" + "ab".repeat(16)
+        val rebuilt = CotChat.buildChatCot(decoded, peer, "DECK", "2026-09-12T09:00:00.000Z", "2026-09-12T10:00:00.000Z")
+        assertEquals(peer, CotChat.decode(CotChat.chatFromCot(rebuilt, sender))!!.recipient)
     }
 
     @Test
