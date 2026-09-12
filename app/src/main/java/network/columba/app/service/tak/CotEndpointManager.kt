@@ -693,15 +693,6 @@ class CotEndpointManager
 
         // Heartbeat replies and mesh callbacks share a stream: each complete
         // XML event must be written before another writer can start one.
-        private fun writeToClient(client: Socket, payload: ByteArray) {
-            synchronized(client) {
-                client.getOutputStream().apply {
-                    write(payload)
-                    flush()
-                }
-            }
-        }
-
         private suspend fun closeAllClients() {
             val closing = clientsLock.withLock { clients.toList().also { clients.clear() } }
             for (client in closing) runCatching { client.close() }
@@ -761,3 +752,23 @@ class CotEndpointManager
             val callsign: String = "COLUMBA"
         }
     }
+
+/**
+ * Write one whole event to one client, serialised on that socket.
+ *
+ * The lock is the point. A heartbeat is answered from the reader thread while
+ * the mesh writes from another, and two threads interleaving halves of two
+ * events on one socket produce a stream ATAK cannot parse.
+ *
+ * Outside the class because it holds no state of it, and because the class was
+ * over detekt's method budget -- which is a fair thing to be told about an
+ * endpoint that already does discovery, framing, rendering and four codecs.
+ */
+private fun writeToClient(client: Socket, payload: ByteArray) {
+    synchronized(client) {
+        client.getOutputStream().apply {
+            write(payload)
+            flush()
+        }
+    }
+}
