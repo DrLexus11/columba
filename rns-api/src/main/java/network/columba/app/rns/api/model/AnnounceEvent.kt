@@ -27,6 +27,11 @@ enum class NodeType : Parcelable {
          */
         fun fromAspect(aspect: String?): NodeType =
             when (aspect) {
+                // A team member is a mesh node, and saying so puts it in
+                // the announce stream where an operator can see the team
+                // appear. UNKNOWN would match no filter chip and show
+                // nowhere.
+                Aspects.TAK_NODE -> NODE
                 Aspects.LXMF_PROPAGATION -> PROPAGATION_NODE
                 Aspects.NOMADNET_NODE -> NODE
                 Aspects.LXST_TELEPHONY -> PHONE

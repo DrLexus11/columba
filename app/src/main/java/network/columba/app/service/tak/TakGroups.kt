@@ -27,7 +27,12 @@ object TakGroups {
      * key on this side differ from every key on that one, which presents as a
      * team whose members cannot hear each other.
      */
-    private val DOMAIN = "urtn-tak-group-v1\u0000".toByteArray(Charsets.US_ASCII)
+    /**
+     * Shared with [TakMembership], which derives the team tag from the same
+     * secret and must use the same separator. Copying the literal into a
+     * second file is how two derivations of one secret quietly diverge.
+     */
+    internal val DOMAIN = "urtn-tak-group-v1\u0000".toByteArray(Charsets.US_ASCII)
     private val IDENTITY_INFO = "identity\u0000".toByteArray(Charsets.US_ASCII)
     private val ASPECT_INFO = "aspect\u0000".toByteArray(Charsets.US_ASCII)
 

@@ -14,13 +14,30 @@ package network.columba.app.service.tak
  * would be a claim about an ATAK nobody has heard from since.
  */
 class CotOutbound(val ourUid: String) {
-    /** The UID this ATAK calls itself, or null until it has said. */
+    /**
+     * The UID this ATAK calls itself, or null until it has said.
+     *
+     * Volatile because one of these is shared by every accepted connection,
+     * and ATAK opens more than one. A UID learned on one client's IO thread
+     * was not guaranteed visible to another's, so a self-report arriving
+     * concurrently could read null, skip [CotEvent.rewriteSelfUid] and put the
+     * ANDROID-xxxx device identifier on the mesh -- the single thing pivot 1
+     * exists to keep off it.
+     */
+    @Volatile
     var atakUid: String? = null
         private set
 
-    /** Counted rather than logged per event; a refusing peer is loud. */
-    var dropped: Long = 0L
-        private set
+    /**
+     * Counted rather than logged per event; a refusing peer is loud.
+     *
+     * Atomic for the same reason: incremented from several client coroutines,
+     * and a count that loses updates under exactly the load that produces them
+     * is worse than no count.
+     */
+    val dropped: Long get() = droppedCount.get()
+
+    private val droppedCount = java.util.concurrent.atomic.AtomicLong()
 
     /**
      * The frame to put on the mesh, or null if this event should not go.
@@ -28,6 +45,36 @@ class CotOutbound(val ourUid: String) {
      * Null is ordinary and covers three cases: our own event coming back,
      * something that is not CoT at all, and an event we could not encode.
      */
+    /**
+     * Whether this event is our own, come back to us.
+     *
+     * Exposed so a caller routing an event to a different codec can ask the
+     * same question [frame] asks, rather than reimplementing the guard and
+     * getting the order wrong -- which is the bug this class exists to stop.
+     */
+    fun isEcho(cotXml: String): Boolean = CotEvent.isSelfAddressed(cotXml, ourUid)
+
+    /**
+     * Learn what this ATAK calls itself, without sending anything.
+     *
+     * Separated from [frame] because the typed codecs return early: a session
+     * that opened with a marker or a chat line never reached [frame] at all,
+     * so nothing was ever learned, and every later self-report that fell
+     * through to tier 2 kept the ANDROID-xxxx device identifier that pivot 1
+     * exists to remove.
+     *
+     * Call it on every event that survives the echo guard, whichever codec
+     * then handles it. Learning is once per session, so calling it twice costs
+     * a parse and changes nothing.
+     */
+    fun observe(cotXml: String) {
+        if (atakUid != null) return
+        // Learned, never configured: ATAK announces its own identifier in
+        // every position report, and a setting an operator must type is a
+        // setting that can be wrong.
+        CotEvent.learnAtakUid(cotXml)?.let { atakUid = it }
+    }
+
     fun frame(cotXml: String): ByteArray? {
         // Validated here rather than relied on downstream. rewriteSelfUid
         // returns early -- without parsing -- until an ATAK UID has been
@@ -37,7 +84,7 @@ class CotOutbound(val ourUid: String) {
         try {
             CotEvent.parse(cotXml)
         } catch (_: IllegalArgumentException) {
-            dropped++
+            droppedCount.incrementAndGet()
             return null
         }
         // The echo guard comes first, before anything is learned from the
@@ -48,16 +95,11 @@ class CotOutbound(val ourUid: String) {
         // ANDROID-xxxx to the whole team for the rest of the session, which is
         // the one outcome this pipeline exists to prevent.
         if (CotEvent.isSelfAddressed(cotXml, ourUid)) return null
-        if (atakUid == null) {
-            // Learned, never configured: ATAK announces its own identifier in
-            // every position report, and a setting an operator must type is a
-            // setting that can be wrong.
-            CotEvent.learnAtakUid(cotXml)?.let { atakUid = it }
-        }
+        observe(cotXml)
         return try {
             CotTier2.encode(CotEvent.rewriteSelfUid(cotXml, atakUid, ourUid))
         } catch (_: IllegalArgumentException) {
-            dropped++
+            droppedCount.incrementAndGet()
             null
         }
     }

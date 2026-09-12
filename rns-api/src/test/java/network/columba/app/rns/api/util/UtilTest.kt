@@ -67,7 +67,7 @@ class UtilTest {
         // to a non-UNKNOWN value — that's the load-bearing invariant. If
         // someone adds a new aspect to one place without the other, this
         // catches it.
-        assertEquals(4, Aspects.ALL.size)
+        assertEquals(5, Aspects.ALL.size)
         for (aspect in Aspects.ALL) {
             assertNotEquals(
                 "aspect $aspect resolved to UNKNOWN but is in Aspects.ALL",
@@ -75,6 +75,33 @@ class UtilTest {
                 NodeType.fromAspect(aspect),
             )
         }
+    }
+
+    @Test
+    fun `the python aspect list is in step with this one`() {
+        // event_bridge.py carries a parallel tuple of the same strings,
+        // "kept in sync by hand" because Chaquopy cannot read Kotlin constants
+        // from Python. An aspect in one list and not the other is dropped
+        // before it reaches the app -- which for TAK means a team that never
+        // discovers its own members, with nothing logged anywhere. Hand-sync
+        // is a comment; this is the check.
+        val bridge = java.io.File("../rns-backend-py/src/main/python/event_bridge.py")
+        if (!bridge.exists()) return   // not this module's job to police layout
+        val declaration =
+            bridge.readText()
+                .substringAfter("_KNOWN_ASPECTS = (")
+                .substringBefore(")")
+        for (aspect in Aspects.ALL) {
+            assertTrue(
+                "aspect $aspect is in Aspects.ALL but not in event_bridge.py",
+                declaration.contains("\"$aspect\""),
+            )
+        }
+        assertEquals(
+            "event_bridge.py lists an aspect Aspects.ALL does not",
+            Aspects.ALL.size,
+            declaration.count { it == ',' } + 1,
+        )
     }
 
     // ===================== NodeType.fromAspect =====================
