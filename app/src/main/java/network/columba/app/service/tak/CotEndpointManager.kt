@@ -410,21 +410,30 @@ class CotEndpointManager
                         announceEvent.appData,
                         System.currentTimeMillis(),
                     )
-                if (arrival != TakMembership.Arrival.NEW) return@collect
-                val claims = session.registry.describe(announceEvent.destinationHash)
-                Log.i(
-                    TAG,
-                    "Team member ${claims?.callsign ?: "?"} is " +
-                        TakIdentity.uidFor(announceEvent.destinationHash),
-                )
-                publishState(session, clientsLock.withLock { clients.size })
-                // Say who we are back. A node that starts late hears everyone
-                // who announces after it and nobody who announced before, so
-                // without this the first node up stays invisible to the second
-                // until the next re-announce -- half an hour of a team that
-                // cannot see its own members. Greeting only happens for a
-                // member that was not already known, so the reply it provokes
-                // finds a known member and goes no further.
+                if (arrival == null) return@collect
+                if (arrival == TakMembership.Arrival.NEW) {
+                    val claims = session.registry.describe(announceEvent.destinationHash)
+                    Log.i(
+                        TAG,
+                        "Team member ${claims?.callsign ?: "?"} is " +
+                            TakIdentity.uidFor(announceEvent.destinationHash),
+                    )
+                    publishState(session, clientsLock.withLock { clients.size })
+                }
+                // Say who we are back -- to whoever just announced, not only to
+                // a member that is new to us.
+                //
+                // A node that starts late hears everyone who announces after it
+                // and nobody who announced before. A node that *restarts* is
+                // worse: it has lost its own membership while every peer still
+                // remembers it, so greeting only new members leaves it greeted
+                // by nobody at all. It is not visibly broken while that lasts
+                // -- its own announces go out, peers see it fine -- and every
+                // frame it receives is dropped for an identity it cannot name.
+                // CarriedIssues #5, found on hardware 2026-09-12.
+                //
+                // The rate limit is what keeps this bounded, and it was already
+                // here; only the trigger was too narrow.
                 if (session.registry.shouldGreet(System.currentTimeMillis())) {
                     announce(session)
                 }
