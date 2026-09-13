@@ -135,6 +135,16 @@ class PropagationNodeManager
     ) {
         companion object {
             private const val TAG = "PropagationNodeManager"
+
+            /**
+             * The least time between two peer-triggered syncs.
+             *
+             * Ten nodes powering up together would otherwise mean ten syncs,
+             * and a sync is a Link and a transfer rather than one packet. Same
+             * floor the bridge uses for the same trigger, so the two halves
+             * behave alike.
+             */
+            const val PEER_SYNC_FLOOR_MS = 60_000L
         }
 
         /**
@@ -257,6 +267,21 @@ class PropagationNodeManager
         private var relayObserverJob: Job? = null
 
         /**
+         * Syncs triggered by a peer being heard rather than by the clock.
+         *
+         * Retrieval was a timer only, and the interval defaults to an hour. So
+         * a message that escalated to the propagation node sat there until the
+         * hour was up -- on hardware 2026-09-13 the command post was holding
+         * nine of them, and chat looked simply broken. An announce is the
+         * cheapest possible evidence that the mesh is alive and somebody is
+         * there to have sent something, which makes it the right moment to ask.
+         */
+        private var peerHeardJob: Job? = null
+
+        /** When a peer-triggered sync last ran. */
+        private var lastPeerSync = 0L
+
+        /**
          * Initialize the manager - start observing database for relay changes.
          * Call this when the Reticulum service becomes ready.
          */
@@ -315,6 +340,23 @@ class PropagationNodeManager
 
             // Start periodic sync with propagation node
             startPeriodicSync()
+
+            // And ask whenever a peer is heard, which the timer alone cannot
+            // do. Bounded by PEER_SYNC_FLOOR_MS so a team powering up together
+            // does not mean one sync per member: a sync is a Link and a
+            // transfer, not a packet.
+            peerHeardJob =
+                scope.launch {
+                    rnsCore.observeAnnounces().collect {
+                        val now = System.currentTimeMillis()
+                        if (now - lastPeerSync < PEER_SYNC_FLOOR_MS) return@collect
+                        if (!settingsRepository.getAutoRetrieveEnabled()) return@collect
+                        lastPeerSync = now
+                        Log.i(TAG, "A peer was heard; asking what is held for us")
+                        runCatching { syncWithPropagationNode() }
+                            .onFailure { Log.w(TAG, "Peer-triggered sync failed: ${it.message}") }
+                    }
+                }
 
             // One-shot auto-select on startup (if auto mode + no relay configured)
             scope.launch {
@@ -540,6 +582,8 @@ class PropagationNodeManager
          */
         fun stop() {
             Log.d(TAG, "Stopping PropagationNodeManager")
+            peerHeardJob?.cancel()
+            peerHeardJob = null
             relayObserverJob?.cancel()
             syncJob?.cancel()
             settingsObserverJob?.cancel()
