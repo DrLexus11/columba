@@ -178,6 +178,7 @@ class CotEndpointManager
         // reader and the mesh listener all touch it.
         private val clients = mutableListOf<Socket>()
         private val clientsLock = Mutex()
+        private val portConflict = CotPortConflict()
 
         fun start() {
             if (supervisor != null) return
@@ -236,14 +237,27 @@ class CotEndpointManager
                     return
                 }
 
+            var lastReported: String? = null
             while (currentCoroutineContext().isActive) {
                 try {
                     serve(keys)
+                    lastReported = null
                 } catch (error: IOException) {
-                    // Almost always the port still held by the previous
-                    // instance across a restart, which clears on its own.
-                    Log.w(TAG, "Endpoint stopped: ${error.message}")
-                    _state.value = State.Failed(error.message ?: "listener failed")
+                    // Not "the previous instance will let go shortly", which is
+                    // what this assumed and is only one of the two cases. The
+                    // other is another server owning the port outright, where
+                    // waiting is not the fix and never becomes it.
+                    val cause = portConflict.diagnose(BIND_HOST, PORT)
+                    val reason = portConflict.explain(cause, BIND_HOST, PORT)
+                    // Logged on change rather than per attempt: this retries
+                    // every five seconds for as long as the conflict lasts, and
+                    // on hardware that was an hour of identical lines burying
+                    // everything else in the buffer.
+                    if (reason != lastReported) {
+                        Log.w(TAG, "Endpoint stopped: ${error.message}. $reason")
+                        lastReported = reason
+                    }
+                    _state.value = State.Failed(reason)
                     delay(RETRY_DELAY_MS)
                 }
             }
