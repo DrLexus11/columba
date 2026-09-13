@@ -149,6 +149,7 @@ class CotEndpointManager
              * already expired.
              */
             private const val CHAT_STALE_MS = 24L * 60 * 60 * 1000
+
         }
 
         /** What the endpoint is doing, for the settings screen. */
@@ -164,6 +165,8 @@ class CotEndpointManager
 
             data class Failed(val reason: String) : State
         }
+
+        private val replay = CotReplay()
 
         private val _state = MutableStateFlow<State>(State.Stopped)
         val state: StateFlow<State> = _state.asStateFlow()
@@ -333,7 +336,9 @@ class CotEndpointManager
                                 val rendered =
                                     session.renderer.render(frame, System.currentTimeMillis())
                                 if (rendered is CotRenderer.Rendered.Cot) {
-                                    writeToClients(rendered.xml.toByteArray(Charsets.UTF_8))
+                                    val bytes = rendered.xml.toByteArray(Charsets.UTF_8)
+                                    replay.hold(bytes, System.currentTimeMillis())
+                                    writeToClients(bytes)
                                 } else {
                                     Log.w(TAG, "LXMF frame did not render: $rendered")
                                 }
@@ -448,6 +453,24 @@ class CotEndpointManager
             val buffer = ByteArray(READ_BUFFER)
             publishState(session, clientsLock.withLock { clients.add(connection); clients.size })
             Log.i(TAG, "ATAK connected")
+            // Before anything new arrives: what it missed while it was away.
+            // This is what makes ATAK as reliable as Columba when both are
+            // running -- Columba keeps a message because LXMF persists it, and
+            // until now ATAK kept nothing at all.
+            val missed = replay.pending(System.currentTimeMillis())
+            if (missed.isNotEmpty()) {
+                Log.i(TAG, "Replaying ${missed.size} held event(s) to a new client")
+                withContext(Dispatchers.IO) {
+                    for (payload in missed) {
+                        try {
+                            writeToClient(connection, payload)
+                        } catch (error: IOException) {
+                            Log.w(TAG, "Replay failed", error)
+                            break
+                        }
+                    }
+                }
+            }
             try {
                 val input = connection.getInputStream()
                 while (true) {
@@ -669,10 +692,23 @@ class CotEndpointManager
                                 return@collect
                             }
                     }
-                writeToClients(payload.toByteArray(Charsets.UTF_8))
+                val bytes = payload.toByteArray(Charsets.UTF_8)
+                // Position is latest-wins and is not held; everything else is.
+                if (TakPayload.kindOf(packet.data) != TakPayload.POSITION_V2) {
+                    replay.hold(bytes, System.currentTimeMillis())
+                }
+                writeToClients(bytes)
             }
         }
 
+        /**
+         * Hand a newly attached client what it missed.
+         *
+         * Oldest first, so a conversation arrives in the order it happened.
+         * Every frame carries its own uid and message id, so a client that
+         * already has one recognises it again -- replay is safe to repeat and
+         * cheap to ignore.
+         */
         private suspend fun writeToClients(payload: ByteArray) {
             // Set on whichever IO thread does the writing, for the same reason.
             TrafficStats.setThreadStatsTag(SOCKET_TAG)
