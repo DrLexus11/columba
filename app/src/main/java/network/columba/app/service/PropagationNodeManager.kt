@@ -238,7 +238,19 @@ class PropagationNodeManager
         // Timeout for sync operation (5 minutes for large transfers)
         private val syncTimeoutMs = 5 * 60 * 1000L
 
+        /** Room for the watchdog to fire before the loop stops waiting on it. */
+        private val settleGraceMs = 10_000L
+
         private var syncJob: Job? = null
+
+        /**
+         * Whether the last attempt failed, so the periodic loop can come back
+         * sooner than the interval. Failures correlate exactly with the
+         * outages that make a sync worth doing, so forfeiting the interval for
+         * one leaves the node silent through the period right after a
+         * partition. See [SyncBackoff].
+         */
+        private val lastAttemptFailed = java.util.concurrent.atomic.AtomicBoolean(false)
         private var settingsObserverJob: Job? = null
         private var propagationStateObserverJob: Job? = null
 
@@ -460,6 +472,7 @@ class PropagationNodeManager
          */
         private suspend fun handleSyncComplete(messagesReceived: Int) {
             if (!syncFinalized.compareAndSet(false, true)) return
+            lastAttemptFailed.set(false)
             if (_isSyncing.value) {
                 Log.d(TAG, "Sync complete: $messagesReceived messages received (manual=$_isManualSync)")
                 _isSyncing.value = false
@@ -509,6 +522,7 @@ class PropagationNodeManager
                         else -> "Unknown error (${state.state})"
                     }
                 Log.w(TAG, "Sync error: $errorMsg (manual=$_isManualSync)")
+                lastAttemptFailed.set(true)
                 syncFinalized.set(true)
                 _isSyncing.value = false
                 _syncProgress.value = SyncProgress.Idle
@@ -741,23 +755,57 @@ class PropagationNodeManager
                     // Initial delay to let things settle
                     kotlinx.coroutines.delay(5_000)
 
+                    var consecutiveFailures = 0
                     while (true) {
                         // Check if auto-retrieve is enabled
                         val autoRetrieveEnabled = settingsRepository.getAutoRetrieveEnabled()
                         if (autoRetrieveEnabled) {
+                            lastAttemptFailed.set(false)
                             try {
                                 syncWithPropagationNode()
+                                awaitSyncSettled()
                             } catch (e: Exception) {
                                 Log.e(TAG, "Error during propagation sync", e)
+                                lastAttemptFailed.set(true)
                             }
+                            consecutiveFailures =
+                                if (lastAttemptFailed.get()) consecutiveFailures + 1 else 0
                         }
 
                         // Get configurable interval from settings
                         val intervalSeconds = settingsRepository.getRetrievalIntervalSeconds()
                         val intervalMs = intervalSeconds * 1000L
-                        kotlinx.coroutines.delay(intervalMs)
+                        val waitMs = SyncBackoff.delayMs(consecutiveFailures, intervalMs)
+                        if (consecutiveFailures > 0) {
+                            Log.i(
+                                TAG,
+                                "Sync attempt $consecutiveFailures failed; retrying in " +
+                                    "${waitMs / 1000}s rather than waiting ${intervalMs / 1000}s",
+                            )
+                        }
+                        kotlinx.coroutines.delay(waitMs)
                     }
                 }
+        }
+
+        /**
+         * Wait for the attempt just started to resolve, so the loop knows
+         * whether it failed.
+         *
+         * [syncWithPropagationNode] returns as soon as the request is away;
+         * the outcome arrives later through [observePropagationStateChanges].
+         * Without waiting, the loop cannot tell a sync that worked from one
+         * that never reached the relay -- and the difference decides whether
+         * to come back in a minute or an hour.
+         *
+         * Bounded, because a sync that never resolves at all must not stop the
+         * loop: the watchdog clears _isSyncing on its own timeout, and this
+         * gives it room to.
+         */
+        private suspend fun awaitSyncSettled() {
+            withTimeoutOrNull(syncTimeoutMs + settleGraceMs) {
+                isSyncing.first { !it }
+            }
         }
 
         /**
