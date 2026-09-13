@@ -362,7 +362,7 @@ class CotEndpointManager
                                 if (rendered is CotRenderer.Rendered.Cot) {
                                     val bytes = rendered.xml.toByteArray(Charsets.UTF_8)
                                     replay.hold(bytes, System.currentTimeMillis())
-                                    writeToClients(bytes)
+                                    writeToClients(bytes, held = true)
                                 } else {
                                     Log.w(TAG, "LXMF frame did not render: $rendered")
                                 }
@@ -718,10 +718,11 @@ class CotEndpointManager
                     }
                 val bytes = payload.toByteArray(Charsets.UTF_8)
                 // Position is latest-wins and is not held; everything else is.
-                if (TakPayload.kindOf(packet.data) != TakPayload.POSITION_V2) {
+                val keep = TakPayload.kindOf(packet.data) != TakPayload.POSITION_V2
+                if (keep) {
                     replay.hold(bytes, System.currentTimeMillis())
                 }
-                writeToClients(bytes)
+                writeToClients(bytes, held = keep)
             }
         }
 
@@ -733,7 +734,7 @@ class CotEndpointManager
          * already has one recognises it again -- replay is safe to repeat and
          * cheap to ignore.
          */
-        private suspend fun writeToClients(payload: ByteArray) {
+        private suspend fun writeToClients(payload: ByteArray, held: Boolean = false) {
             // Set on whichever IO thread does the writing, for the same reason.
             TrafficStats.setThreadStatsTag(SOCKET_TAG)
             // Snapshot under the lock, write outside it. A client whose
@@ -742,7 +743,17 @@ class CotEndpointManager
             // loop and every other client behind the slowest one.
             val targets = clientsLock.withLock { clients.toList() }
             if (targets.isEmpty()) {
-                Log.w(TAG, "ATAK delivery lost: ${payload.size} bytes, no connected clients")
+                // "Lost" and "held" are not the same outcome and must not read
+                // the same. This logged "lost" for a chat line it had just put
+                // in the replay buffer -- on hardware 2026-09-13, in the one
+                // situation where knowing which it was is the whole question.
+                // The firmware bridge already made this distinction; this side
+                // had the buffer and kept the old wording.
+                if (held) {
+                    Log.i(TAG, "no ATAK attached; ${payload.size} bytes held for replay")
+                } else {
+                    Log.w(TAG, "ATAK delivery lost: ${payload.size} bytes, no connected clients")
+                }
             }
             val dead = mutableListOf<Socket>()
             withContext(Dispatchers.IO) {
