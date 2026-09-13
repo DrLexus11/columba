@@ -136,15 +136,6 @@ class PropagationNodeManager
         companion object {
             private const val TAG = "PropagationNodeManager"
 
-            /**
-             * The least time between two peer-triggered syncs.
-             *
-             * Ten nodes powering up together would otherwise mean ten syncs,
-             * and a sync is a Link and a transfer rather than one packet. Same
-             * floor the bridge uses for the same trigger, so the two halves
-             * behave alike.
-             */
-            const val PEER_SYNC_FLOOR_MS = 60_000L
         }
 
         /**
@@ -278,8 +269,8 @@ class PropagationNodeManager
          */
         private var peerHeardJob: Job? = null
 
-        /** When a peer-triggered sync last ran. */
-        private var lastPeerSync = 0L
+        /** When to ask after hearing a peer, and when to stop asking. */
+        private val peerSync = PeerSyncTrigger()
 
         /**
          * Initialize the manager - start observing database for relay changes.
@@ -348,13 +339,28 @@ class PropagationNodeManager
             peerHeardJob =
                 scope.launch {
                     rnsCore.observeAnnounces().collect {
-                        val now = System.currentTimeMillis()
-                        if (now - lastPeerSync < PEER_SYNC_FLOOR_MS) return@collect
+                        if (!peerSync.shouldAsk(System.currentTimeMillis())) return@collect
                         if (!settingsRepository.getAutoRetrieveEnabled()) return@collect
-                        lastPeerSync = now
+                        lastAttemptFailed.set(false)
                         Log.i(TAG, "A peer was heard; asking what is held for us")
-                        runCatching { syncWithPropagationNode() }
-                            .onFailure { Log.w(TAG, "Peer-triggered sync failed: ${it.message}") }
+                        runCatching {
+                            syncWithPropagationNode()
+                            awaitSyncSettled()
+                        }.onFailure {
+                            Log.w(TAG, "Peer-triggered sync failed: ${it.message}")
+                            lastAttemptFailed.set(true)
+                        }
+                        if (!lastAttemptFailed.get()) {
+                            peerSync.succeeded()
+                        } else if (peerSync.failed()) {
+                            Log.i(
+                                TAG,
+                                "Peer-triggered sync has failed " +
+                                    "${peerSync.consecutiveFailures()} times; holding off for " +
+                                    "${peerSync.waitMs() / 60_000} minutes rather than retrying " +
+                                    "into a path that is refusing",
+                            )
+                        }
                     }
                 }
 
