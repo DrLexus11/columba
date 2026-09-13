@@ -10,8 +10,9 @@ import org.junit.Test
  * errno and want opposite responses.
  *
  * Seen on hardware 2026-09-13: the settings screen said "bind failed:
- * EADDRINUSE" for an hour while ATAK held port 8087, and waiting was never
- * going to fix it.
+ * EADDRINUSE" for an hour while ATAK held the endpoint's port, and waiting was
+ * never going to fix it. The port has since moved off ATAK's default; the two
+ * causes still need telling apart.
  */
 class CotPortConflictTest {
     private fun conflict(accepts: Boolean) =
@@ -21,7 +22,7 @@ class CotPortConflictTest {
     fun `something answering on the port is another server`() = runTest {
         assertEquals(
             CotPortConflict.Cause.ANOTHER_SERVER,
-            conflict(accepts = true).diagnose("127.0.0.1", 8087),
+            conflict(accepts = true).diagnose("127.0.0.1", CotEndpointManager.PORT),
         )
     }
 
@@ -29,7 +30,7 @@ class CotPortConflictTest {
     fun `nothing answering is a socket on its way out`() = runTest {
         assertEquals(
             CotPortConflict.Cause.NOT_RELEASED_YET,
-            conflict(accepts = false).diagnose("127.0.0.1", 8087),
+            conflict(accepts = false).diagnose("127.0.0.1", CotEndpointManager.PORT),
         )
     }
 
@@ -41,11 +42,12 @@ class CotPortConflictTest {
         val text = CotPortConflict().explain(
             CotPortConflict.Cause.ANOTHER_SERVER,
             "127.0.0.1",
-            8087,
+            CotEndpointManager.PORT,
         )
         assertTrue(text, text.contains("ATAK"))
-        assertTrue(text, text.contains("input"))
-        assertTrue(text, text.contains("127.0.0.1:8087"))
+        assertTrue(text, text.contains("outgoing"))
+        assertTrue(text, text.contains("not clear it"))
+        assertTrue(text, text.contains("127.0.0.1:${CotEndpointManager.PORT}"))
     }
 
     @Test
@@ -56,7 +58,7 @@ class CotPortConflictTest {
         val text = CotPortConflict().explain(
             CotPortConflict.Cause.NOT_RELEASED_YET,
             "127.0.0.1",
-            8087,
+            CotEndpointManager.PORT,
         )
         assertTrue(text, !text.contains("ATAK"))
         assertTrue(text, text.contains("Retrying"))

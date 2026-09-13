@@ -79,8 +79,18 @@ class CotEndpointManager
              * The port ATAK is pointed at. Fixed, because it is one more thing
              * that can be wrong in a field configuration and nothing is gained
              * by moving it.
+             *
+             * **Not 8087**, which is ATAK's own default CoT input. An endpoint
+             * there competes with ATAK for a port ATAK already owns, and
+             * whichever binds first wins: found on hardware 2026-09-13 with
+             * ATAK holding `0.0.0.0:8087` and a connection open from itself to
+             * itself, while this endpoint retried every five seconds for an
+             * hour and a message that had survived a partition never reached
+             * the map. The retry loop reads as connection flapping from ATAK's
+             * side. 18087 is clear of every ATAK default -- 8087, 8089 for
+             * TLS, 6969 for multicast SA, 4242 and 8080.
              */
-            const val PORT = 8087
+            const val PORT = 18087
 
             /**
              * Loopback only, and deliberately not configurable.
@@ -320,7 +330,7 @@ class CotEndpointManager
                     // accept() blocks in a way cancellation cannot reach, so
                     // closing the socket is the only thing that unblocks it.
                     // Without this, changing team would leave the old listener
-                    // holding port 8087 until someone happened to connect --
+                    // holding the endpoint port until someone happened to connect --
                     // and the new one would fail to bind for as long as that
                     // lasted, which is forever if nobody does.
                     currentCoroutineContext().job.invokeOnCompletion {
