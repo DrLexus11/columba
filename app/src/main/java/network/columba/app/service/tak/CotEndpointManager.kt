@@ -307,6 +307,7 @@ class CotEndpointManager
             val registry = TakMembership.Registry(keys.team, keys.secret, ownHash = node.hash)
             val session = Session(
                 node = node,
+                keys = keys,
                 lxmf = TakLxmf.Carrier(rnsCore, rnsLxmf, nodeIdentity),
                 team = keys.team,
                 pipeline = CotOutbound(TakIdentity.uidFor(node.hash)),
@@ -319,7 +320,6 @@ class CotEndpointManager
                         positionStaleMs = POSITION_STALE_MS,
                         chatStaleMs = CHAT_STALE_MS,
                     ),
-                payload = TakMembership.memberPayload(keys.team, keys.secret, keys.callsign),
             )
 
             withContext(Dispatchers.IO) {
@@ -403,7 +403,15 @@ class CotEndpointManager
          * what TakGroups goes to trouble to hide.
          */
         private suspend fun announce(session: Session) {
-            rnsCore.announceDestination(session.node, session.payload)
+            // Built here rather than once per session. The callsign in it is
+            // read from ATAK, so it is not known when the session starts and
+            // can change while it runs.
+            val payload = TakMembership.memberPayload(
+                session.keys.team,
+                session.keys.secret,
+                session.pipeline.atakCallsign ?: Keys.FALLBACK_CALLSIGN,
+            )
+            rnsCore.announceDestination(session.node, payload)
                 .onFailure { Log.w(TAG, "Announce failed: ${it.message}") }
         }
 
@@ -543,9 +551,20 @@ class CotEndpointManager
             // scrubbing the marker codec added. The typed handlers do not need
             // the learned UID; only the tier-2 rewrite does.
             val known = session.pipeline.atakUid
+            val knownCallsign = session.pipeline.atakCallsign
             session.pipeline.observe(cotXml)
             if (known == null) {
                 session.pipeline.atakUid?.let { Log.i(TAG, "This ATAK calls itself $it") }
+            }
+            val callsign = session.pipeline.atakCallsign
+            if (callsign != null && callsign != knownCallsign) {
+                // Announced now rather than at the next interval. Until this
+                // goes out the team is drawing this node under the fallback
+                // name and addressing chat to it, and the interval is thirty
+                // minutes -- long enough for an operator to conclude the
+                // callsign does not work and stop trying.
+                Log.i(TAG, "This ATAK's operator is $callsign; re-announcing")
+                announce(session)
             }
             // The typed codecs in order, each answering "was this mine?".
             // A new codec is a term in this expression rather than another
@@ -807,7 +826,8 @@ class CotEndpointManager
             val pipeline: CotOutbound,
             val registry: TakMembership.Registry,
             val renderer: CotRenderer,
-            val payload: ByteArray,
+            /** Kept so the announce can be rebuilt around a new callsign. */
+            val keys: Keys,
             val gate: CotPosition.PositionGate = CotPosition.PositionGate(),
             /** Shorter than position's: a pointer moves continuously. */
             val spiGate: CotPosition.PositionGate =
@@ -822,14 +842,26 @@ class CotEndpointManager
          * waste and one more place for the secret to be held.
          */
         private class Keys(val team: String, val secret: ByteArray) {
-            /**
-             * How this node identifies itself to the team.
-             *
-             * Derived rather than configured for now: a callsign setting is UI
-             * that PR B does not have yet, and a node announcing nothing at all
-             * would be worse than one announcing a name nobody chose.
-             */
-            val callsign: String = "COLUMBA"
+            companion object {
+                /**
+                 * What this node calls itself until ATAK says otherwise.
+                 *
+                 * It is a placeholder, and it used to be the answer. Every
+                 * handset on the mesh announced "COLUMBA" -- a constant in
+                 * this file, not a name -- so the command post's map showed the
+                 * same word for whoever was carrying it, and chat was addressed
+                 * to a label nobody had chosen. Observed on hardware
+                 * 2026-09-13.
+                 *
+                 * The real callsign is read from ATAK's own self-report, which
+                 * already carries it; see CotEvent.learnAtakCallsign. Nothing
+                 * is configured here for the reason the UID is not: the
+                 * operator has already typed it once, and a second place to
+                 * type it is a second place for it to be wrong. This is only
+                 * what goes out before ATAK has connected at all.
+                 */
+                const val FALLBACK_CALLSIGN = "COLUMBA"
+            }
         }
     }
 

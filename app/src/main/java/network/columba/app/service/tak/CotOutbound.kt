@@ -29,6 +29,17 @@ class CotOutbound(val ourUid: String) {
         private set
 
     /**
+     * The callsign this ATAK's operator has set, once one has been seen.
+     *
+     * Volatile for the same reason as [atakUid], and *not* latched the way it
+     * is: an operator can change their callsign mid-session, and the mesh
+     * should follow rather than keep announcing the name they abandoned.
+     */
+    @Volatile
+    var atakCallsign: String? = null
+        private set
+
+    /**
      * Counted rather than logged per event; a refusing peer is loud.
      *
      * Atomic for the same reason: incremented from several client coroutines,
@@ -68,6 +79,10 @@ class CotOutbound(val ourUid: String) {
      * a parse and changes nothing.
      */
     fun observe(cotXml: String) {
+        // The callsign is read every time, not once. An operator who changes
+        // it mid-session should be renamed on every peer's map, rather than
+        // leaving the team addressing a name they have abandoned.
+        CotEvent.learnAtakCallsign(cotXml)?.let { atakCallsign = it }
         if (atakUid != null) return
         // Learned, never configured: ATAK announces its own identifier in
         // every position report, and a setting an operator must type is a

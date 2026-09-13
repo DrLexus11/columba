@@ -104,6 +104,32 @@ object CotEvent {
         return event.getAttribute("uid").takeIf { it.isNotEmpty() && isSelfReport }
     }
 
+    /**
+     * The callsign this ATAK's operator has set, from the same self-report.
+     *
+     * A node announcing a name nobody chose is worse than it looks: peers draw
+     * that name on the map and address chat by it, so the whole team sees a
+     * label the operator never picked and cannot correct. Observed on hardware
+     * 2026-09-13, where every handset on the mesh announced itself as
+     * "COLUMBA" -- a constant in this source, not a name -- and the command
+     * post's map showed the same word for whoever was carrying it.
+     *
+     * Read rather than configured, for the reason [learnAtakUid] gives: the
+     * operator has already set this in ATAK, and a second place to type it is
+     * a second place for it to be wrong. The `<takv>` gate is the same one --
+     * a marker's `<contact>` must never be mistaken for the device that made
+     * it.
+     */
+    fun learnAtakCallsign(cotXml: String): String? {
+        val detail = parseOrNull(cotXml)?.let { childElement(it, "detail") } ?: return null
+        // The same `<takv>` gate learnAtakUid uses: a marker's `<contact>`
+        // must never be mistaken for the device that made it.
+        if (childElement(detail, "takv") == null) return null
+        return childElement(detail, "contact")
+            ?.getAttribute("callsign")
+            ?.takeIf { it.isNotEmpty() }
+    }
+
     /** [parse], but null for input that is not a CoT event at all. */
     private fun parseOrNull(cotXml: String): Element? =
         try {
