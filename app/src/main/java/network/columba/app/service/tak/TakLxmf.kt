@@ -151,11 +151,10 @@ object TakLxmf {
                 // conversation as well as their ATAK.
                 content = text,
                 sourceIdentity = identity,
-                // Link-based, so it is proof-backed and retried, and held by a
-                // propagation node when the peer is unreachable. A chat line
-                // is an operator action and rare; the link is affordable here
-                // in a way it would never be for a position beacon.
-                deliveryMethod = DeliveryMethod.DIRECT,
+                // Encrypted LXMF packets retain proofs, retries and the
+                // propagation fallback without a handshake for each cold
+                // conversation. LXMF promotes oversized payloads to DIRECT.
+                deliveryMethod = DeliveryMethod.OPPORTUNISTIC,
                 tryPropagationOnFail = true,
                 extraFields = extraFields(frame),
             ).isSuccess

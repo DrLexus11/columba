@@ -1,5 +1,15 @@
 package network.columba.app.service.tak
 
+import io.mockk.coEvery
+import io.mockk.coVerify
+import io.mockk.every
+import io.mockk.mockk
+import kotlinx.coroutines.test.runTest
+import network.columba.app.rns.api.RnsCore
+import network.columba.app.rns.api.RnsLxmf
+import network.columba.app.rns.api.model.DeliveryMethod
+import network.columba.app.rns.api.model.Destination
+import network.columba.app.rns.api.model.Identity
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
@@ -8,6 +18,43 @@ import org.junit.Test
 
 /** The LXMF carrier: what a direct message rides, and what it must not claim. */
 class TakLxmfTest {
+    @Test
+    fun `chat uses acknowledged packets with propagation fallback`() = runTest {
+        val core = mockk<RnsCore>()
+        val router = mockk<RnsLxmf>()
+        val identity = mockk<Identity>()
+        val destination = mockk<Destination>()
+        val memberHash = ByteArray(16) { 1 }
+        val inboxHash = ByteArray(16) { 2 }
+        val chat = byteArrayOf(3, 1, 2)
+        every { destination.hash } returns inboxHash
+        coEvery { core.recallIdentity(memberHash) } returns identity
+        coEvery { core.createDestination(identity, any(), any(), "lxmf", listOf("delivery")) } returns
+            Result.success(destination)
+        coEvery {
+            router.sendLxmfMessageWithMethod(
+                destinationHash = inboxHash,
+                content = "probe",
+                sourceIdentity = identity,
+                deliveryMethod = DeliveryMethod.OPPORTUNISTIC,
+                tryPropagationOnFail = true,
+                extraFields = TakLxmf.extraFields(chat),
+            )
+        } returns Result.success(mockk())
+
+        assertTrue(TakLxmf.Carrier(core, router, identity).send(memberHash, chat, "probe"))
+        coVerify(exactly = 1) {
+            router.sendLxmfMessageWithMethod(
+                destinationHash = inboxHash,
+                content = "probe",
+                sourceIdentity = identity,
+                deliveryMethod = DeliveryMethod.OPPORTUNISTIC,
+                tryPropagationOnFail = true,
+                extraFields = TakLxmf.extraFields(chat),
+            )
+        }
+    }
+
     private val vectors: org.json.JSONObject =
         org.json.JSONObject(
             checkNotNull(javaClass.classLoader.getResourceAsStream("tak_native_v1.json"))
