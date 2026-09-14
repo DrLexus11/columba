@@ -30,6 +30,7 @@ import java.util.TimeZone
 import network.columba.app.rns.api.RnsCore
 import network.columba.app.rns.api.RnsLxmf
 import network.columba.app.rns.api.model.DeliveryMethod
+import network.columba.app.rns.api.model.DeliveryStatus
 import network.columba.app.rns.api.model.Destination
 import network.columba.app.rns.api.model.DestinationType
 import network.columba.app.rns.api.model.Direction
@@ -189,6 +190,7 @@ class CotEndpointManager
         private val clients = mutableListOf<Socket>()
         private val clientsLock = Mutex()
         private val portConflict = CotPortConflict()
+        private val ticks = DeliveryTicks(rnsLxmf)
 
         fun start() {
             if (supervisor != null) return
@@ -285,12 +287,14 @@ class CotEndpointManager
         private fun <T> Result<T>.orFail(step: String): T =
             getOrElse { throw IOException("$step: ${it.message}", it) }
 
-        private suspend fun serve(keys: Keys) {
-            // No group destination. Pivot 5: a group packet reaches only peers
-            // on the same interface as the sender, so a team is a membership
-            // set and traffic for it is addressed to each member.
-            //
-            // The UID names *this node*, never the team.
+        /**
+         * One session per run.
+         *
+         * The learned ATAK UID, the member list, the position cadence and the
+         * proofs waiting for a tick all belong to this endpoint's lifetime
+         * rather than to the process, so changing team starts a fresh one.
+         */
+        private suspend fun newSession(keys: Keys): Session {
             val nodeIdentity = rnsLxmf.getLxmfIdentity().orFail("no node identity yet")
             val node =
                 rnsCore.createDestination(
@@ -300,12 +304,8 @@ class CotEndpointManager
                     TakIdentity.NODE_APP,
                     TakIdentity.NODE_ASPECTS,
                 ).orFail("could not claim a node address")
-
-            // One session per run: the learned ATAK UID, the member list and
-            // the position cadence all belong to this endpoint's lifetime
-            // rather than to the process.
             val registry = TakMembership.Registry(keys.team, keys.secret, ownHash = node.hash)
-            val session = Session(
+            return Session(
                 node = node,
                 keys = keys,
                 lxmf = TakLxmf.Carrier(rnsCore, rnsLxmf, nodeIdentity),
@@ -321,6 +321,15 @@ class CotEndpointManager
                         chatStaleMs = CHAT_STALE_MS,
                     ),
             )
+        }
+
+        private suspend fun serve(keys: Keys) {
+            // No group destination. Pivot 5: a group packet reaches only peers
+            // on the same interface as the sender, so a team is a membership
+            // set and traffic for it is addressed to each member.
+            //
+            // The UID names *this node*, never the team.
+            val session = newSession(keys)
 
             withContext(Dispatchers.IO) {
                 // Applies to every socket this thread opens from here on,
@@ -353,6 +362,12 @@ class CotEndpointManager
                     // the same chat line whichever carrier brought it, and a
                     // second rendering here would be a second place for the
                     // two to drift.
+                    // Everything tier-2 takes the same road out: held for a
+                    // client that is not attached, then written to those that are.
+                    val deliver: suspend (ByteArray) -> Unit = { bytes ->
+                        replay.hold(bytes, System.currentTimeMillis())
+                        writeToClients(bytes, held = true)
+                    }
                     val fromLxmf =
                         launch {
                             session.lxmf.frames().collect { frame ->
@@ -360,16 +375,29 @@ class CotEndpointManager
                                 val rendered =
                                     session.renderer.render(frame, System.currentTimeMillis())
                                 if (rendered is CotRenderer.Rendered.Cot) {
-                                    val bytes = rendered.xml.toByteArray(Charsets.UTF_8)
-                                    replay.hold(bytes, System.currentTimeMillis())
-                                    writeToClients(bytes, held = true)
+                                    deliver(rendered.xml.toByteArray(Charsets.UTF_8))
                                 } else {
                                     Log.w(TAG, "LXMF frame did not render: $rendered")
                                 }
                             }
                         }
+                    // The sender's tick, from LXMF's proof. See DeliveryTicks.
+                    val fromProofs =
+                        launch {
+                            ticks.collect(
+                                session.proofs, session.renderer,
+                                session.pipeline.ourUid, deliver,
+                            )
+                        }
                     val fromAnnounces = launch { learnMembers(session) }
-                    val beacon = launch { announceForever(session) }
+                    val beacon =
+                        launch {
+                            announce(session)
+                            while (isActive) {
+                                delay(ANNOUNCE_INTERVAL_MS)
+                                announce(session)
+                            }
+                        }
                     try {
                         while (isActive) {
                             val connection = listener.accept()
@@ -378,6 +406,7 @@ class CotEndpointManager
                         }
                     } finally {
                         beacon.cancel()
+                        fromProofs.cancel()
                         fromAnnounces.cancel()
                         fromMesh.cancel()
                         fromLxmf.cancel()
@@ -415,21 +444,6 @@ class CotEndpointManager
                 .onFailure { Log.w(TAG, "Announce failed: ${it.message}") }
         }
 
-        private suspend fun announceForever(session: Session) {
-            announce(session)
-            while (currentCoroutineContext().isActive) {
-                delay(ANNOUNCE_INTERVAL_MS)
-                announce(session)
-            }
-        }
-
-        /**
-         * Learn team members from the announces this node already hears.
-         *
-         * Most of what arrives here is not ours -- another team, or software
-         * that is not this project. The registry decides, and a payload it does
-         * not recognise is ordinary.
-         */
         private suspend fun learnMembers(session: Session) {
             rnsCore.observeAnnounces().collect { announceEvent ->
                 // Every aspect Columba tracks arrives here, not just ours.
@@ -615,32 +629,60 @@ class CotEndpointManager
             // destinationFor() reverses it. That is pivot 1 paying for itself.
             val message = CotChat.decode(frame)
             val recipient = message?.recipient.orEmpty()
-            if (recipient.isEmpty()) {
+            val kind = message?.kind
+            when {
                 // A receipt for a room line goes nowhere. Every member
                 // answering a broadcast with a delivery and a read receipt is
                 // two thirds of what group chat costs on the air -- 7.2 s of
                 // the 11.1 s a ten-person room spends -- for one bit of
                 // meaning each, and none of it is something an operator can
-                // act on. A direct receipt still goes, because there one peer
-                // is waiting on exactly that answer.
-                val roomReceipt = message != null && message.kind != CotChat.KIND_MESSAGE
-                if (!roomReceipt) fanOut(frame, session)
-                return true
-            }
-            // Addressed to one person, so it reaches that person or nobody.
-            // The fan-out is not a fallback here -- broadcasting a line meant
-            // for one person is the bug this whole path exists to stop, and it
-            // would not deliver it either. Anything reachable another way is
-            // still reached that way.
-            val destination =
-                session.registry.memberDestination(recipient, System.currentTimeMillis())
-            if (destination == null) {
-                Log.i(TAG, "Chat for a uid that is not a member of this team, not sent")
-            } else if (!session.lxmf.send(destination, frame, message?.text.orEmpty())) {
-                // The bare packet is the fallback for a peer whose identity we
-                // cannot recall, not the normal route. It delivers the line
-                // and promises nothing about it.
-                sendTo(destination, frame)
+                // act on.
+                recipient.isEmpty() && kind != null && kind != CotChat.KIND_MESSAGE -> Unit
+
+                recipient.isEmpty() -> fanOut(frame, session)
+
+                // A delivered-receipt is a transport fact and LXMF has already
+                // established it: the sender holds a proof that this node
+                // received the message. Sending the same fact back as a second
+                // LXMF message, with its own retry budget, pays twice for one
+                // answer -- and on a lossy path the receipt is the half that is
+                // lost, so an operator sees no tick on a line that did arrive.
+                // The sender draws its own tick from the proof instead.
+                //
+                // A read-receipt still goes: only this ATAK knows a human
+                // opened it, and no transport can prove that.
+                kind == CotChat.KIND_DELIVERED -> Unit
+
+                else -> {
+                    // Addressed to one person, so it reaches that person or
+                    // nobody. The fan-out is not a fallback here --
+                    // broadcasting a line meant for one person is the bug this
+                    // whole path exists to stop, and it would not deliver it
+                    // either.
+                    val destination =
+                        session.registry.memberDestination(
+                            recipient, System.currentTimeMillis())
+                    val hash =
+                        destination?.let {
+                            session.lxmf.send(it, frame, message?.text.orEmpty())
+                        }
+                    when {
+                        destination == null ->
+                            Log.i(TAG, "Chat for a uid that is not a member of this team, not sent")
+                        // The bare packet is the fallback for a peer whose
+                        // identity we cannot recall, not the normal route. It
+                        // delivers the line and promises nothing about it.
+                        hash == null -> sendTo(destination, frame)
+                        // Only a message earns a tick. Acknowledging a receipt
+                        // would have two nodes answering each other for ever.
+                        kind == CotChat.KIND_MESSAGE && message != null ->
+                            session.proofs.awaiting(
+                                hash,
+                                ChatProofs.Pending(
+                                    destination, message.messageId, message.room),
+                            )
+                    }
+                }
             }
             return true
         }
@@ -832,7 +874,16 @@ class CotEndpointManager
             /** Shorter than position's: a pointer moves continuously. */
             val spiGate: CotPosition.PositionGate =
                 CotPosition.PositionGate(intervalMs = 5_000),
-        )
+        ) {
+            /**
+             * Sent messages whose delivery proof will draw their tick.
+             *
+             * A property rather than a constructor parameter: nothing
+             * constructs a Session with one, and the parameter list is at its
+             * limit.
+             */
+            val proofs = ChatProofs()
+        }
 
         /**
          * What the team name and the fleet secret derive.

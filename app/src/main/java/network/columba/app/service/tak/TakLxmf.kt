@@ -129,8 +129,14 @@ object TakLxmf {
          * blocked on a radio, and a peer who is out of range gets the line
          * when they return rather than never.
          */
-        suspend fun send(memberHash: ByteArray, frame: ByteArray, text: String): Boolean {
-            val peerIdentity = rnsCore.recallIdentity(memberHash) ?: return false
+        /**
+         * @return the hash the backend gave this message, or null if LXMF
+         *   would not take it. The hash is what a later delivery proof refers
+         *   to, which is how a sender draws its own tick instead of waiting
+         *   for the far ATAK to send one back across the mesh.
+         */
+        suspend fun send(memberHash: ByteArray, frame: ByteArray, text: String): String? {
+            val peerIdentity = rnsCore.recallIdentity(memberHash) ?: return null
             // The peer's inbox, derived from the identity we already hold.
             // Nothing extra is announced for this: the TAK node destination
             // and the LXMF inbox are built from the same identity, so knowing
@@ -143,7 +149,7 @@ object TakLxmf {
                     DestinationType.SINGLE,
                     LXMF_APP_NAME,
                     LXMF_DELIVERY_ASPECTS,
-                ).getOrNull() ?: return false
+                ).getOrNull() ?: return null
             return rnsLxmf.sendLxmfMessageWithMethod(
                 destinationHash = inbox.hash,
                 // Content is for the human; the field is the protocol. The
@@ -157,8 +163,11 @@ object TakLxmf {
                 deliveryMethod = DeliveryMethod.OPPORTUNISTIC,
                 tryPropagationOnFail = true,
                 extraFields = extraFields(frame),
-            ).isSuccess
+            ).getOrNull()?.messageHash?.toHexString()
         }
+
+        private fun ByteArray.toHexString(): String =
+            joinToString("") { "%02x".format(it) }
 
         /**
          * TAK chat frames arriving over LXMF.

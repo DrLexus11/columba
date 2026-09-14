@@ -8,6 +8,7 @@ import kotlinx.coroutines.test.runTest
 import network.columba.app.rns.api.RnsCore
 import network.columba.app.rns.api.RnsLxmf
 import network.columba.app.rns.api.model.DeliveryMethod
+import network.columba.app.rns.api.model.MessageReceipt
 import network.columba.app.rns.api.model.Destination
 import network.columba.app.rns.api.model.Identity
 import org.junit.Assert.assertArrayEquals
@@ -40,9 +41,21 @@ class TakLxmfTest {
                 tryPropagationOnFail = true,
                 extraFields = TakLxmf.extraFields(chat),
             )
-        } returns Result.success(mockk())
+        } returns Result.success(
+            MessageReceipt(
+                messageHash = byteArrayOf(0xab.toByte(), 0xcd.toByte()),
+                timestamp = 0,
+                destinationHash = inboxHash,
+            ),
+        )
 
-        assertTrue(TakLxmf.Carrier(core, router, identity).send(memberHash, chat, "probe"))
+        // The hash, not a boolean: it is what a later delivery proof refers
+        // to, and how a sender draws its own tick instead of waiting for the
+        // far ATAK to send a receipt back across the mesh.
+        assertEquals(
+            "abcd",
+            TakLxmf.Carrier(core, router, identity).send(memberHash, chat, "probe"),
+        )
         coVerify(exactly = 1) {
             router.sendLxmfMessageWithMethod(
                 destinationHash = inboxHash,

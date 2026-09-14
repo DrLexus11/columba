@@ -135,6 +135,37 @@ class CotRenderer(
         )
     }
 
+    /**
+     * The delivery receipt a peer would have sent, rendered from LXMF's proof.
+     *
+     * The tick used to come from the far ATAK, as a receipt that crossed the
+     * mesh as a second LXMF message with its own retry budget. LXMF has
+     * already proved the peer's node holds the message, so that pays twice for
+     * one answer -- and on a lossy path the receipt is the half that is lost,
+     * leaving no tick on a line that did arrive.
+     *
+     * Built as though the peer had sent it, because that is exactly the event
+     * this replaces: attributing it to ourselves would file the tick in a
+     * conversation with ourselves, which is the bug that broke replies in
+     * September.
+     */
+    fun deliveryReceipt(peer: ByteArray, messageId: String, room: String,
+                        ourUid: String, now: Long): String =
+        CotChat.buildChatCot(
+            CotChat.Message(
+                kind = CotChat.KIND_DELIVERED,
+                senderId = TakMembership.senderIdFor(peer),
+                messageId = messageId,
+                room = room,
+                text = "",
+                recipient = ourUid,
+            ),
+            TakIdentity.uidFor(peer),
+            callsignOf(peer),
+            cotTime(now),
+            cotTime(now + chatStaleMs),
+        )
+
     /** As claimed in the member's announce. For display, never for trust. */
     private fun callsignOf(sender: ByteArray): String =
         registry.describe(sender)?.callsign ?: UNKNOWN_CALLSIGN
