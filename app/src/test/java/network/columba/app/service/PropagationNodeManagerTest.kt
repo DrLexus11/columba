@@ -23,6 +23,7 @@ import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.async
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.emptyFlow
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.StandardTestDispatcher
@@ -97,6 +98,12 @@ class PropagationNodeManagerTest {
 
         // Mock networkStatus flow
         every { rnsCore.networkStatus } returns networkStatusFlow
+        // Announces drive the peer-triggered sync: hearing a peer is the
+        // cheapest evidence that somebody is there to have sent something, and
+        // the only trigger that fires on reconnection rather than on a timer.
+        // Empty here, so these tests exercise the timer path they were written
+        // for without a peer-triggered sync racing them.
+        every { rnsCore.observeAnnounces() } returns emptyFlow()
 
         // Mock propagationStateFlow for sync completion observation
         every { rnsLxmf.propagationStateFlow } returns propagationStateFlow
