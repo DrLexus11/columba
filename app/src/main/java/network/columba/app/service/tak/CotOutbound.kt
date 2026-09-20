@@ -50,6 +50,10 @@ class CotOutbound(val ourUid: String) {
 
     private val droppedCount = java.util.concurrent.atomic.AtomicLong()
 
+    /** Whether the last refusal was about size, and so worth cutting up. */
+    @Volatile
+    private var lastDropWasSize = false
+
     /**
      * The frame to put on the mesh, or null if this event should not go.
      *
@@ -90,6 +94,31 @@ class CotOutbound(val ourUid: String) {
         CotEvent.learnAtakUid(cotXml)?.let { atakUid = it }
     }
 
+    /**
+     * Every frame this event needs, in order. Empty if it should not go.
+     *
+     * [frame] returns one or nothing, which was the whole world while tier 2
+     * was the only path off this node -- so an event too big for one packet
+     * was not late, it was gone. That is why drawings and a nine-line MEDEVAC
+     * never crossed.
+     *
+     * Only a *size* refusal is cut up. Malformed XML, our own echo and an
+     * undecodable payload all mean "do not send this", and fragmenting one
+     * would put the same refusal on the air in pieces.
+     */
+    fun frames(cotXml: String): List<ByteArray> {
+        frame(cotXml)?.let { return listOf(it) }
+        if (!lastDropWasSize) return emptyList()
+        return try {
+            CotFragment.fragments(
+                CotTier2.encode(CotEvent.rewriteSelfUid(cotXml, atakUid, ourUid), bound = null),
+            )
+        } catch (_: IllegalArgumentException) {
+            droppedCount.incrementAndGet()
+            emptyList()
+        }
+    }
+
     fun frame(cotXml: String): ByteArray? {
         // Validated here rather than relied on downstream. rewriteSelfUid
         // returns early -- without parsing -- until an ATAK UID has been
@@ -112,8 +141,12 @@ class CotOutbound(val ourUid: String) {
         if (CotEvent.isSelfAddressed(cotXml, ourUid)) return null
         observe(cotXml)
         return try {
+            lastDropWasSize = false
             CotTier2.encode(CotEvent.rewriteSelfUid(cotXml, atakUid, ourUid))
-        } catch (_: IllegalArgumentException) {
+        } catch (error: IllegalArgumentException) {
+            // Only a size refusal is worth fragmenting; everything else here
+            // is a decision not to send at all.
+            lastDropWasSize = error.message?.contains("tier 3") == true
             droppedCount.incrementAndGet()
             null
         }

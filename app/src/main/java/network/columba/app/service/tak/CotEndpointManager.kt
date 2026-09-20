@@ -627,8 +627,15 @@ class CotEndpointManager
                     forwardChat(cotXml, session) ||
                     forwardMarker(cotXml, session)
             if (typed) return
-            val frame = session.pipeline.frame(cotXml) ?: return
-            fanOut(frame, session)
+            // Cut up rather than refused. An event over the one-packet bound
+            // used to be dropped outright, which is why drawings and a
+            // nine-line MEDEVAC never crossed. An ordinary event still comes
+            // back as one frame and pays nothing for this.
+            val frames = session.pipeline.frames(cotXml)
+            if (frames.size > 1) {
+                Log.i(TAG, "event too large for one packet; sending ${frames.size} fragments")
+            }
+            frames.forEach { fanOut(it, session) }
         }
 
         /**
@@ -818,8 +825,21 @@ class CotEndpointManager
                 if (!packet.destination.hash.contentEquals(session.node.hash)) return@collect
                 Log.i(TAG, "mesh packet for this node: ${packet.data.size} bytes, " +
                     "kind=${TakPayload.nameOf(packet.data)}")
+                // Keyed on the sender, which comes from the packet and never
+                // from the frame: a peer that could choose its own key could
+                // merge itself into somebody else's transfer.
+                val data =
+                    if (TakPayload.kindOf(packet.data) == TakPayload.FRAGMENT_V1) {
+                        session.reassembler.feed(
+                            packet.destination.hash, packet.data, System.currentTimeMillis(),
+                        )?.also {
+                            Log.i(TAG, "reassembled a ${it.size} byte event from fragments")
+                        } ?: return@collect
+                    } else {
+                        packet.data
+                    }
                 val payload =
-                    when (val rendered = session.renderer.render(packet.data, System.currentTimeMillis())) {
+                    when (val rendered = session.renderer.render(data, System.currentTimeMillis())) {
                         is CotRenderer.Rendered.Cot -> rendered.xml
                         // Ours, and deliberately not drawn. Falling through to
                         // tier 2 here would put a frame we just declined onto
@@ -827,7 +847,7 @@ class CotEndpointManager
                         CotRenderer.Rendered.Handled -> return@collect
                         CotRenderer.Rendered.NotOurs ->
                             try {
-                                CotTier2.decode(packet.data)
+                                CotTier2.decode(data)
                             } catch (_: IllegalArgumentException) {
                                 // A frame we cannot read is ordinary: an older
                                 // node, a newer dictionary, or simply not ours.
@@ -836,7 +856,7 @@ class CotEndpointManager
                     }
                 val bytes = payload.toByteArray(Charsets.UTF_8)
                 // Position is latest-wins and is not held; everything else is.
-                val keep = TakPayload.kindOf(packet.data) != TakPayload.POSITION_V2
+                val keep = TakPayload.kindOf(data) != TakPayload.POSITION_V2
                 if (keep) {
                     session.replay.hold(bytes, System.currentTimeMillis())
                 }
@@ -945,6 +965,9 @@ class CotEndpointManager
              * this run owns rather than something handed to it.
              */
             val proofs = ChatProofs()
+
+            /** Fragments of events too big for one packet, until they are whole. */
+            val reassembler = CotReassembler()
 
             /**
              * Held events belong to this run, not to the process.

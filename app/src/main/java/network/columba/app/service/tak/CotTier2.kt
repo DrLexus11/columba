@@ -77,7 +77,13 @@ object CotTier2 {
      * for compression that made the packet bigger is the kind of thing that
      * never shows up until somebody measures.
      */
-    fun encode(cotXml: String): ByteArray {
+    /**
+     * @param bound the one-packet limit that makes tier 2 tier 2. Refusing
+     *   above it is the default for exactly that reason. Tier 3 passes null:
+     *   it wants the same frame, knowing it is too big, because it is about to
+     *   cut it into pieces that each fit. Nothing else should.
+     */
+    fun encode(cotXml: String, bound: Int? = MAX_FRAME_BYTES): ByteArray {
         val raw = cotXml.toByteArray(Charsets.UTF_8)
         require(raw.isNotEmpty()) { "CoT must not be empty" }
         require(raw.size <= MAX_DECOMPRESSED) { "CoT is too large for tier 2; it belongs in tier 3" }
@@ -107,8 +113,8 @@ object CotTier2 {
         // 5 KB ATAK drawing is comfortably inside -- it compresses to about
         // 700 bytes, nearly twice the MDU. Nothing caught that, so the frame
         // reached Reticulum, which refuses it at the packet layer.
-        require(frame.size <= MAX_FRAME_BYTES) {
-            "tier 2 frame is ${frame.size} bytes, over the $MAX_FRAME_BYTES-byte bound; " +
+        require(bound == null || frame.size <= bound) {
+            "tier 2 frame is ${frame.size} bytes, over the $bound-byte bound; " +
                 "it belongs in tier 3"
         }
         return frame
