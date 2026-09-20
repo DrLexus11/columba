@@ -94,7 +94,15 @@ class CotChatTest {
             decoded, "urtn-" + "ab".repeat(16), "LEXUS",
             "2026-09-11T20:00:00.000Z", "2026-09-11T21:00:00.000Z",
         )
-        assertEquals(decoded, CotChat.decode(CotChat.chatFromCot(rebuilt, sender)))
+        val again = CotChat.decode(CotChat.chatFromCot(rebuilt, sender))!!
+        // The words and the identity of the line survive intact.
+        assertEquals(decoded.copy(room = again.room, recipient = again.recipient), again)
+        // Two fields legitimately turn around, because a rebuilt event is the
+        // *other side* of the conversation: it is headed by the sender, and
+        // reading it back the way the endpoint reads what ATAK writes gives a
+        // line addressed to that sender. That is a reply, and it is the point.
+        assertEquals("LEXUS", again.room)
+        assertEquals("urtn-" + "ab".repeat(16), again.recipient)
     }
 
     @Test
@@ -276,6 +284,56 @@ class CotChatTest {
         val decoded = CotChat.decode(CotChat.chatFromCot(addressedTo(peer), sender))!!
         assertEquals(peer, decoded.recipient)
         assertNotNull(TakIdentity.destinationFor(decoded.recipient))
+    }
+
+    @Test
+    fun `a received message is a conversation with its sender`() {
+        // ATAK keys a conversation on the other party. In an event the local
+        // ATAK wrote that is the recipient; in one it is handed it is the
+        // sender. Naming it after the recipient put the operator in a
+        // conversation with themselves, and their reply then carried their own
+        // UID and was dropped at the far end as not a member -- messages in,
+        // replies nowhere. Hardware, 2026-09-12.
+        val decoded = CotChat.decode(CotChat.chatFromCot(chat.getString("message"), sender))!!
+        val peer = "urtn-" + "ab".repeat(16)
+        val rebuilt = CotChat.buildChatCot(decoded, peer, "DECK", "2026-09-12T09:00:00.000Z", "2026-09-12T10:00:00.000Z")
+        assertTrue(rebuilt, rebuilt.contains("""id="$peer""""))
+        assertTrue(rebuilt, !rebuilt.contains("""id="${decoded.recipient}""""))
+    }
+
+    @Test
+    fun `a reply to a received message goes back to its sender`() {
+        // The test that would have caught it: read the rebuilt event back the
+        // way the endpoint reads what ATAK writes, and check the addressee is
+        // the peer rather than ourselves.
+        val decoded = CotChat.decode(CotChat.chatFromCot(chat.getString("message"), sender))!!
+        val peer = "urtn-" + "ab".repeat(16)
+        val rebuilt = CotChat.buildChatCot(decoded, peer, "DECK", "2026-09-12T09:00:00.000Z", "2026-09-12T10:00:00.000Z")
+        assertEquals(peer, CotChat.decode(CotChat.chatFromCot(rebuilt, sender))!!.recipient)
+    }
+
+    @Test
+    fun `a direct message is headed by its sender`() {
+        // The chatroom names the other party, and that is a different string
+        // on each side. Replaying the author's verbatim gave the recipient a
+        // thread named after themselves -- seen on hardware 2026-09-12, where
+        // a line from DECK opened a conversation headed COLUMBA on COLUMBA's
+        // own phone.
+        val decoded = CotChat.decode(CotChat.chatFromCot(chat.getString("message"), sender))!!
+        val rebuilt = CotChat.buildChatCot(decoded, "urtn-x", "DECK", "2026-09-12T09:00:00.000Z", "2026-09-12T10:00:00.000Z")
+        assertTrue(rebuilt, rebuilt.contains("""chatroom="DECK""""))
+        assertTrue(rebuilt, !rebuilt.contains("""chatroom="Inquisitor""""))
+    }
+
+    @Test
+    fun `a room line keeps its room`() {
+        // A room really is the same string for everybody, so re-heading one
+        // would split a shared conversation into a thread per sender.
+        val event = addressedTo("All Chat Rooms")
+            .replace("""chatroom="Inquisitor"""", """chatroom="All Chat Rooms"""")
+        val decoded = CotChat.decode(CotChat.chatFromCot(event, sender))!!
+        val rebuilt = CotChat.buildChatCot(decoded, "urtn-x", "DECK", "2026-09-12T09:00:00.000Z", "2026-09-12T10:00:00.000Z")
+        assertTrue(rebuilt, rebuilt.contains("""chatroom="All Chat Rooms""""))
     }
 
     @Test

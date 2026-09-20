@@ -14,6 +14,17 @@ import javax.xml.parsers.DocumentBuilderFactory
  * hostile and every failure leaves as IllegalArgumentException.
  */
 object CotEvent {
+    /** Heartbeats are answered on their local socket before mesh routing. */
+    fun pingReply(cotXml: String, now: java.time.Instant = java.time.Instant.now()): String? {
+        val event = parseOrNull(cotXml) ?: return null
+        if (event.getAttribute("type") != "t-x-c-t") return null
+        val uid = escapeAttribute(event.getAttribute("uid").ifEmpty { "takPong" })
+        return "<event version=\"2.0\" uid=\"$uid\" type=\"t-x-c-t-r\" " +
+            "time=\"$now\" start=\"$now\" stale=\"${now.plusSeconds(60)}\" how=\"m-g\">" +
+            "<point lat=\"0\" lon=\"0\" hae=\"0\" ce=\"9999999\" le=\"9999999\"/>" +
+            "<detail/></event>"
+    }
+
     /**
      * True when this event is the endpoint's own, echoed back.
      *
@@ -93,6 +104,32 @@ object CotEvent {
         return event.getAttribute("uid").takeIf { it.isNotEmpty() && isSelfReport }
     }
 
+    /**
+     * The callsign this ATAK's operator has set, from the same self-report.
+     *
+     * A node announcing a name nobody chose is worse than it looks: peers draw
+     * that name on the map and address chat by it, so the whole team sees a
+     * label the operator never picked and cannot correct. Observed on hardware
+     * 2026-09-13, where every handset on the mesh announced itself as
+     * "COLUMBA" -- a constant in this source, not a name -- and the command
+     * post's map showed the same word for whoever was carrying it.
+     *
+     * Read rather than configured, for the reason [learnAtakUid] gives: the
+     * operator has already set this in ATAK, and a second place to type it is
+     * a second place for it to be wrong. The `<takv>` gate is the same one --
+     * a marker's `<contact>` must never be mistaken for the device that made
+     * it.
+     */
+    fun learnAtakCallsign(cotXml: String): String? {
+        val detail = parseOrNull(cotXml)?.let { childElement(it, "detail") } ?: return null
+        // The same `<takv>` gate learnAtakUid uses: a marker's `<contact>`
+        // must never be mistaken for the device that made it.
+        if (childElement(detail, "takv") == null) return null
+        return childElement(detail, "contact")
+            ?.getAttribute("callsign")
+            ?.takeIf { it.isNotEmpty() }
+    }
+
     /** [parse], but null for input that is not a CoT event at all. */
     private fun parseOrNull(cotXml: String): Element? =
         try {
@@ -153,7 +190,7 @@ object CotEvent {
      * means forwarding our own event, which is the loop this check exists to
      * prevent.
      */
-    private fun startTagEnd(xml: String): Int {
+    internal fun startTagEnd(xml: CharSequence): Int {
         var quote = ' '
         for (index in xml.indices) {
             val character = xml[index]

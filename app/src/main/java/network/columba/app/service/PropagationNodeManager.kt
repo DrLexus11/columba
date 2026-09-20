@@ -135,6 +135,7 @@ class PropagationNodeManager
     ) {
         companion object {
             private const val TAG = "PropagationNodeManager"
+
         }
 
         /**
@@ -238,11 +239,38 @@ class PropagationNodeManager
         // Timeout for sync operation (5 minutes for large transfers)
         private val syncTimeoutMs = 5 * 60 * 1000L
 
+        /** Room for the watchdog to fire before the loop stops waiting on it. */
+        private val settleGraceMs = 10_000L
+
         private var syncJob: Job? = null
+
+        /**
+         * Whether the last attempt failed, so the periodic loop can come back
+         * sooner than the interval. Failures correlate exactly with the
+         * outages that make a sync worth doing, so forfeiting the interval for
+         * one leaves the node silent through the period right after a
+         * partition. See [SyncBackoff].
+         */
+        private val lastAttemptFailed = java.util.concurrent.atomic.AtomicBoolean(false)
         private var settingsObserverJob: Job? = null
         private var propagationStateObserverJob: Job? = null
 
         private var relayObserverJob: Job? = null
+
+        /**
+         * Syncs triggered by a peer being heard rather than by the clock.
+         *
+         * Retrieval was a timer only, and the interval defaults to an hour. So
+         * a message that escalated to the propagation node sat there until the
+         * hour was up -- on hardware 2026-09-13 the command post was holding
+         * nine of them, and chat looked simply broken. An announce is the
+         * cheapest possible evidence that the mesh is alive and somebody is
+         * there to have sent something, which makes it the right moment to ask.
+         */
+        private var peerHeardJob: Job? = null
+
+        /** When to ask after hearing a peer, and when to stop asking. */
+        private val peerSync = PeerSyncTrigger()
 
         /**
          * Initialize the manager - start observing database for relay changes.
@@ -303,6 +331,38 @@ class PropagationNodeManager
 
             // Start periodic sync with propagation node
             startPeriodicSync()
+
+            // And ask whenever a peer is heard, which the timer alone cannot
+            // do. Bounded by PEER_SYNC_FLOOR_MS so a team powering up together
+            // does not mean one sync per member: a sync is a Link and a
+            // transfer, not a packet.
+            peerHeardJob =
+                scope.launch {
+                    rnsCore.observeAnnounces().collect {
+                        if (!peerSync.shouldAsk(System.currentTimeMillis())) return@collect
+                        if (!settingsRepository.getAutoRetrieveEnabled()) return@collect
+                        lastAttemptFailed.set(false)
+                        Log.i(TAG, "A peer was heard; asking what is held for us")
+                        runCatching {
+                            syncWithPropagationNode()
+                            awaitSyncSettled()
+                        }.onFailure {
+                            Log.w(TAG, "Peer-triggered sync failed: ${it.message}")
+                            lastAttemptFailed.set(true)
+                        }
+                        if (!lastAttemptFailed.get()) {
+                            peerSync.succeeded()
+                        } else if (peerSync.failed()) {
+                            Log.i(
+                                TAG,
+                                "Peer-triggered sync has failed " +
+                                    "${peerSync.consecutiveFailures()} times; holding off for " +
+                                    "${peerSync.waitMs() / 60_000} minutes rather than retrying " +
+                                    "into a path that is refusing",
+                            )
+                        }
+                    }
+                }
 
             // One-shot auto-select on startup (if auto mode + no relay configured)
             scope.launch {
@@ -460,6 +520,7 @@ class PropagationNodeManager
          */
         private suspend fun handleSyncComplete(messagesReceived: Int) {
             if (!syncFinalized.compareAndSet(false, true)) return
+            lastAttemptFailed.set(false)
             if (_isSyncing.value) {
                 Log.d(TAG, "Sync complete: $messagesReceived messages received (manual=$_isManualSync)")
                 _isSyncing.value = false
@@ -509,6 +570,7 @@ class PropagationNodeManager
                         else -> "Unknown error (${state.state})"
                     }
                 Log.w(TAG, "Sync error: $errorMsg (manual=$_isManualSync)")
+                lastAttemptFailed.set(true)
                 syncFinalized.set(true)
                 _isSyncing.value = false
                 _syncProgress.value = SyncProgress.Idle
@@ -526,6 +588,8 @@ class PropagationNodeManager
          */
         fun stop() {
             Log.d(TAG, "Stopping PropagationNodeManager")
+            peerHeardJob?.cancel()
+            peerHeardJob = null
             relayObserverJob?.cancel()
             syncJob?.cancel()
             settingsObserverJob?.cancel()
@@ -741,23 +805,57 @@ class PropagationNodeManager
                     // Initial delay to let things settle
                     kotlinx.coroutines.delay(5_000)
 
+                    var consecutiveFailures = 0
                     while (true) {
                         // Check if auto-retrieve is enabled
                         val autoRetrieveEnabled = settingsRepository.getAutoRetrieveEnabled()
                         if (autoRetrieveEnabled) {
+                            lastAttemptFailed.set(false)
                             try {
                                 syncWithPropagationNode()
+                                awaitSyncSettled()
                             } catch (e: Exception) {
                                 Log.e(TAG, "Error during propagation sync", e)
+                                lastAttemptFailed.set(true)
                             }
+                            consecutiveFailures =
+                                if (lastAttemptFailed.get()) consecutiveFailures + 1 else 0
                         }
 
                         // Get configurable interval from settings
                         val intervalSeconds = settingsRepository.getRetrievalIntervalSeconds()
                         val intervalMs = intervalSeconds * 1000L
-                        kotlinx.coroutines.delay(intervalMs)
+                        val waitMs = SyncBackoff.delayMs(consecutiveFailures, intervalMs)
+                        if (consecutiveFailures > 0) {
+                            Log.i(
+                                TAG,
+                                "Sync attempt $consecutiveFailures failed; retrying in " +
+                                    "${waitMs / 1000}s rather than waiting ${intervalMs / 1000}s",
+                            )
+                        }
+                        kotlinx.coroutines.delay(waitMs)
                     }
                 }
+        }
+
+        /**
+         * Wait for the attempt just started to resolve, so the loop knows
+         * whether it failed.
+         *
+         * [syncWithPropagationNode] returns as soon as the request is away;
+         * the outcome arrives later through [observePropagationStateChanges].
+         * Without waiting, the loop cannot tell a sync that worked from one
+         * that never reached the relay -- and the difference decides whether
+         * to come back in a minute or an hour.
+         *
+         * Bounded, because a sync that never resolves at all must not stop the
+         * loop: the watchdog clears _isSyncing on its own timeout, and this
+         * gives it room to.
+         */
+        private suspend fun awaitSyncSettled() {
+            withTimeoutOrNull(syncTimeoutMs + settleGraceMs) {
+                isSyncing.first { !it }
+            }
         }
 
         /**
@@ -808,6 +906,10 @@ class PropagationNodeManager
                     kotlinx.coroutines.delay(syncTimeoutMs)
                     if (_isSyncing.value) {
                         Log.w(TAG, "Sync timed out after ${syncTimeoutMs / 1000} seconds")
+                        // A timeout is a failed attempt. Without this the retry
+                        // loop sees consecutiveFailures stay at zero and never
+                        // backs off -- on precisely the outage this backoff exists for.
+                        lastAttemptFailed.set(true)
                         // Finalize before clearing _isSyncing so an orphaned pollForSyncCompletion
                         // loop can't race the next startSync and prematurely finish it.
                         syncFinalized.set(true)
@@ -831,6 +933,7 @@ class PropagationNodeManager
                             }
                             "failed" -> {
                                 timeoutJob.cancel()
+                                lastAttemptFailed.set(true)
                                 // Match the finalization discipline used everywhere else so a stale
                                 // propagationStateFlow "complete" can't later pass the CAS in
                                 // handleSyncComplete and consume the next sync's finalizer.
@@ -849,6 +952,7 @@ class PropagationNodeManager
                     }.onFailure { error ->
                         Log.w(TAG, "Periodic sync request failed: ${error.message}")
                         timeoutJob.cancel()
+                        lastAttemptFailed.set(true)
                         syncFinalized.set(true)
                         _isSyncing.value = false
                         _syncProgress.value = SyncProgress.Idle
@@ -856,6 +960,7 @@ class PropagationNodeManager
             } catch (e: Exception) {
                 Log.e(TAG, "Error requesting messages from propagation node", e)
                 timeoutJob.cancel()
+                lastAttemptFailed.set(true)
                 syncFinalized.set(true)
                 _isSyncing.value = false
                 _syncProgress.value = SyncProgress.Idle
