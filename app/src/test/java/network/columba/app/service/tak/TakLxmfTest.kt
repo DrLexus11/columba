@@ -13,6 +13,7 @@ import network.columba.app.rns.api.model.Destination
 import network.columba.app.rns.api.model.Identity
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -213,5 +214,42 @@ class TakLxmfTest {
         assertEquals("meet me at the north gate", decoded.text)
         assertEquals("BRAVO", decoded.room)
         assertEquals(1789132717L, decoded.sentUnix)
+    }
+
+    /**
+     * The envelope's identity is the only one here worth anything.
+     *
+     * The sender id inside a frame is four bytes the sender chose for itself;
+     * the source hash is what LXMF authenticated. Before these agreed had to
+     * be checked, any LXMF sender at all -- no fleet secret, no membership --
+     * could put words on an operator's screen under a member's name, needing
+     * only four bytes of that member's destination hash, which every announce
+     * publishes.
+     */
+    @Test
+    fun `a frame is authentic only when its sender id matches the envelope`() {
+        val member = ByteArray(16) { (it + 1).toByte() }
+        val theirId = TakMembership.senderIdFor(member)
+
+        assertTrue(TakLxmf.senderIsAuthentic(member, theirId))
+    }
+
+    @Test
+    fun `an impostor claiming a members id is refused`() {
+        val member = ByteArray(16) { (it + 1).toByte() }
+        val impostor = ByteArray(16) { (it + 90).toByte() }
+        // Public in every announce, so knowing it proves nothing.
+        val theirId = TakMembership.senderIdFor(member)
+
+        assertFalse(
+            "the envelope, not the claim, decides",
+            TakLxmf.senderIsAuthentic(impostor, theirId),
+        )
+    }
+
+    /** A source hash too short to carry a sender id cannot vouch for one. */
+    @Test
+    fun `a truncated source hash is not authentic`() {
+        assertFalse(TakLxmf.senderIsAuthentic(ByteArray(3), 0))
     }
 }

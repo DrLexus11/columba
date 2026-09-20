@@ -180,7 +180,6 @@ class CotEndpointManager
             data class Failed(val reason: String) : State
         }
 
-        private val replay = CotReplay()
 
         private val _state = MutableStateFlow<State>(State.Stopped)
         val state: StateFlow<State> = _state.asStateFlow()
@@ -260,27 +259,43 @@ class CotEndpointManager
                 }
 
             var lastReported: String? = null
+            // Logged on change rather than per attempt: this retries every five
+            // seconds for as long as the fault lasts, and on hardware that was
+            // an hour of identical lines burying everything else in the buffer.
+            //
+            // A lambda rather than a method so the two catches below can share
+            // it without adding to a class that is already at its function
+            // budget.
+            val report: suspend (String, String) -> Unit = { reason, detail ->
+                if (reason != lastReported) {
+                    Log.w(TAG, "Endpoint stopped: $detail. $reason")
+                    lastReported = reason
+                }
+                _state.value = State.Failed(reason)
+                delay(RETRY_DELAY_MS)
+            }
             while (currentCoroutineContext().isActive) {
                 try {
                     serve(keys)
                     lastReported = null
+                } catch (error: SetupFailure) {
+                    // Nothing has offered the port yet, so this is not a port
+                    // question. Probing one here reported "still held from a
+                    // previous run" about a port nothing had tried to take, and
+                    // sent an operator hunting a second copy of the app that
+                    // did not exist.
+                    val reason = error.message ?: "the endpoint could not start"
+                    report(reason, reason)
                 } catch (error: IOException) {
-                    // Not "the previous instance will let go shortly", which is
-                    // what this assumed and is only one of the two cases. The
-                    // other is another server owning the port outright, where
-                    // waiting is not the fix and never becomes it.
-                    val cause = portConflict.diagnose(BIND_HOST, PORT)
-                    val reason = portConflict.explain(cause, BIND_HOST, PORT)
-                    // Logged on change rather than per attempt: this retries
-                    // every five seconds for as long as the conflict lasts, and
-                    // on hardware that was an hour of identical lines burying
-                    // everything else in the buffer.
-                    if (reason != lastReported) {
-                        Log.w(TAG, "Endpoint stopped: ${error.message}. $reason")
-                        lastReported = reason
-                    }
-                    _state.value = State.Failed(reason)
-                    delay(RETRY_DELAY_MS)
+                    // A real bind failure, and two causes with opposite cures:
+                    // a previous run that has not let go, where waiting is the
+                    // fix, and another server owning the port, where waiting
+                    // never becomes the fix.
+                    val reason =
+                        portConflict.explain(
+                            portConflict.diagnose(BIND_HOST, PORT), BIND_HOST, PORT,
+                        )
+                    report(reason, error.message ?: "bind failed")
                 }
             }
         }
@@ -295,7 +310,7 @@ class CotEndpointManager
          * retry contract stays stated in a single place.
          */
         private fun <T> Result<T>.orFail(step: String): T =
-            getOrElse { throw IOException("$step: ${it.message}", it) }
+            getOrElse { throw SetupFailure("$step: ${it.message}", it) }
 
         /**
          * One session per run.
@@ -319,7 +334,6 @@ class CotEndpointManager
                 node = node,
                 keys = keys,
                 lxmf = TakLxmf.Carrier(rnsCore, rnsLxmf, nodeIdentity),
-                team = keys.team,
                 pipeline = CotOutbound(TakIdentity.uidFor(node.hash)),
                 registry = registry,
                 renderer =
@@ -332,6 +346,17 @@ class CotEndpointManager
                     ),
             )
         }
+
+        /**
+         * A setup step failed before the listener was ever offered the port.
+         *
+         * Distinct from an IOException out of bind() because the diagnosis is
+         * different and the cure is too: probing the port after a
+         * backend-not-ready error reports "still held from a previous run"
+         * about a port nothing has tried to take, and sends an operator looking
+         * for a second copy of the app that does not exist.
+         */
+        private class SetupFailure(message: String, cause: Throwable?) : IOException(message, cause)
 
         private suspend fun serve(keys: Keys) {
             // No group destination. Pivot 5: a group packet reaches only peers
@@ -375,19 +400,22 @@ class CotEndpointManager
                     // Everything tier-2 takes the same road out: held for a
                     // client that is not attached, then written to those that are.
                     val deliver: suspend (ByteArray) -> Unit = { bytes ->
-                        replay.hold(bytes, System.currentTimeMillis())
+                        session.replay.hold(bytes, System.currentTimeMillis())
                         writeToClients(bytes, held = true)
                     }
                     val fromLxmf =
                         launch {
-                            session.lxmf.frames().collect { frame ->
-                                Log.i(TAG, "TAK chat arrived over LXMF, ${frame.size} bytes")
+                            session.lxmf.frames().collect { inbound ->
+                                Log.i(
+                                    TAG,
+                                    "TAK chat arrived over LXMF, ${inbound.frame.size} bytes",
+                                )
                                 val rendered =
-                                    session.renderer.render(frame, System.currentTimeMillis())
+                                    session.renderer.render(inbound, System.currentTimeMillis())
                                 if (rendered is CotRenderer.Rendered.Cot) {
                                     deliver(rendered.xml.toByteArray(Charsets.UTF_8))
                                 } else {
-                                    Log.w(TAG, "LXMF frame did not render: $rendered")
+                                    Log.w(TAG, "LXMF frame not drawn: $rendered")
                                 }
                             }
                         }
@@ -514,7 +542,7 @@ class CotEndpointManager
             // This is what makes ATAK as reliable as Columba when both are
             // running -- Columba keeps a message because LXMF persists it, and
             // until now ATAK kept nothing at all.
-            val missed = replay.pending(System.currentTimeMillis())
+            val missed = session.replay.pending(System.currentTimeMillis())
             if (missed.isNotEmpty()) {
                 Log.i(TAG, "Replaying ${missed.size} held event(s) to a new client")
                 withContext(Dispatchers.IO) {
@@ -686,12 +714,30 @@ class CotEndpointManager
                         hash == null -> sendTo(destination, frame)
                         // Only a message earns a tick. Acknowledging a receipt
                         // would have two nodes answering each other for ever.
-                        kind == CotChat.KIND_MESSAGE && message != null ->
-                            session.proofs.awaiting(
-                                hash,
-                                ChatProofs.Pending(
-                                    destination, message.messageId, message.room),
-                            )
+                        kind == CotChat.KIND_MESSAGE && message != null -> {
+                            val alreadyProved =
+                                session.proofs.awaiting(
+                                    hash,
+                                    ChatProofs.Pending(
+                                        destination, message.messageId, message.room),
+                                )
+                            // The proof beat the registration. Both backends
+                            // install their delivery callback before dispatching
+                            // the send and the status stream does not replay, so
+                            // a peer one hop away is proved before this line
+                            // runs -- and the tick was dropped for exactly the
+                            // messages most certain to have arrived.
+                            if (alreadyProved) {
+                                val now = System.currentTimeMillis()
+                                val tick =
+                                    session.renderer.deliveryReceipt(
+                                        destination, message.messageId, message.room,
+                                        session.pipeline.ourUid, now,
+                                    ).toByteArray(Charsets.UTF_8)
+                                session.replay.hold(tick, now)
+                                writeToClients(tick, held = true)
+                            }
+                        }
                     }
                 }
             }
@@ -792,7 +838,7 @@ class CotEndpointManager
                 // Position is latest-wins and is not held; everything else is.
                 val keep = TakPayload.kindOf(packet.data) != TakPayload.POSITION_V2
                 if (keep) {
-                    replay.hold(bytes, System.currentTimeMillis())
+                    session.replay.hold(bytes, System.currentTimeMillis())
                 }
                 writeToClients(bytes, held = keep)
             }
@@ -875,25 +921,46 @@ class CotEndpointManager
              * who can address our node can also address our inbox.
              */
             val lxmf: TakLxmf.Carrier,
-            val team: String,
             val pipeline: CotOutbound,
             val registry: TakMembership.Registry,
             val renderer: CotRenderer,
             /** Kept so the announce can be rebuilt around a new callsign. */
             val keys: Keys,
-            val gate: CotPosition.PositionGate = CotPosition.PositionGate(),
-            /** Shorter than position's: a pointer moves continuously. */
-            val spiGate: CotPosition.PositionGate =
-                CotPosition.PositionGate(intervalMs = 5_000),
         ) {
+            /**
+             * The team this run is on.
+             *
+             * Read from [keys] rather than passed alongside them: the two were
+             * always the same string, and a Session whose team disagreed with
+             * the secret its keys were derived from would address a team it
+             * could not decrypt.
+             */
+            val team: String get() = keys.team
+
             /**
              * Sent messages whose delivery proof will draw their tick.
              *
-             * A property rather than a constructor parameter: nothing
-             * constructs a Session with one, and the parameter list is at its
-             * limit.
+             * Properties rather than constructor parameters, here and below:
+             * nothing constructs a Session with any of them, and each is state
+             * this run owns rather than something handed to it.
              */
             val proofs = ChatProofs()
+
+            /**
+             * Held events belong to this run, not to the process.
+             *
+             * collectLatest builds a new session when the team or the fleet
+             * secret changes, and a buffer that outlived that would hand the
+             * next ATAK client events received under the old team -- replayed
+             * into the new one, attributed to members of a team they were never
+             * sent to.
+             */
+            val replay = CotReplay()
+
+            val gate = CotPosition.PositionGate()
+
+            /** Shorter than position's: a pointer moves continuously. */
+            val spiGate = CotPosition.PositionGate(intervalMs = 5_000)
         }
 
         /**

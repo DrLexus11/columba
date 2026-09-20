@@ -49,9 +49,17 @@ class InboxAnnouncer(
     suspend fun announceIfDue(now: Long): Boolean {
         if (lastAnnounce != 0L && now - lastAnnounce < floorMs) return false
         val displayName = identityRepository.getActiveIdentitySync()?.displayName ?: return false
-        lastAnnounce = now
-        rnsCore.triggerAutoAnnounce(displayName)
-            .onFailure { Log.w(TAG, "Inbox announce failed: ${it.message}") }
-        return true
+        // The floor starts when an announce actually goes out, not when one is
+        // attempted. Committing the timestamp first meant a backend that was
+        // not ready yet -- which is exactly the cold start this class exists
+        // for -- burned the whole minute on a failure and told the caller it
+        // had succeeded, so no peer arriving in that window could trigger a
+        // retry and the inbox stayed unreachable.
+        val announced =
+            rnsCore.triggerAutoAnnounce(displayName)
+                .onFailure { Log.w(TAG, "Inbox announce failed: ${it.message}") }
+                .isSuccess
+        if (announced) lastAnnounce = now
+        return announced
     }
 }

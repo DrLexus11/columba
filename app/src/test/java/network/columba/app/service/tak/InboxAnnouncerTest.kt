@@ -78,4 +78,37 @@ class InboxAnnouncerTest {
         // slow for a mesh node whose peers come and go.
         assertTrue(InboxAnnouncer.FLOOR_MS < 60L * 60 * 1000)
     }
+
+    /**
+     * The floor starts when an announce goes out, not when one is attempted.
+     *
+     * Committing the timestamp first meant a backend that was not ready --
+     * exactly the cold start this class exists for -- burned the whole minute
+     * on a failure, so no peer arriving in that window could trigger a retry
+     * and the inbox stayed unreachable.
+     */
+    @Test
+    fun `a failed announce does not start the floor`() = runTest {
+        val (announcer, core) = announcer()
+        coEvery { core.triggerAutoAnnounce(any()) } returns
+            Result.failure(IllegalStateException("backend not ready"))
+
+        assertFalse("a failed announce must not report success", announcer.announceIfDue(1_000))
+
+        // Well inside the floor, and still retried, because nothing went out.
+        coEvery { core.triggerAutoAnnounce(any()) } returns Result.success(Unit)
+        assertTrue("the retry was suppressed by a failure", announcer.announceIfDue(1_500))
+        coVerify(exactly = 2) { core.triggerAutoAnnounce("LEXUS") }
+    }
+
+    /** Once one does go out, the floor applies as before. */
+    @Test
+    fun `a successful announce starts the floor`() = runTest {
+        val (announcer, core) = announcer()
+
+        assertTrue(announcer.announceIfDue(1_000))
+        assertFalse(announcer.announceIfDue(1_500))
+
+        coVerify(exactly = 1) { core.triggerAutoAnnounce("LEXUS") }
+    }
 }

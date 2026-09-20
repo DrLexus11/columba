@@ -1,7 +1,9 @@
 package network.columba.app.service.tak
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
@@ -57,5 +59,58 @@ class ChatProofsTest {
         proofs.awaiting("hash-1", pending("msg-1"))
         proofs.forget("hash-1")
         assertEquals(0, proofs.size())
+    }
+
+    /**
+     * The proof can beat the registration, and used to be dropped when it did.
+     *
+     * Both backends install their delivery callback before dispatching the
+     * send and the status stream does not replay, so a peer one hop away is
+     * proved before the sender has registered the hash -- and the tick went
+     * missing for exactly the messages most certain to have arrived.
+     */
+    @Test
+    fun `a proof that arrives first is reconciled`() {
+        val proofs = ChatProofs()
+
+        // The proof lands before anyone is waiting for it.
+        assertNull(proofs.claim("hash-early"))
+
+        // Registering now is told the answer is already in.
+        assertTrue(proofs.awaiting("hash-early", pending("msg-early")))
+        // And nothing is left waiting for a proof that has been and gone.
+        assertNull(proofs.claim("hash-early"))
+    }
+
+    /** A send registered before its proof still waits, as it always did. */
+    @Test
+    fun `the ordinary order still waits for the proof`() {
+        val proofs = ChatProofs()
+
+        assertFalse(proofs.awaiting("hash-1", pending("msg-1")))
+
+        assertEquals("msg-1", proofs.claim("hash-1")?.messageId)
+    }
+
+    /** An early proof is reconciled once, not every time. */
+    @Test
+    fun `an early proof is spent by the registration that claims it`() {
+        val proofs = ChatProofs()
+        assertNull(proofs.claim("hash-early"))
+
+        assertTrue(proofs.awaiting("hash-early", pending("msg-early")))
+        // A second send that happened to reuse the hash is genuinely waiting.
+        assertFalse(proofs.awaiting("hash-early", pending("msg-again")))
+    }
+
+    /** Abandoning a send drops the early proof with it. */
+    @Test
+    fun `forget clears an early proof too`() {
+        val proofs = ChatProofs()
+        assertNull(proofs.claim("hash-early"))
+
+        proofs.forget("hash-early")
+
+        assertFalse(proofs.awaiting("hash-early", pending("msg-early")))
     }
 }

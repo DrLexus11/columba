@@ -906,6 +906,10 @@ class PropagationNodeManager
                     kotlinx.coroutines.delay(syncTimeoutMs)
                     if (_isSyncing.value) {
                         Log.w(TAG, "Sync timed out after ${syncTimeoutMs / 1000} seconds")
+                        // A timeout is a failed attempt. Without this the retry
+                        // loop sees consecutiveFailures stay at zero and never
+                        // backs off -- on precisely the outage this backoff exists for.
+                        lastAttemptFailed.set(true)
                         // Finalize before clearing _isSyncing so an orphaned pollForSyncCompletion
                         // loop can't race the next startSync and prematurely finish it.
                         syncFinalized.set(true)
@@ -929,6 +933,7 @@ class PropagationNodeManager
                             }
                             "failed" -> {
                                 timeoutJob.cancel()
+                                lastAttemptFailed.set(true)
                                 // Match the finalization discipline used everywhere else so a stale
                                 // propagationStateFlow "complete" can't later pass the CAS in
                                 // handleSyncComplete and consume the next sync's finalizer.
@@ -947,6 +952,7 @@ class PropagationNodeManager
                     }.onFailure { error ->
                         Log.w(TAG, "Periodic sync request failed: ${error.message}")
                         timeoutJob.cancel()
+                        lastAttemptFailed.set(true)
                         syncFinalized.set(true)
                         _isSyncing.value = false
                         _syncProgress.value = SyncProgress.Idle
@@ -954,6 +960,7 @@ class PropagationNodeManager
             } catch (e: Exception) {
                 Log.e(TAG, "Error requesting messages from propagation node", e)
                 timeoutJob.cancel()
+                lastAttemptFailed.set(true)
                 syncFinalized.set(true)
                 _isSyncing.value = false
                 _syncProgress.value = SyncProgress.Idle

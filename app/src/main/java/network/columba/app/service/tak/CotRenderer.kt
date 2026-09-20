@@ -64,6 +64,30 @@ class CotRenderer(
             else -> Rendered.NotOurs
         }
 
+    /**
+     * Render a frame that arrived over LXMF, where the carrier proved who sent
+     * it.
+     *
+     * The sender id inside a frame is four bytes the sender chose for itself;
+     * the envelope's source hash is what LXMF authenticated. Rendering on the
+     * claim alone let any LXMF sender at all -- no fleet secret, no membership
+     * -- put words on an operator's screen under a member's name, needing only
+     * four bytes of that member's destination hash, which every announce
+     * publishes.
+     *
+     * The packet path has no envelope to check and authenticates differently:
+     * it arrives on this node's own destination. Hence two entry points rather
+     * than one that sometimes checks.
+     */
+    fun render(inbound: TakLxmf.Inbound, now: Long): Rendered {
+        val claimed = CotChat.decode(inbound.frame)?.senderId
+        if (claimed == null || !TakLxmf.senderIsAuthentic(inbound.sourceHash, claimed)) {
+            Log.w(TAG, "LXMF chat frame does not match its sender, not shown")
+            return Rendered.Handled
+        }
+        return render(inbound.frame, now)
+    }
+
     /** A peer's position report. */
     private fun position(raw: ByteArray, now: Long): Rendered {
         val fix = PositionCodec.decode(raw) ?: return Rendered.NotOurs

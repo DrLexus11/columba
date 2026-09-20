@@ -42,14 +42,37 @@ class ChatProofs(private val maxPending: Int = MAX_PENDING) {
 
     private val pending = LinkedHashMap<String, Pending>()
 
-    /** Remember a sent message, keyed by the hash the backend reports for it. */
+    /**
+     * Proofs that arrived before the send they belong to was registered.
+     *
+     * The race is real and not rare: both backends install their delivery
+     * callback before dispatching the send, and the delivery-status stream does
+     * not replay. An opportunistic message delivered immediately -- a peer one
+     * hop away, which is the common case in a room -- is therefore proved while
+     * [awaiting] has not been called yet. The update was dropped and the sender
+     * never got its tick for the message most certain to have arrived.
+     *
+     * Hashes only, and bounded: most of what lands here is a proof for the
+     * operator's own ordinary messaging, which is not ours and is simply aged
+     * out.
+     */
+    private val provedEarly = LinkedHashSet<String>()
+
+    /**
+     * Remember a sent message, keyed by the hash the backend reports for it.
+     *
+     * @return true if the proof had already arrived, in which case the caller
+     *   should draw the tick now: nothing further is coming for this hash.
+     */
     @Synchronized
-    fun awaiting(messageHash: String, entry: Pending) {
+    fun awaiting(messageHash: String, entry: Pending): Boolean {
+        if (provedEarly.remove(messageHash)) return true
         while (pending.size >= maxPending) {
             val oldest = pending.keys.firstOrNull() ?: break
             pending.remove(oldest)
         }
         pending[messageHash] = entry
+        return false
     }
 
     /**
@@ -59,12 +82,28 @@ class ChatProofs(private val maxPending: Int = MAX_PENDING) {
      * notification for the same message must not draw a second tick.
      */
     @Synchronized
-    fun claim(messageHash: String): Pending? = pending.remove(messageHash)
+    fun claim(messageHash: String): Pending? {
+        val entry = pending.remove(messageHash)
+        // Not ours, or ours and not registered yet -- and from here the two are
+        // indistinguishable. Held so [awaiting] can reconcile if the send is
+        // still on its way to registering, aged out otherwise.
+        if (entry == null) rememberEarlyProof(messageHash)
+        return entry
+    }
+
+    private fun rememberEarlyProof(messageHash: String) {
+        while (provedEarly.size >= maxPending) {
+            val oldest = provedEarly.firstOrNull() ?: break
+            provedEarly.remove(oldest)
+        }
+        provedEarly.add(messageHash)
+    }
 
     /** A send that failed outright is not waiting for anything. */
     @Synchronized
     fun forget(messageHash: String) {
         pending.remove(messageHash)
+        provedEarly.remove(messageHash)
     }
 
     @Synchronized

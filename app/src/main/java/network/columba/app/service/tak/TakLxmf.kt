@@ -109,6 +109,36 @@ object TakLxmf {
     }
 
     /**
+     * One arriving frame, with the identity LXMF proved for it.
+     *
+     * Kept together deliberately: the frame's own sender id is a claim, the
+     * source hash is evidence, and separating them is what allowed the claim to
+     * be believed on its own.
+     */
+    data class Inbound(val sourceHash: ByteArray, val frame: ByteArray) {
+        override fun equals(other: Any?): Boolean =
+            this === other ||
+                (
+                    other is Inbound &&
+                        frame.contentEquals(other.frame) &&
+                        sourceHash.contentEquals(other.sourceHash)
+                )
+
+        override fun hashCode(): Int = frame.contentHashCode() * 31 + sourceHash.contentHashCode()
+    }
+
+    /**
+     * Whether the frame's claimed sender is the node that actually sent it.
+     *
+     * The wire format has four bytes for identity, so what arrives is a lookup
+     * key rather than a name. That is fine when the carrier authenticates the
+     * sender and we check the two agree -- and worthless without the check,
+     * which is the whole of this function.
+     */
+    fun senderIsAuthentic(sourceHash: ByteArray, claimedSenderId: Int): Boolean =
+        sourceHash.size >= 4 && TakMembership.senderIdFor(sourceHash) == claimedSenderId
+
+    /**
      * What this endpoint sends and receives chat through.
      *
      * The Kotlin twin of `tools/tak_lxmf.py`'s Carrier, and it exists for the
@@ -170,14 +200,27 @@ object TakLxmf {
             joinToString("") { "%02x".format(it) }
 
         /**
-         * TAK chat frames arriving over LXMF.
+         * TAK chat frames arriving over LXMF, each with who actually sent it.
          *
          * Everything else on this router is the operator's own messaging and
          * passes straight through -- claiming one would be worse than missing
          * ours.
+         *
+         * The envelope's source hash travels with the frame and is the only
+         * identity here worth anything. LXMF authenticated it; the sender id
+         * inside the frame is four bytes the sender chose for itself. Emitting
+         * the frame alone let the renderer resolve that self-declared id
+         * against the team registry, so any LXMF sender at all -- no team
+         * secret, no membership -- could put words on an operator's screen
+         * under a member's name simply by knowing four bytes of that member's
+         * destination hash, which is public in every announce.
          */
-        fun frames(): Flow<ByteArray> =
-            rnsLxmf.observeMessages().mapNotNull { frameFrom(it.fieldsJson) }
+        fun frames(): Flow<Inbound> =
+            rnsLxmf.observeMessages().mapNotNull { message ->
+                frameFrom(message.fieldsJson)?.let { frame ->
+                    Inbound(sourceHash = message.sourceHash, frame = frame)
+                }
+            }
     }
 
     private fun stringField(fields: JSONObject, id: Int): String? {
