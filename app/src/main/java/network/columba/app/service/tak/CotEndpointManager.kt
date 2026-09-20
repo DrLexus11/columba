@@ -21,6 +21,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import network.columba.app.data.repository.IdentityRepository
 import network.columba.app.di.ApplicationScope
 import network.columba.app.repository.SettingsRepository
 import network.columba.app.service.PositionCodec
@@ -69,6 +70,7 @@ class CotEndpointManager
     @Inject
     constructor(
         private val settingsRepository: SettingsRepository,
+        private val identityRepository: IdentityRepository,
         private val rnsCore: RnsCore,
         private val rnsLxmf: RnsLxmf,
         @ApplicationScope private val scope: CoroutineScope,
@@ -140,6 +142,7 @@ class CotEndpointManager
              */
             private const val ANNOUNCE_INTERVAL_MS = 30L * 60 * 1000
 
+
             /**
              * How long a peer's position is worth drawing before the track
              * should go grey.
@@ -191,6 +194,13 @@ class CotEndpointManager
         private val clientsLock = Mutex()
         private val portConflict = CotPortConflict()
         private val ticks = DeliveryTicks(rnsLxmf)
+
+        /**
+         * Tells arriving peers where our inbox is. Without it they get markers
+         * and positions and no chat until the app's own hourly-to-twelve-hourly
+         * announce happens to fire. See InboxAnnouncer.
+         */
+        private val inboxAnnouncer = InboxAnnouncer(identityRepository, rnsCore)
 
         fun start() {
             if (supervisor != null) return
@@ -487,6 +497,7 @@ class CotEndpointManager
                 // here; only the trigger was too narrow.
                 if (session.registry.shouldGreet(System.currentTimeMillis())) {
                     announce(session)
+                    inboxAnnouncer.announceIfDue(System.currentTimeMillis())
                 }
             }
         }
