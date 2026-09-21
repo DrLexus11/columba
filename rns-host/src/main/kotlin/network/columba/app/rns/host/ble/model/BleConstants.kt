@@ -143,6 +143,19 @@ object BleConstants {
      */
     const val MAX_CONNECTION_RETRY_BACKOFF_MS = CONNECTION_RETRY_BACKOFF_MS * 8
 
+    /**
+     * Base delay for retrying after GATT status 133, doubled per attempt: 2 s,
+     * 4 s, 8 s.
+     *
+     * Separate from [CONNECTION_RETRY_BACKOFF_MS] on purpose. That one paces
+     * blacklisting a device that keeps failing; this one is the first retry
+     * after a transient failure -- typically the previous link to the same
+     * board not yet released, as after an app restart -- on what may be the
+     * handset's only way onto the mesh. Measured on the bench 2026-09-21: at
+     * the old base, a restarted phone was off the mesh for three minutes.
+     */
+    const val GATT_133_RETRY_BASE_MS = 1000L
+
     // Fragmentation
     /**
      * Fragment header size in bytes.
