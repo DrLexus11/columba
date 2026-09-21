@@ -779,7 +779,20 @@ class CotEndpointManager
                     return true
                 }
             }
-            fanOut(frame, session)
+            // Sent to somebody in particular goes to them alone, over LXMF so
+            // it is proved; see MarkerAddressees. The bare packet is the
+            // fallback for a peer whose identity cannot be recalled, as for
+            // addressed chat.
+            val recipients = MarkerAddressees.of(cotXml, session.registry, System.currentTimeMillis())
+            when {
+                recipients == null -> fanOut(frame, session)
+                recipients.isEmpty() ->
+                    Log.i(TAG, "Marker addressed to nobody on this team; not sent, and not broadcast instead")
+                else ->
+                    recipients.forEach { member ->
+                        if (session.lxmf.send(member, frame, "") == null) sendTo(member, frame)
+                    }
+            }
             return true
         }
 

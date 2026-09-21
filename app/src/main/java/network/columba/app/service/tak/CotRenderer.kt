@@ -83,9 +83,12 @@ class CotRenderer(
      * than one that sometimes checks.
      */
     fun render(inbound: TakLxmf.Inbound, now: Long, signedBy: ByteArray?): Rendered {
-        val claimed = CotChat.decode(inbound.frame)?.senderId
+        // A chat line, or a marker sent to this node in particular. Either way
+        // the frame's claimed sender must agree with the one LXMF proved, or
+        // any member could put words, or a pin, under another member's name.
+        val claimed = CotChat.decode(inbound.frame)?.senderId ?: CotMarker.decode(inbound.frame)?.senderId
         if (claimed == null || !TakLxmf.senderIsAuthentic(signedBy, claimed)) {
-            Log.w(TAG, "LXMF chat frame does not match its sender, not shown")
+            Log.w(TAG, "LXMF frame does not match its sender, not shown")
             return Rendered.Handled
         }
         return render(inbound.frame, now)
