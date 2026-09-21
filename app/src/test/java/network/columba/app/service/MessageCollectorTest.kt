@@ -170,6 +170,43 @@ class MessageCollectorTest {
         }
 
     @Test
+    fun `an application payload with no text never becomes a conversation row`() =
+        runBlocking {
+            // A TAK drawing fragment: application data in fields[0xFB/0xFC] and
+            // not one character of text. The backend now emits it so TAK can
+            // read it; a row for it would be an empty bubble -- the failure the
+            // chat predicate was written to stop.
+            val fragment =
+                ReceivedMessage(
+                    messageHash = "tak_fragment",
+                    content = "",
+                    sourceHash = testSourceHash,
+                    destinationHash = testDestHash,
+                    timestamp = System.currentTimeMillis(),
+                    fieldsJson = """{"251": "tak.chat.v1", "252": "05aabbccdd0003"}""",
+                    publicKey = null,
+                )
+
+            val saved = mutableListOf<String>()
+            coEvery { conversationRepository.saveMessage(any(), any(), any(), any()) } answers {
+                saved += thirdArg<Any>().toString()
+            }
+
+            messageCollector.startCollecting()
+            kotlinx.coroutines.delay(50)
+            messageFlow.emit(fragment)
+            kotlinx.coroutines.delay(200)
+            assertTrue("a fragment made a conversation row", saved.isEmpty())
+
+            // And the guard is selective: an ordinary line behind it still
+            // lands, so the collector is alive and only application frames
+            // were skipped.
+            messageFlow.emit(fragment.copy(messageHash = "chat_line", content = "hello", fieldsJson = null))
+            coVerify(timeout = 2000) { conversationRepository.saveMessage(any(), any(), any(), any()) }
+            assertTrue("the ordinary line after it was not saved", saved.size == 1)
+        }
+
+    @Test
     fun `processMessage skips in-memory duplicate`() =
         runBlocking {
             // Given: A message broadcast from EventHandler

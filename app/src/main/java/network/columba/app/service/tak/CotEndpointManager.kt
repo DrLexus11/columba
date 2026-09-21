@@ -392,6 +392,7 @@ class CotEndpointManager
                             "point ATAK at $BIND_HOST:$PORT, TCP, no SSL",
                     )
                     publishState(session, clientsLock.withLock { clients.size })
+                    session.versions.attach(this)
 
                     val fromMesh = launch { pumpMeshToClients(session) }
                     // The same renderer the packet path uses: a chat line is
@@ -412,7 +413,8 @@ class CotEndpointManager
                                     "TAK frame arrived over LXMF, ${inbound.frame.size} bytes",
                                 )
                                 session.fragments.deliver(
-                                    inbound, session.reassembler, session.renderer, deliver,
+                                    inbound, session.reassembler, session.renderer,
+                                    session.freshness, deliver,
                                 )
                             }
                         }
@@ -628,19 +630,19 @@ class CotEndpointManager
             // used to be dropped outright, which is why drawings and a
             // nine-line MEDEVAC never crossed. An ordinary event still comes
             // back as one frame and pays nothing for this.
+            // An edited and re-sent drawing arrives as several versions of one
+            // event, and a version costs about 7.7 s of channel for a team of
+            // seven. Latest wins; see CotCoalesce. A fragment goes over LXMF,
+            // a single frame takes the cheap fan-out; see TakLxmfCarriage.
             val frames = session.pipeline.frames(cotXml)
-            val now = System.currentTimeMillis()
-            if (frames.size > 1) {
-                // Over LXMF, not as bare packets, and only if ATAK's share
-                // timer has not already sent us this exact drawing. See
-                // TakLxmfCarriage for why a fragment cannot take the
-                // cheap fan-out.
-                if (!session.repeats.isRepeat(cotXml, frames, now)) {
-                    Log.i(TAG, "event too large for one packet; sending ${frames.size} fragments")
-                    session.fragments.send(frames, session.registry, session.lxmf, now)
+            session.versions.submit(cotXml, frames) { version ->
+                if (version.size > 1) {
+                    session.fragments.send(
+                        version, session.registry, session.lxmf, System.currentTimeMillis(),
+                    )
+                } else {
+                    fanOut(version[0], session)
                 }
-            } else {
-                frames.forEach { fanOut(it, session) }
             }
         }
 
@@ -863,7 +865,7 @@ class CotEndpointManager
                                 // A frame we cannot read is ordinary: an older
                                 // node, a newer dictionary, or simply not ours.
                                 return@collect
-                            }
+                            }.takeIf { session.freshness.admit(it) } ?: return@collect
                     }
                 val bytes = payload.toByteArray(Charsets.UTF_8)
                 // Position is latest-wins and is not held; everything else is.
@@ -980,7 +982,11 @@ class CotEndpointManager
             val proofs = ChatProofs()
 
             /** Fragments of events too big for one packet, until they are whole. */
-            val repeats = LargeEventGate()
+            /** Latest wins across repeated versions of one event. */
+            val versions = CotVersions()
+
+            /** Never draw a version older than one already drawn. */
+            val freshness = Freshness()
             val reassembler =
                 CotReassembler(
                     observer = { index, count, held, elapsedMs ->

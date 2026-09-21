@@ -184,4 +184,22 @@ class ChatMessageFilterTest {
             ).isUserVisibleChatMessage(),
         )
     }
+
+    @Test
+    fun `an application payload is emitted but is not a chat bubble`() {
+        // A TAK drawing fragment. Not one character of text, so it is not chat
+        // -- and before carriesApplicationPayload() the backends dropped it on
+        // that basis, so no application ever saw it.
+        val fragment = received(fieldsJson = """{"251": "tak.chat.v1", "252": "05aabb"}""")
+
+        assertTrue(fragment.carriesApplicationPayload())
+        assertFalse(fragment.isUserVisibleChatMessage())
+    }
+
+    @Test
+    fun `ordinary side channels are not application payloads`() {
+        assertFalse(received(fieldsJson = """{"2": "telemetry"}""").carriesApplicationPayload())
+        assertFalse(received(content = "hello").carriesApplicationPayload())
+        assertFalse(received(fieldsJson = "not json").carriesApplicationPayload())
+    }
 }

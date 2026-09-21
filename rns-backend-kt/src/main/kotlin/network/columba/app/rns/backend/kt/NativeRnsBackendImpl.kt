@@ -51,6 +51,7 @@ import network.columba.app.rns.api.util.Aspects
 import network.columba.app.rns.api.util.LxmfFields
 import network.columba.app.rns.api.util.ReactionWireCodec
 import network.columba.app.rns.api.util.hexToBytes
+import network.columba.app.rns.api.util.carriesApplicationPayload
 import network.columba.app.rns.api.util.isUserVisibleChatMessage
 import network.columba.app.rns.api.util.toHex
 import network.columba.app.rns.backend.kt.BuildConfig
@@ -999,7 +1000,10 @@ class NativeRnsBackendImpl(
                     fieldsJson = fieldsJson,
                     iconAppearance = iconAppearance,
                 )
-            if (received.isUserVisibleChatMessage()) {
+            // An application payload is emitted with no visible content too;
+            // chat consumers skip it by the chat predicate. See
+            // `carriesApplicationPayload()` in :rns-api.
+            if (received.isUserVisibleChatMessage() || received.carriesApplicationPayload()) {
                 _messages.tryEmit(received)
             } else {
                 Log.d(

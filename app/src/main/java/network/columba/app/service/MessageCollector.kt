@@ -19,6 +19,7 @@ import network.columba.app.notifications.NotificationHelper
 import network.columba.app.rns.api.RnsCore
 import network.columba.app.rns.api.RnsLxmf
 import network.columba.app.rns.host.util.PeerNameResolver
+import network.columba.app.rns.api.util.isUserVisibleChatMessage
 import java.util.concurrent.ConcurrentHashMap
 import javax.inject.Inject
 import javax.inject.Singleton
@@ -101,6 +102,12 @@ class MessageCollector
 
                 try {
                     rnsLxmf.observeMessages().collect { receivedMessage ->
+                        // Application payloads -- a TAK drawing fragment -- now
+                        // reach this flow with no visible content, for the
+                        // application that wants them. They are not a
+                        // conversation, and a row for one is an empty bubble.
+                        if (!receivedMessage.isUserVisibleChatMessage()) return@collect
+
                         // De-duplicate: Skip if we've already processed this message in-memory
                         if (receivedMessage.messageHash in processedMessageIds) {
                             Log.d(TAG, "Skipping duplicate message ${receivedMessage.messageHash.take(16)} (in-memory cache)")

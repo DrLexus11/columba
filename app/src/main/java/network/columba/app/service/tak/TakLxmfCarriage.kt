@@ -38,6 +38,7 @@ class TakLxmfCarriage(private val rnsCore: RnsCore) {
         lxmf: TakLxmf.Carrier,
         now: Long,
     ) {
+        Log.i(TAG, "event too large for one packet; sending ${frames.size} fragments")
         val members = registry.members(now)
         for (frame in frames) {
             for (memberHash in members) {
@@ -63,23 +64,28 @@ class TakLxmfCarriage(private val rnsCore: RnsCore) {
      * could never pass, and every chat line arriving over LXMF was dropped as
      * a forgery -- found on the bench 2026-09-21.
      *
-     * A fragment is keyed on the member the carrier *proved* rather than on a
-     * destination hash, which is strictly better than the packet path can
-     * manage and costs nothing here.
+     * A fragment is keyed on the LXMF source hash, which LXMF has verified and
+     * which does not change from one message to the next.
      */
     suspend fun deliver(
         inbound: TakLxmf.Inbound,
         reassembler: CotReassembler,
         renderer: CotRenderer,
+        freshness: Freshness,
         deliver: suspend (ByteArray) -> Unit,
     ) {
         val signedBy = TakLxmf.memberForLxmf(rnsCore, inbound.sourceHash)
         if (TakPayload.kindOf(inbound.frame) == TakPayload.FRAGMENT_V1) {
+            // Keyed on the LXMF source hash, not on the member it resolves to.
+            // Resolution recalls an identity and can fail for one message and
+            // succeed for the next; on the bench that split one transfer
+            // across two keys and it never completed. The source hash is the
+            // same for every message one sender sends.
             val whole =
-                reassembler.feed(signedBy, inbound.frame, System.currentTimeMillis())
+                reassembler.feed(inbound.sourceHash, inbound.frame, System.currentTimeMillis())
                     ?: return
             Log.i(TAG, "reassembled ${whole.size} bytes over LXMF")
-            draw(whole, renderer, deliver)
+            draw(whole, renderer, freshness, deliver)
             return
         }
         when (val rendered = renderer.render(inbound, System.currentTimeMillis(), signedBy)) {
@@ -98,6 +104,7 @@ class TakLxmfCarriage(private val rnsCore: RnsCore) {
     private suspend fun draw(
         data: ByteArray,
         renderer: CotRenderer,
+        freshness: Freshness,
         deliver: suspend (ByteArray) -> Unit,
     ) {
         val payload =
@@ -113,6 +120,12 @@ class TakLxmfCarriage(private val rnsCore: RnsCore) {
                         return
                     }
             }
+        // An older version of this event can finish its retries, or come back
+        // from the propagation node, after a newer one landed.
+        if (!freshness.admit(payload)) {
+            Log.i(TAG, "dropped an older version that arrived late")
+            return
+        }
         deliver(payload.toByteArray(Charsets.UTF_8))
     }
 }
