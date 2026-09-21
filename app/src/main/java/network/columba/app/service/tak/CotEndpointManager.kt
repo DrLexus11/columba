@@ -42,6 +42,8 @@ import java.net.ServerSocket
 import java.net.Socket
 import javax.inject.Inject
 import javax.inject.Singleton
+import android.content.Context
+import dagger.hilt.android.qualifiers.ApplicationContext
 
 /**
  * The local CoT endpoint: ATAK connects to 127.0.0.1, never to anyone's IP.
@@ -69,6 +71,7 @@ import javax.inject.Singleton
 class CotEndpointManager
     @Inject
     constructor(
+        @ApplicationContext private val context: Context,
         private val settingsRepository: SettingsRepository,
         private val identityRepository: IdentityRepository,
         private val rnsCore: RnsCore,
@@ -201,6 +204,11 @@ class CotEndpointManager
          */
         private val inboxAnnouncer = InboxAnnouncer(identityRepository, rnsCore)
 
+        /** The team table on disk, so a restart does not leave this node blind. */
+        private val memberStore by lazy {
+            MemberTableStore(java.io.File(context.noBackupFilesDir, "tak_members.json"))
+        }
+
         fun start() {
             if (supervisor != null) return
             supervisor =
@@ -330,6 +338,9 @@ class CotEndpointManager
                     TakIdentity.NODE_ASPECTS,
                 ).orFail("could not claim a node address")
             val registry = TakMembership.Registry(keys.team, keys.secret, ownHash = node.hash)
+            memberStore.load(registry, System.currentTimeMillis()).takeIf { it > 0 }?.let {
+                Log.i(TAG, "Restored $it team member(s) from before the restart")
+            }
             return Session(
                 node = node,
                 keys = keys,
@@ -499,6 +510,7 @@ class CotEndpointManager
                         System.currentTimeMillis(),
                     )
                 if (arrival == null) return@collect
+                memberStore.save(session.registry)
                 if (arrival == TakMembership.Arrival.NEW) {
                     val claims = session.registry.describe(announceEvent.destinationHash)
                     Log.i(

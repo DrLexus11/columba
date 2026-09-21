@@ -1,5 +1,7 @@
 package network.columba.app.service.tak
 
+import network.columba.app.rns.api.util.hexToBytes
+import org.json.JSONObject
 import javax.crypto.Mac
 import javax.crypto.spec.SecretKeySpec
 
@@ -261,6 +263,61 @@ object TakMembership {
         private fun prune(now: Long) {
             members.entries.removeAll { now - it.value.heard > expiryMs }
         }
+
+        /**
+         * The table as JSON, to outlive a restart.
+         *
+         * Mirrors `tools/tak_membership.py` in structure, not in units: `heard`
+         * is milliseconds here and seconds there, and each side only ever reads
+         * its own file. The table lives in
+         * memory, so a node that restarts is blind to its team until somebody
+         * announces -- and announces are rare by design. Seen on the bench
+         * 2026-09-21: a bridge restarted just after the phone announced knew
+         * nobody, dropped the phone's positions and sent its own to no one,
+         * and both ATAKs showed the other offline.
+         */
+        fun snapshot(): String =
+            synchronized(lock) {
+                val table = JSONObject()
+                members.forEach { (key, entry) ->
+                    table.put(
+                        key,
+                        JSONObject()
+                            .put("callsign", entry.callsign)
+                            .put("role", entry.role)
+                            .put("heard", entry.heard),
+                    )
+                }
+                JSONObject().put("tag", tag.toHex()).put("members", table).toString()
+            }
+
+        /**
+         * Read back a [snapshot]. Returns how many members were restored.
+         *
+         * Nothing crosses a change of team or secret: the saved tag must be
+         * this registry's, or a node moved to another team would start out
+         * addressing the old one. Entries past expiry stay behind, so a node
+         * that was off for a day does not come back addressing people who have
+         * gone. Anything unreadable restores nothing.
+         */
+        fun restore(json: String, now: Long): Int =
+            runCatching {
+                val saved = JSONObject(json)
+                // hexToBytes throws on anything malformed, which runCatching
+                // turns into "restored nothing".
+                if (!constantTimeEquals(saved.getString("tag").hexToBytes(), tag)) return@runCatching 0
+                val table = saved.getJSONObject("members")
+                synchronized(lock) {
+                    table.keys().asSequence().count { key ->
+                        val entry = table.getJSONObject(key)
+                        val heard = entry.getLong("heard")
+                        val own = ownHash != null && key == ownHash.toHex()
+                        val keep = now - heard <= expiryMs && !own
+                        if (keep) members[key] = Entry(entry.optString("callsign"), entry.optString("role"), heard)
+                        keep
+                    }
+                }
+            }.getOrDefault(0)
 
         /** Destination hashes worth addressing, most recently heard first. */
         fun members(now: Long): List<ByteArray> =
