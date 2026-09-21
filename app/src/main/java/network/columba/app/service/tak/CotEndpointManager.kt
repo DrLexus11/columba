@@ -336,6 +336,7 @@ class CotEndpointManager
                 lxmf = TakLxmf.Carrier(rnsCore, rnsLxmf, nodeIdentity),
                 pipeline = CotOutbound(TakIdentity.uidFor(node.hash)),
                 registry = registry,
+                fragments = TakLxmfCarriage(rnsCore),
                 renderer =
                     CotRenderer(
                         registry = registry,
@@ -408,15 +409,11 @@ class CotEndpointManager
                             session.lxmf.frames().collect { inbound ->
                                 Log.i(
                                     TAG,
-                                    "TAK chat arrived over LXMF, ${inbound.frame.size} bytes",
+                                    "TAK frame arrived over LXMF, ${inbound.frame.size} bytes",
                                 )
-                                val rendered =
-                                    session.renderer.render(inbound, System.currentTimeMillis())
-                                if (rendered is CotRenderer.Rendered.Cot) {
-                                    deliver(rendered.xml.toByteArray(Charsets.UTF_8))
-                                } else {
-                                    Log.w(TAG, "LXMF frame not drawn: $rendered")
-                                }
+                                session.fragments.deliver(
+                                    inbound, session.reassembler, session.renderer, deliver,
+                                )
                             }
                         }
                     // The sender's tick, from LXMF's proof. See DeliveryTicks.
@@ -632,10 +629,19 @@ class CotEndpointManager
             // nine-line MEDEVAC never crossed. An ordinary event still comes
             // back as one frame and pays nothing for this.
             val frames = session.pipeline.frames(cotXml)
+            val now = System.currentTimeMillis()
             if (frames.size > 1) {
-                Log.i(TAG, "event too large for one packet; sending ${frames.size} fragments")
+                // Over LXMF, not as bare packets, and only if ATAK's share
+                // timer has not already sent us this exact drawing. See
+                // TakLxmfCarriage for why a fragment cannot take the
+                // cheap fan-out.
+                if (!session.repeats.isRepeat(cotXml, frames, now)) {
+                    Log.i(TAG, "event too large for one packet; sending ${frames.size} fragments")
+                    session.fragments.send(frames, session.registry, session.lxmf, now)
+                }
+            } else {
+                frames.forEach { fanOut(it, session) }
             }
-            frames.forEach { fanOut(it, session) }
         }
 
         /**
@@ -830,6 +836,11 @@ class CotEndpointManager
                 // merge itself into somebody else's transfer.
                 val data =
                     if (TakPayload.kindOf(packet.data) == TakPayload.FRAGMENT_V1) {
+                        // Keyed on the sender, which comes from the packet and
+                        // never from the frame: a peer that could choose its
+                        // own key could merge itself into somebody else's
+                        // transfer. The per-fragment line comes from the
+                        // reassembler's own observer.
                         session.reassembler.feed(
                             packet.destination.hash, packet.data, System.currentTimeMillis(),
                         )?.also {
@@ -944,6 +955,8 @@ class CotEndpointManager
             val pipeline: CotOutbound,
             val registry: TakMembership.Registry,
             val renderer: CotRenderer,
+            /** How an event too big for one packet travels, and arrives. */
+            val fragments: TakLxmfCarriage,
             /** Kept so the announce can be rebuilt around a new callsign. */
             val keys: Keys,
         ) {
@@ -967,7 +980,17 @@ class CotEndpointManager
             val proofs = ChatProofs()
 
             /** Fragments of events too big for one packet, until they are whole. */
-            val reassembler = CotReassembler()
+            val repeats = LargeEventGate()
+            val reassembler =
+                CotReassembler(
+                    observer = { index, count, held, elapsedMs ->
+                        Log.i(
+                            TAG,
+                            "fragment ${index + 1} of $count, $held held, " +
+                                "${elapsedMs}ms since the first",
+                        )
+                    },
+                )
 
             /**
              * Held events belong to this run, not to the process.

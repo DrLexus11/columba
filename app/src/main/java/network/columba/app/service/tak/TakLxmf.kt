@@ -135,8 +135,32 @@ object TakLxmf {
      * sender and we check the two agree -- and worthless without the check,
      * which is the whole of this function.
      */
-    fun senderIsAuthentic(sourceHash: ByteArray, claimedSenderId: Int): Boolean =
-        sourceHash.size >= 4 && TakMembership.senderIdFor(sourceHash) == claimedSenderId
+    fun senderIsAuthentic(signedBy: ByteArray?, claimedSenderId: Int): Boolean =
+        signedBy != null && signedBy.size >= 4 &&
+            TakMembership.senderIdFor(signedBy) == claimedSenderId
+
+    /**
+     * The TAK node destination an LXMF source hash belongs to, or null.
+     *
+     * An inbox and a TAK node are two destinations built from the same
+     * identity, so their hashes have nothing in common -- measured on the
+     * bench: one identity gave node `c4be0a5b...` and inbox `42f8f27a...`.
+     * Comparing an inbox hash against a sender id taken from a node hash
+     * therefore never matches, for any node, and every LXMF chat line was
+     * being dropped as a forgery. `tools/cot_bridge.py` does the recall; this
+     * is the half that was missing.
+     */
+    suspend fun memberForLxmf(rnsCore: RnsCore, sourceHash: ByteArray?): ByteArray? {
+        if (sourceHash == null || sourceHash.isEmpty()) return null
+        val identity = rnsCore.recallIdentity(sourceHash) ?: return null
+        return rnsCore.createDestination(
+            identity,
+            Direction.OUT,
+            DestinationType.SINGLE,
+            TakIdentity.NODE_APP,
+            TakIdentity.NODE_ASPECTS,
+        ).getOrNull()?.hash
+    }
 
     /**
      * What this endpoint sends and receives chat through.

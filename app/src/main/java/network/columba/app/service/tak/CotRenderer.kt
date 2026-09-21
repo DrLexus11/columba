@@ -69,7 +69,10 @@ class CotRenderer(
      * it.
      *
      * The sender id inside a frame is four bytes the sender chose for itself;
-     * the envelope's source hash is what LXMF authenticated. Rendering on the
+     * `signedBy` is the TAK node destination the carrier's authenticated
+     * source hash resolves to. It has to be resolved rather than compared
+     * directly: an inbox and a node are different destinations built from the
+     * same identity, so their hashes share nothing. Rendering on the
      * claim alone let any LXMF sender at all -- no fleet secret, no membership
      * -- put words on an operator's screen under a member's name, needing only
      * four bytes of that member's destination hash, which every announce
@@ -79,9 +82,9 @@ class CotRenderer(
      * it arrives on this node's own destination. Hence two entry points rather
      * than one that sometimes checks.
      */
-    fun render(inbound: TakLxmf.Inbound, now: Long): Rendered {
+    fun render(inbound: TakLxmf.Inbound, now: Long, signedBy: ByteArray?): Rendered {
         val claimed = CotChat.decode(inbound.frame)?.senderId
-        if (claimed == null || !TakLxmf.senderIsAuthentic(inbound.sourceHash, claimed)) {
+        if (claimed == null || !TakLxmf.senderIsAuthentic(signedBy, claimed)) {
             Log.w(TAG, "LXMF chat frame does not match its sender, not shown")
             return Rendered.Handled
         }

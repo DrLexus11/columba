@@ -14,6 +14,7 @@ package network.columba.app.service.tak
 class CotReassembler(
     private val timeoutMs: Long = CotFragment.REASSEMBLY_TIMEOUT_MS,
     private val maxTransfers: Int = MAX_TRANSFERS,
+    private val observer: ((index: Int, count: Int, held: Int, elapsedMs: Long) -> Unit)? = null,
 ) {
     companion object {
         /** A node that never completes a transfer must not grow this forever. */
@@ -39,6 +40,11 @@ class CotReassembler(
         val key = (sender?.joinToString("") { "%02x".format(it) } ?: "") to part.transferId
         val entry = entryFor(key, part, now) ?: return null
         entry.slices[part.index] = part.slice
+        // Elapsed since the *first* fragment of this transfer, which is the
+        // number the timeout is measured against. A transfer that never
+        // completes is otherwise silent: every fragment arrives, the event
+        // never does, and nothing says which of the two halves lost it.
+        observer?.invoke(part.index, part.count, entry.slices.size, now - entry.first)
         return if (entry.slices.size < part.count) {
             null
         } else {

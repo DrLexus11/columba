@@ -34,6 +34,18 @@ class CotFragmentTest {
         assertEquals(fixture.getInt("kind"), TakPayload.FRAGMENT_V1)
         assertEquals(fixture.getInt("header_bytes"), CotFragment.HEADER_BYTES)
         assertEquals(fixture.getInt("max_fragment_bytes"), CotFragment.MAX_FRAGMENT_BYTES)
+        assertEquals(
+            fixture.getInt("max_fragment_frame_bytes"),
+            CotFragment.MAX_FRAGMENT_FRAME_BYTES,
+        )
+        // The bound that matters: a fragment travels as an LXMF message, and
+        // the envelope costs a measured 107 bytes on the air. Sized against
+        // the 383 B bare-packet MDU instead, every fragment became a Resource
+        // over its own Link.
+        assertTrue(
+            CotFragment.MAX_FRAGMENT_FRAME_BYTES + CotFragment.LXMF_ENVELOPE_BYTES <=
+                CotTier2.MAX_FRAME_BYTES,
+        )
         assertEquals(fixture.getInt("max_fragments"), CotFragment.MAX_FRAGMENTS)
         assertEquals(
             fixture.getLong("reassembly_timeout_seconds") * 1000,
@@ -92,15 +104,20 @@ class CotFragmentTest {
         val mine = CotFragment.fragments(ByteArray(700) { 0x41 }, transferId = 7)
         val theirs = CotFragment.fragments(ByteArray(700) { 0x42 }, transferId = 7)
         val reassembler = CotReassembler()
-        assertNull(reassembler.feed(sender, mine[0], now = 1_000))
-        assertNull(reassembler.feed(other, theirs[0], now = 1_000))
+        // Interleaved, every fragment but the last. How many that is depends
+        // on the fragment size, which is set by the LXMF envelope -- so the
+        // test does not hard-code it.
+        for (index in 0 until mine.size - 1) {
+            assertNull(reassembler.feed(sender, mine[index], now = 1_000))
+            assertNull(reassembler.feed(other, theirs[index], now = 1_000))
+        }
         assertTrue(
             ByteArray(700) { 0x41 }
-                .contentEquals(reassembler.feed(sender, mine[1], now = 1_000)),
+                .contentEquals(reassembler.feed(sender, mine.last(), now = 1_000)),
         )
         assertTrue(
             ByteArray(700) { 0x42 }
-                .contentEquals(reassembler.feed(other, theirs[1], now = 1_000)),
+                .contentEquals(reassembler.feed(other, theirs.last(), now = 1_000)),
         )
     }
 
@@ -135,5 +152,41 @@ class CotFragmentTest {
         val frame = ByteArray(20)
         frame[0] = TakPayload.FRAGMENT_V1.toByte()
         assertNull(CotFragment.decode(frame))
+    }
+    @Test
+    fun `the observer reports every fragment, measured from the first`() {
+        // The seam that lets a slow transfer be watched while it is still
+        // slow. Elapsed is from the first fragment, not the previous one:
+        // the timeout is measured against the first, so reporting gaps would
+        // answer a question nobody asked.
+        val seen = mutableListOf<List<Long>>()
+        val reassembler =
+            CotReassembler(
+                observer = { index, count, held, elapsedMs ->
+                    seen += listOf(index.toLong(), count.toLong(), held.toLong(), elapsedMs)
+                },
+            )
+        val frames = CotFragment.fragments(ByteArray(900) { 7 }, transferId = 11)
+        frames.forEachIndexed { index, frame ->
+            reassembler.feed(sender, frame, 1_000L + index * 10_000L)
+        }
+
+        // Every fragment reported, the last one included -- it closes the
+        // transfer and carries the elapsed time worth reading.
+        assertEquals(frames.size, seen.size)
+        assertEquals(0L, seen[0][3])
+        assertEquals(10_000L, seen[1][3])
+        assertEquals(frames.size.toLong(), seen.last()[2])
+    }
+
+    @Test
+    fun `a reassembler without an observer still works`() {
+        // The default path is the one that runs in the field.
+        val frames = CotFragment.fragments(ByteArray(900) { 7 }, transferId = 12)
+        val plain = CotReassembler()
+        var whole: ByteArray? = null
+        frames.forEach { whole = plain.feed(sender, it, 0L) ?: whole }
+
+        assertEquals(900, whole?.size)
     }
 }

@@ -34,8 +34,36 @@ package network.columba.app.service.tak
 object CotFragment {
     const val HEADER_BYTES = 7
 
-    /** What one fragment may carry, so the whole frame fits one packet. */
-    const val MAX_FRAGMENT_BYTES = CotTier2.MAX_FRAME_BYTES - HEADER_BYTES
+    /**
+     * The envelope LXMF puts around one frame, measured on the bench.
+     *
+     * A fragment does not travel as a bare packet -- it travels as an LXMF
+     * message, because that is the only thing that gives it a proof and a
+     * retry. Measured 2026-09-21 against LXMF 1.1.1, the envelope is a
+     * constant 107 bytes on the air.
+     */
+    const val LXMF_ENVELOPE_BYTES = 107
+
+    /** Headroom for fields a message may yet carry: a ticket, a stamp. */
+    const val LXMF_HEADROOM_BYTES = 20
+
+    /**
+     * What one fragment frame may be, so it fits ONE LXMF message in ONE
+     * packet.
+     *
+     * **Not 383.** That is the bare-packet MDU and it is not this frame's
+     * budget. A 383 B fragment packs to 490 B on the air, and at 309 B LXMF
+     * stops using a packet at all and builds a Resource over a Link -- one
+     * link handshake per fragment, on a path where establishment was measured
+     * at 5 of 15 when the channel was busy. Strictly worse than the single
+     * Resource this scheme exists to avoid, and it would have looked like tier
+     * 3 working.
+     */
+    const val MAX_FRAGMENT_FRAME_BYTES =
+        CotTier2.MAX_FRAME_BYTES - LXMF_ENVELOPE_BYTES - LXMF_HEADROOM_BYTES
+
+    /** What one fragment may carry. */
+    const val MAX_FRAGMENT_BYTES = MAX_FRAGMENT_FRAME_BYTES - HEADER_BYTES
 
     /**
      * A transfer is at most this many fragments.
