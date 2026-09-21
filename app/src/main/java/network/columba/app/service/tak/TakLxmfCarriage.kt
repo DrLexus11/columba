@@ -72,6 +72,7 @@ class TakLxmfCarriage(private val rnsCore: RnsCore) {
         reassembler: CotReassembler,
         renderer: CotRenderer,
         freshness: Freshness,
+        pending: PendingAttribution,
         deliver: suspend (ByteArray) -> Unit,
     ) {
         val signedBy = TakLxmf.memberForLxmf(rnsCore, inbound.sourceHash)
@@ -90,6 +91,14 @@ class TakLxmfCarriage(private val rnsCore: RnsCore) {
         }
         when (val rendered = renderer.render(inbound, System.currentTimeMillis(), signedBy)) {
             is CotRenderer.Rendered.Cot -> deliver(rendered.xml.toByteArray(Charsets.UTF_8))
+            // From a sender not yet in the team table: held, not dropped, and
+            // its announce asked for now rather than waited for. LXMF has
+            // already proved who sent it, so there is somebody to ask.
+            CotRenderer.Rendered.Unattributed -> {
+                pending.hold(inbound.frame, System.currentTimeMillis())
+                signedBy?.let { rnsCore.requestPath(it) }
+                Log.i(TAG, "Held a frame from a sender not yet known; asked for its announce")
+            }
             else -> Log.w(TAG, "LXMF frame not drawn: $rendered")
         }
     }
@@ -110,7 +119,9 @@ class TakLxmfCarriage(private val rnsCore: RnsCore) {
         val payload =
             when (val rendered = renderer.render(data, System.currentTimeMillis())) {
                 is CotRenderer.Rendered.Cot -> rendered.xml
-                CotRenderer.Rendered.Handled -> return
+                // A reassembled event is tier 2; chat and markers are never
+                // big enough to be cut up, so there is nothing here to hold.
+                CotRenderer.Rendered.Handled, CotRenderer.Rendered.Unattributed -> return
                 CotRenderer.Rendered.NotOurs ->
                     try {
                         CotTier2.decode(data)

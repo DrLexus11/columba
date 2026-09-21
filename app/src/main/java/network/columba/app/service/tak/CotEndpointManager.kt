@@ -425,7 +425,7 @@ class CotEndpointManager
                                 )
                                 session.fragments.deliver(
                                     inbound, session.reassembler, session.renderer,
-                                    session.freshness, deliver,
+                                    session.freshness, session.pending, deliver,
                                 )
                             }
                         }
@@ -519,6 +519,16 @@ class CotEndpointManager
                             TakIdentity.uidFor(announceEvent.destinationHash),
                     )
                     publishState(session, clientsLock.withLock { clients.size })
+                    // Anything that arrived before this member could be named
+                    // is drawn now, instead of having been dropped.
+                    val now = System.currentTimeMillis()
+                    session.pending.ready(session.registry, now).forEach { raw ->
+                        (session.renderer.render(raw, now) as? CotRenderer.Rendered.Cot)?.let {
+                            val bytes = it.xml.toByteArray(Charsets.UTF_8)
+                            session.replay.hold(bytes, now)
+                            writeToClients(bytes, held = true)
+                        }
+                    }
                 }
                 // Say who we are back -- to whoever just announced, not only to
                 // a member that is new to us.
@@ -883,6 +893,12 @@ class CotEndpointManager
                         // tier 2 here would put a frame we just declined onto
                         // the map by another route.
                         CotRenderer.Rendered.Handled -> return@collect
+                        // From a sender not yet in the team table: held, and
+                        // drawn when they announce. See PendingAttribution.
+                        CotRenderer.Rendered.Unattributed -> {
+                            session.pending.hold(data, System.currentTimeMillis())
+                            return@collect
+                        }
                         CotRenderer.Rendered.NotOurs ->
                             try {
                                 CotTier2.decode(data)
@@ -1012,6 +1028,9 @@ class CotEndpointManager
 
             /** Never draw a version older than one already drawn. */
             val freshness = Freshness()
+
+            /** Chat and markers from a sender not yet known, until they are. */
+            val pending = PendingAttribution()
             val reassembler =
                 CotReassembler(
                     observer = { index, count, held, elapsedMs ->

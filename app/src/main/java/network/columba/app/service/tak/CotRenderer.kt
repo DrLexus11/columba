@@ -39,6 +39,13 @@ class CotRenderer(
 
         /** Not one of our codecs. The caller tries tier 2. */
         data object NotOurs : Rendered
+
+        /**
+         * Ours, from a sender this node cannot name *yet*. The caller holds it
+         * and renders it again once that sender announces; see
+         * PendingAttribution for what dropping it cost on the bench.
+         */
+        data object Unattributed : Rendered
     }
 
     companion object {
@@ -116,10 +123,10 @@ class CotRenderer(
     /** A peer's marker. */
     private fun marker(raw: ByteArray, now: Long): Rendered {
         val marker = CotMarker.decode(raw) ?: return Rendered.NotOurs
-        // A marker from a node this team has never heard announce. Drawing it
-        // under an invented identity puts an object on the map nobody can be
-        // asked about.
-        val sender = registry.resolveSenderId(marker.senderId, now) ?: return Rendered.Handled
+        // A marker from a node this team has not heard announce -- yet. Drawing
+        // it under an invented identity puts an object on the map nobody can
+        // be asked about, so it waits for the announce instead.
+        val sender = registry.resolveSenderId(marker.senderId, now) ?: return Rendered.Unattributed
         return Rendered.Cot(
             CotMarker.buildMarkerCot(
                 marker,
@@ -152,7 +159,9 @@ class CotRenderer(
         val sender = registry.resolveSenderId(message.senderId, now)
         if (!forUs || sender == null) {
             if (!forUs) Log.i(TAG, "Direct chat addressed to another member, not shown")
-            return Rendered.Handled
+            // Not yet named is not the same as not ours: it waits, where a
+            // line addressed to somebody else is simply not shown.
+            return if (forUs) Rendered.Unattributed else Rendered.Handled
         }
         return Rendered.Cot(
             CotChat.buildChatCot(
