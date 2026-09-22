@@ -407,6 +407,8 @@ class CotEndpointManager
                         session.replay.hold(bytes, System.currentTimeMillis())
                         writeToClients(bytes, held = true)
                     }
+                    val files = TakFileTransfers.inDirectory(context.noBackupFilesDir, rnsCore, session.lxmf, deliver)
+                    val fileJobs = files.start(this)
                     val fromLxmf =
                         launch {
                             session.lxmf.frames().collect { inbound ->
@@ -414,9 +416,15 @@ class CotEndpointManager
                                     TAG,
                                     "TAK frame arrived over LXMF, ${inbound.frame.size} bytes",
                                 )
+                                if (files.takeFile(inbound)) return@collect
+                                // A file notice is held until its file is here,
+                                // so ATAK is never offered what it cannot fetch.
+                                val toAtak: suspend (ByteArray) -> Unit = { bytes ->
+                                    if (!files.intercept(bytes, inbound.sourceHash)) deliver(bytes)
+                                }
                                 session.fragments.deliver(
                                     inbound, session.reassembler, session.renderer,
-                                    session.freshness, session.pending, deliver,
+                                    session.freshness, session.pending, toAtak,
                                 )
                             }
                         }
@@ -445,6 +453,7 @@ class CotEndpointManager
                         }
                     } finally {
                         live = null
+                        fileJobs.forEach { it.cancel() }
                         beacon.cancel()
                         fromProofs.cancel()
                         fromAnnounces.cancel()

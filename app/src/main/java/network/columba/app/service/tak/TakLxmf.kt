@@ -189,23 +189,15 @@ object TakLxmf {
          *   to, which is how a sender draws its own tick instead of waiting
          *   for the far ATAK to send one back across the mesh.
          */
-        suspend fun send(memberHash: ByteArray, frame: ByteArray, text: String): String? {
-            val peerIdentity = rnsCore.recallIdentity(memberHash) ?: return null
-            // The peer's inbox, derived from the identity we already hold.
-            // Nothing extra is announced for this: the TAK node destination
-            // and the LXMF inbox are built from the same identity, so knowing
-            // a peer well enough to address their node is knowing them well
-            // enough to address their inbox. Pivot 1 paying for itself again.
-            val inbox =
-                rnsCore.createDestination(
-                    peerIdentity,
-                    Direction.OUT,
-                    DestinationType.SINGLE,
-                    LXMF_APP_NAME,
-                    LXMF_DELIVERY_ASPECTS,
-                ).getOrNull() ?: return null
+        suspend fun send(
+            memberHash: ByteArray,
+            frame: ByteArray,
+            text: String,
+            propagate: Boolean = true,
+        ): String? {
+            val inbox = inboxFor(memberHash) ?: return null
             return rnsLxmf.sendLxmfMessageWithMethod(
-                destinationHash = inbox.hash,
+                destinationHash = inbox,
                 // Content is for the human; the field is the protocol. The
                 // same line therefore lands in the recipient's Columba
                 // conversation as well as their ATAK.
@@ -215,9 +207,31 @@ object TakLxmf {
                 // propagation fallback without a handshake for each cold
                 // conversation. LXMF promotes oversized payloads to DIRECT.
                 deliveryMethod = DeliveryMethod.OPPORTUNISTIC,
-                tryPropagationOnFail = true,
+                // A file request is not left at a propagation node: answered
+                // later, it would bring the file over whatever path exists
+                // then, which may be the LoRa leg the fetch gate avoided.
+                tryPropagationOnFail = propagate,
                 extraFields = extraFields(frame),
             ).getOrNull()?.messageHash?.toHexString()
+        }
+
+        /**
+         * A member's LXMF inbox, derived from the identity we already hold.
+         *
+         * Nothing extra is announced for this: the TAK node destination and
+         * the LXMF inbox are built from the same identity, so knowing a peer
+         * well enough to address their node is knowing them well enough to
+         * address their inbox. Pivot 1 paying for itself again.
+         */
+        suspend fun inboxFor(memberHash: ByteArray): ByteArray? {
+            val peerIdentity = rnsCore.recallIdentity(memberHash) ?: return null
+            return rnsCore.createDestination(
+                peerIdentity,
+                Direction.OUT,
+                DestinationType.SINGLE,
+                LXMF_APP_NAME,
+                LXMF_DELIVERY_ASPECTS,
+            ).getOrNull()?.hash
         }
 
         private fun ByteArray.toHexString(): String =
