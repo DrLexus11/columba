@@ -204,13 +204,30 @@ class CotVersions(
         this.scope = scope
     }
 
+    /**
+     * Offer one version, sending it now, holding it for the trailing edge, or
+     * dropping it as superseded.
+     *
+     * [addressees] is who this version is for, null for the team. It is part
+     * of the key: one drawing shared with A and then with B is two streams of
+     * versions, and B's must not coalesce A's away.
+     */
     suspend fun submit(
         cotXml: String,
         frames: List<ByteArray>,
+        addressees: List<ByteArray>? = null,
         send: suspend (List<ByteArray>) -> Unit,
     ) {
         if (frames.isEmpty()) return
-        val uid = CotCoalesce.eventAttribute(cotXml, "uid")
+        val uid =
+            CotCoalesce.eventAttribute(cotXml, "uid")?.let { eventUid ->
+                if (addressees == null) {
+                    eventUid
+                } else {
+                    eventUid + "\u0000" +
+                        addressees.map { hash -> hash.joinToString("") { "%02x".format(it) } }.sorted().joinToString(",")
+                }
+            }
         val offer =
             if (uid == null) {
                 LatestWins.Offer(LatestWins.Decision.SEND)

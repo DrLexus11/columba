@@ -26,7 +26,8 @@ class TakLxmfCarriage(private val rnsCore: RnsCore) {
     }
 
     /**
-     * Send every fragment of one event to every member, over LXMF.
+     * Send every fragment of one event to every member, or to [recipients],
+     * over LXMF.
      *
      * A peer the carrier will not take is logged, not quietly downgraded to a
      * packet: sending unreliably while the caller believes otherwise is worse
@@ -37,9 +38,10 @@ class TakLxmfCarriage(private val rnsCore: RnsCore) {
         registry: TakMembership.Registry,
         lxmf: TakLxmf.Carrier,
         now: Long,
+        recipients: List<ByteArray>? = null,
     ) {
         Log.i(TAG, "event too large for one packet; sending ${frames.size} fragments")
-        val members = registry.members(now)
+        val members = recipients ?: registry.members(now)
         for (frame in frames) {
             for (memberHash in members) {
                 if (lxmf.send(memberHash, frame, "") == null) {

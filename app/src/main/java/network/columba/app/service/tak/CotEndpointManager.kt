@@ -660,14 +660,24 @@ class CotEndpointManager
             // event, and a version costs about 7.7 s of channel for a team of
             // seven. Latest wins; see CotCoalesce. A fragment goes over LXMF,
             // a single frame takes the cheap fan-out; see TakLxmfCarriage.
+            // Sent to the people ATAK named, not to the team, as markers are.
+            // A data package notice for one contact reached the whole team on
+            // the bench, 2026-09-22. Nobody on the team by that name is
+            // refused, not broadcast.
+            val recipients = MarkerAddressees.of(cotXml, session.registry, System.currentTimeMillis())
+            if (recipients != null && recipients.isEmpty()) {
+                Log.i(TAG, "Event addressed to nobody on this team; not sent, and not broadcast instead")
+                return
+            }
             val frames = session.pipeline.frames(cotXml)
-            session.versions.submit(cotXml, frames) { version ->
-                if (version.size > 1) {
-                    session.fragments.send(
-                        version, session.registry, session.lxmf, System.currentTimeMillis(),
-                    )
-                } else {
-                    fanOut(version[0], session)
+            session.versions.submit(cotXml, frames, recipients) { version ->
+                when {
+                    version.size > 1 ->
+                        session.fragments.send(
+                            version, session.registry, session.lxmf, System.currentTimeMillis(), recipients,
+                        )
+                    recipients == null -> fanOut(version[0], session)
+                    else -> recipients.forEach { sendTo(it, version[0]) }
                 }
             }
         }
