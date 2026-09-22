@@ -82,4 +82,50 @@ class PendingAttributionTest {
             )
         assertEquals(CotRenderer.Rendered.Handled, renderer.render(forSomeoneElse, 2_000))
     }
+
+    /**
+     * A frame held from LXMF names the node that proved it, and is released to
+     * that node alone -- compared on the whole hash.
+     *
+     * Releasing on the frame's four-byte sender id meant a signer whose prefix
+     * collided with a real member's was drawn under that member's name as soon
+     * as the member announced.
+     */
+    @Test
+    fun `a held frame is released to the node that proved it`() {
+        val pending = PendingAttribution()
+        pending.hold(chatFromDeck(), 1_000, signedBy = deck)
+
+        deckAnnounces(2_000)
+
+        assertEquals(1, pending.ready(registry, 3_000).size)
+    }
+
+    @Test
+    fun `a signer whose id collides with a member is not released as that member`() {
+        val pending = PendingAttribution()
+        // Same four-byte prefix as the deck, so the same claimed sender id --
+        // but a different node, which LXMF proved.
+        val impostor = deck.copyOf().also { it[15] = 0x7F }
+        assertEquals(TakMembership.senderIdFor(deck), TakMembership.senderIdFor(impostor))
+        pending.hold(chatFromDeck(), 1_000, signedBy = impostor)
+
+        deckAnnounces(2_000)
+
+        assertTrue(
+            "released under the deck's name on a four-byte match",
+            pending.ready(registry, 3_000).isEmpty(),
+        )
+    }
+
+    /** The packet path has no signer; it is released on membership as before. */
+    @Test
+    fun `a frame with no signer is released on membership alone`() {
+        val pending = PendingAttribution()
+        pending.hold(chatFromDeck(), 1_000)
+
+        deckAnnounces(2_000)
+
+        assertEquals(1, pending.ready(registry, 3_000).size)
+    }
 }

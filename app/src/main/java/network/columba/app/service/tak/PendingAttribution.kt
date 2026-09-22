@@ -33,13 +33,19 @@ class PendingAttribution(
             }
     }
 
-    private class Held(val at: Long, val raw: ByteArray)
+    /**
+     * One frame, and the node LXMF proved sent it if it came that way.
+     *
+     * [signedBy] is null for the packet path, which is authenticated by having
+     * arrived on this node's own destination rather than by a signature.
+     */
+    private class Held(val at: Long, val raw: ByteArray, val signedBy: ByteArray?)
 
     private val held = ArrayDeque<Held>()
 
     @Synchronized
-    fun hold(raw: ByteArray, now: Long) {
-        held.addLast(Held(now, raw.copyOf()))
+    fun hold(raw: ByteArray, now: Long, signedBy: ByteArray? = null) {
+        held.addLast(Held(now, raw.copyOf(), signedBy?.copyOf()))
         while (held.size > maxHeld) held.removeFirst()
     }
 
@@ -50,12 +56,29 @@ class PendingAttribution(
     @Synchronized
     fun ready(registry: TakMembership.Registry, now: Long): List<ByteArray> {
         held.removeAll { now - it.at > holdMs }
-        val released =
-            held.filter { entry ->
-                senderIdOf(entry.raw)?.let { registry.resolveSenderId(it, now) } != null
-            }
+        val released = held.filter { releasable(it, registry, now) }
         held.removeAll { it in released }
         return released.map { it.raw }
+    }
+
+    /**
+     * Whether a held frame can now be drawn, and drawn as its real sender.
+     *
+     * The team must be able to name the frame's claimed sender. For a frame
+     * that came over LXMF that is not enough on its own: the claim is four
+     * bytes, and the member it resolves to has to be the *same node* LXMF
+     * proved -- compared on the whole hash. Releasing on the four-byte id
+     * alone meant a signer whose prefix collided with a real member's was
+     * drawn under that member's name once the member announced.
+     */
+    private fun releasable(
+        entry: Held,
+        registry: TakMembership.Registry,
+        now: Long,
+    ): Boolean {
+        val member =
+            senderIdOf(entry.raw)?.let { registry.resolveSenderId(it, now) } ?: return false
+        return entry.signedBy == null || member.contentEquals(entry.signedBy)
     }
 
     @Synchronized

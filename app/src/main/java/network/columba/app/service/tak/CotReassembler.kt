@@ -8,8 +8,13 @@ package network.columba.app.service.tak
  * **Keyed on the sender as well as the transfer id.** Two peers can pick the
  * same random id, and merging their fragments would produce a frame that
  * decodes to something neither of them sent -- which is worse than dropping
- * both. The sender comes from the packet, never from the frame: a peer that
- * could choose its own key could merge itself into somebody else's transfer.
+ * both. The sender is the LXMF source hash, which the carrier authenticated,
+ * never anything taken from the frame: a peer that could choose its own key
+ * could merge itself into somebody else's transfer.
+ *
+ * Only a carrier that authenticates its sender may feed this. The bare-packet
+ * path has no source at all, and once passed this node's own destination hash
+ * as "the sender" -- one key shared by every peer on the mesh.
  */
 class CotReassembler(
     private val timeoutMs: Long = CotFragment.REASSEMBLY_TIMEOUT_MS,
@@ -35,9 +40,14 @@ class CotReassembler(
     /** Take one fragment. Returns the whole payload, or null if not yet. */
     @Synchronized
     fun feed(sender: ByteArray?, frame: ByteArray, now: Long): ByteArray? {
-        val part = CotFragment.decode(frame) ?: return null
+        // No sender, no key: a shared empty key is the collision this class
+        // exists to prevent, so a caller without a proved source is refused
+        // along with a frame that is not a fragment.
+        val source = sender?.takeIf { it.isNotEmpty() }
+        val part = CotFragment.decode(frame)
+        if (source == null || part == null) return null
         expire(now)
-        val key = (sender?.joinToString("") { "%02x".format(it) } ?: "") to part.transferId
+        val key = source.joinToString("") { "%02x".format(it) } to part.transferId
         val entry = entryFor(key, part, now) ?: return null
         entry.slices[part.index] = part.slice
         // Elapsed since the *first* fragment of this transfer, which is the

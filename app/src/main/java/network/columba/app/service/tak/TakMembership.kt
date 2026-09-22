@@ -300,24 +300,48 @@ object TakMembership {
          * that was off for a day does not come back addressing people who have
          * gone. Anything unreadable restores nothing.
          */
-        fun restore(json: String, now: Long): Int =
-            runCatching {
-                val saved = JSONObject(json)
-                // hexToBytes throws on anything malformed, which runCatching
-                // turns into "restored nothing".
-                if (!constantTimeEquals(saved.getString("tag").hexToBytes(), tag)) return@runCatching 0
-                val table = saved.getJSONObject("members")
-                synchronized(lock) {
-                    table.keys().asSequence().count { key ->
-                        val entry = table.getJSONObject(key)
-                        val heard = entry.getLong("heard")
-                        val own = ownHash != null && key == ownHash.toHex()
-                        val keep = now - heard <= expiryMs && !own
-                        if (keep) members[key] = Entry(entry.optString("callsign"), entry.optString("role"), heard)
-                        keep
-                    }
+        fun restore(json: String, now: Long): Int {
+            // Parsed and validated in full before the registry is touched.
+            // Inserting inside the loop meant a bad entry partway through left
+            // everything before it restored while the call reported zero --
+            // and a key that was not a destination hash went straight into the
+            // table, where the next members() call threw from unHex() and the
+            // endpoint could not start. "Damaged restores nothing" has to mean
+            // nothing, all or none.
+            val staged = runCatching { stage(json, now) }.getOrNull() ?: return 0
+            synchronized(lock) { members.putAll(staged) }
+            return staged.size
+        }
+
+        /**
+         * Every entry of a snapshot worth keeping, or null if any of it is
+         * damaged. Throws on malformed JSON; the caller treats that the same.
+         */
+        private fun stage(json: String, now: Long): Map<String, Entry>? {
+            val saved = JSONObject(json)
+            // hexToBytes throws on anything malformed, which the caller turns
+            // into "restored nothing".
+            if (!constantTimeEquals(saved.getString("tag").hexToBytes(), tag)) return emptyMap()
+            val table = saved.getJSONObject("members")
+            val staged = LinkedHashMap<String, Entry>()
+            for (key in table.keys()) {
+                // A key is a destination hash or the snapshot is not ours to
+                // trust: one malformed key rejects the whole file.
+                if (!isDestinationKey(key)) return null
+                val entry = table.getJSONObject(key)
+                val heard = entry.getLong("heard")
+                val own = ownHash != null && key == ownHash.toHex()
+                if (now - heard <= expiryMs && !own) {
+                    staged[key] = Entry(entry.optString("callsign"), entry.optString("role"), heard)
                 }
-            }.getOrDefault(0)
+            }
+            return staged
+        }
+
+        /** Sixteen bytes as lower-case hex: the only shape a member key takes. */
+        private fun isDestinationKey(key: String): Boolean =
+            key.length == TakIdentity.DESTINATION_HASH_LENGTH * 2 &&
+                key.all { it in '0'..'9' || it in 'a'..'f' }
 
         /** Destination hashes worth addressing, most recently heard first. */
         fun members(now: Long): List<ByteArray> =

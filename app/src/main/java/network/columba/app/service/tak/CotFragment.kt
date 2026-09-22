@@ -130,7 +130,13 @@ object CotFragment {
      * that is not ours is not an error.
      */
     fun decode(frame: ByteArray): Part? {
+        // The upper bound is checked before anything is copied. Without it a
+        // peer could hand over a header that decodes perfectly and a slice of
+        // any size, which the reassembler then copies and holds for up to
+        // MAX_TRANSFERS transfers at once -- memory pressure bought for the
+        // price of one packet. Nothing this codec produces is larger.
         if (frame.size <= HEADER_BYTES ||
+            frame.size > MAX_FRAGMENT_FRAME_BYTES ||
             (frame[0].toInt() and 0xFF) != TakPayload.FRAGMENT_V1
         ) {
             return null

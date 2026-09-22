@@ -189,4 +189,70 @@ class CotFragmentTest {
 
         assertEquals(900, whole?.size)
     }
+
+    /**
+     * A fragment larger than the wire format allows is refused before anything
+     * is copied. A header that decodes perfectly with a slice of any size was
+     * otherwise copied and held for up to sixteen transfers at once.
+     */
+    @Test
+    fun `a fragment above the wire maximum is refused`() {
+        val oversized =
+            ByteArray(CotFragment.MAX_FRAGMENT_FRAME_BYTES + 1).also {
+                it[0] = TakPayload.FRAGMENT_V1.toByte()
+                it[6] = 1 // count 1, index 0: a header that is otherwise valid
+            }
+
+        assertNull(CotFragment.decode(oversized))
+    }
+
+    @Test
+    fun `a fragment at the wire maximum is accepted`() {
+        val atBound =
+            ByteArray(CotFragment.MAX_FRAGMENT_FRAME_BYTES).also {
+                it[0] = TakPayload.FRAGMENT_V1.toByte()
+                it[6] = 1
+            }
+
+        assertTrue(CotFragment.decode(atBound) != null)
+    }
+
+    /**
+     * Why the sender has to be the real one.
+     *
+     * The mesh path passed this node's own destination hash as "the sender",
+     * which is the same value for every peer -- so two peers whose random
+     * transfer ids met were merged into an event neither of them sent. This
+     * pins that shared key does exactly that; the fix is to never give the
+     * reassembler one.
+     */
+    @Test
+    fun `one shared key merges two peers into something neither sent`() {
+        val sharedKey = ByteArray(16) { 0x44 }
+        val mine = CotFragment.fragments(ByteArray(700) { 0x41 }, transferId = 7)
+        val theirs = CotFragment.fragments(ByteArray(700) { 0x42 }, transferId = 7)
+        val reassembler = CotReassembler()
+
+        for (index in 0 until mine.size - 1) {
+            reassembler.feed(sharedKey, mine[index], now = 1_000)
+            reassembler.feed(sharedKey, theirs[index], now = 1_000)
+        }
+        val merged = reassembler.feed(sharedKey, mine.last(), now = 1_000)
+
+        assertTrue(
+            "a shared key produced one peer's payload intact -- it should corrupt",
+            merged == null || !merged.contentEquals(ByteArray(700) { 0x41 }),
+        )
+    }
+
+    /** No proved sender, no reassembly: an empty key is that shared key. */
+    @Test
+    fun `a fragment with no sender is refused`() {
+        val reassembler = CotReassembler()
+        val only = CotFragment.fragments(ByteArray(10) { 0x41 }, transferId = 9)
+
+        assertNull(reassembler.feed(null, only.single(), now = 1_000))
+        assertNull(reassembler.feed(ByteArray(0), only.single(), now = 1_000))
+        assertEquals(0, reassembler.pending())
+    }
 }

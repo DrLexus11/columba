@@ -50,10 +50,6 @@ class CotOutbound(val ourUid: String) {
 
     private val droppedCount = java.util.concurrent.atomic.AtomicLong()
 
-    /** Whether the last refusal was about size, and so worth cutting up. */
-    @Volatile
-    private var lastDropWasSize = false
-
     /**
      * The frame to put on the mesh, or null if this event should not go.
      *
@@ -106,10 +102,15 @@ class CotOutbound(val ourUid: String) {
      * undecodable payload all mean "do not send this", and fragmenting one
      * would put the same refusal on the air in pieces.
      */
-    fun frames(cotXml: String): List<ByteArray> {
-        frame(cotXml)?.let { return listOf(it) }
-        if (!lastDropWasSize) return emptyList()
-        return try {
+    fun frames(cotXml: String): List<ByteArray> =
+        when (val outcome = encode(cotXml)) {
+            is Outcome.Framed -> listOf(outcome.frame)
+            Outcome.TooLarge -> fragment(cotXml)
+            Outcome.Refused -> emptyList()
+        }
+
+    private fun fragment(cotXml: String): List<ByteArray> =
+        try {
             CotFragment.fragments(
                 CotTier2.encode(CotEvent.rewriteSelfUid(cotXml, atakUid, ourUid), bound = null),
             )
@@ -117,9 +118,30 @@ class CotOutbound(val ourUid: String) {
             droppedCount.incrementAndGet()
             emptyList()
         }
+
+    /**
+     * What one encode attempt came to.
+     *
+     * Returned rather than left in a field. One pipeline serves every ATAK
+     * socket, so a flag set by one call could be read by another's -- an
+     * oversized event dropped, or a refusal fragmented -- and the early returns
+     * never reset it at all: after one oversized event, the next *echo of our
+     * own report* read a stale "too large" and went on the air in pieces. The
+     * answer belongs to the call that produced it.
+     */
+    private sealed interface Outcome {
+        data class Framed(val frame: ByteArray) : Outcome
+
+        /** Refused for size alone, and so worth cutting up. */
+        data object TooLarge : Outcome
+
+        /** Malformed, our own echo, or undecodable: do not send at all. */
+        data object Refused : Outcome
     }
 
-    fun frame(cotXml: String): ByteArray? {
+    fun frame(cotXml: String): ByteArray? = (encode(cotXml) as? Outcome.Framed)?.frame
+
+    private fun encode(cotXml: String): Outcome {
         // Validated here rather than relied on downstream. rewriteSelfUid
         // returns early -- without parsing -- until an ATAK UID has been
         // learned, so before the first self-report of a session nothing else
@@ -129,7 +151,7 @@ class CotOutbound(val ourUid: String) {
             CotEvent.parse(cotXml)
         } catch (_: IllegalArgumentException) {
             droppedCount.incrementAndGet()
-            return null
+            return Outcome.Refused
         }
         // The echo guard comes first, before anything is learned from the
         // event. Our own self-report echoed back carries <takv> and is a
@@ -138,17 +160,15 @@ class CotOutbound(val ourUid: String) {
         // and none is ever rewritten again. The device would report itself as
         // ANDROID-xxxx to the whole team for the rest of the session, which is
         // the one outcome this pipeline exists to prevent.
-        if (CotEvent.isSelfAddressed(cotXml, ourUid)) return null
+        if (CotEvent.isSelfAddressed(cotXml, ourUid)) return Outcome.Refused
         observe(cotXml)
         return try {
-            lastDropWasSize = false
-            CotTier2.encode(CotEvent.rewriteSelfUid(cotXml, atakUid, ourUid))
+            Outcome.Framed(CotTier2.encode(CotEvent.rewriteSelfUid(cotXml, atakUid, ourUid)))
         } catch (error: IllegalArgumentException) {
+            droppedCount.incrementAndGet()
             // Only a size refusal is worth fragmenting; everything else here
             // is a decision not to send at all.
-            lastDropWasSize = error.message?.contains("tier 3") == true
-            droppedCount.incrementAndGet()
-            null
+            if (error.message?.contains("tier 3") == true) Outcome.TooLarge else Outcome.Refused
         }
     }
 }

@@ -101,6 +101,16 @@ class CotRenderer(
         return render(inbound.frame, now)
     }
 
+    /**
+     * Whether [hash] names a node on this team right now.
+     *
+     * Here because the renderer already holds the team table, and a carrier
+     * deciding whether to accept a frame at all needs exactly this question
+     * answered the same way the renderer answers it.
+     */
+    fun isCurrentMember(hash: ByteArray?, now: Long): Boolean =
+        hash != null && registry.isMember(hash, now)
+
     /** A peer's position report. */
     private fun position(raw: ByteArray, now: Long): Rendered {
         val fix = PositionCodec.decode(raw) ?: return Rendered.NotOurs

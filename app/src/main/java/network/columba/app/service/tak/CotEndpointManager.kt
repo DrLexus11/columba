@@ -868,24 +868,23 @@ class CotEndpointManager
                 if (!packet.destination.hash.contentEquals(session.node.hash)) return@collect
                 Log.i(TAG, "mesh packet for this node: ${packet.data.size} bytes, " +
                     "kind=${TakPayload.nameOf(packet.data)}")
-                // Keyed on the sender, which comes from the packet and never
-                // from the frame: a peer that could choose its own key could
-                // merge itself into somebody else's transfer.
-                val data =
-                    if (TakPayload.kindOf(packet.data) == TakPayload.FRAGMENT_V1) {
-                        // Keyed on the sender, which comes from the packet and
-                        // never from the frame: a peer that could choose its
-                        // own key could merge itself into somebody else's
-                        // transfer. The per-fragment line comes from the
-                        // reassembler's own observer.
-                        session.reassembler.feed(
-                            packet.destination.hash, packet.data, System.currentTimeMillis(),
-                        )?.also {
-                            Log.i(TAG, "reassembled a ${it.size} byte event from fragments")
-                        } ?: return@collect
-                    } else {
-                        packet.data
-                    }
+                // No fragment is reassembled from a bare packet. This path has
+                // no sender to key or attribute on: the packet API carries no
+                // source, and what was passed as "the sender" here was the
+                // packet's *destination* -- this node's own hash, identical for
+                // every peer. Every mesh transfer therefore shared one key, and
+                // two peers whose random transfer ids met were merged into an
+                // event neither of them sent. Worse, nothing here could check
+                // the sender was on the team at all.
+                //
+                // Nothing conforming sends one this way any more: a fragment is
+                // a whole LXMF message (see TakLxmfCarriage), which carries a
+                // proved source, is gated on membership and keyed per sender.
+                if (TakPayload.kindOf(packet.data) == TakPayload.FRAGMENT_V1) {
+                    Log.w(TAG, "fragment arrived as a bare packet; fragments travel over LXMF, refused")
+                    return@collect
+                }
+                val data = packet.data
                 val payload =
                     when (val rendered = session.renderer.render(data, System.currentTimeMillis())) {
                         is CotRenderer.Rendered.Cot -> rendered.xml

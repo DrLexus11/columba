@@ -77,6 +77,18 @@ class TakLxmfCarriage(private val rnsCore: RnsCore) {
     ) {
         val signedBy = TakLxmf.memberForLxmf(rnsCore, inbound.sourceHash)
         if (TakPayload.kindOf(inbound.frame) == TakPayload.FRAGMENT_V1) {
+            // Membership first, before a byte is held. Chat and markers check
+            // their sender against the one LXMF proved; a fragment carries no
+            // sender id of its own, and the event it reassembles into is drawn
+            // through the tier-2 fallback with no check at all. So any LXMF
+            // identity able to address this inbox could inject a whole event.
+            // Every fragment of a completed transfer shares one source hash --
+            // that is the reassembler's key -- so gating each fragment is what
+            // carries the check through to the reassembled event.
+            if (!renderer.isCurrentMember(signedBy, System.currentTimeMillis())) {
+                Log.w(TAG, "fragment from a sender not on this team, refused")
+                return
+            }
             // Keyed on the LXMF source hash, not on the member it resolves to.
             // Resolution recalls an identity and can fail for one message and
             // succeed for the next; on the bench that split one transfer
@@ -95,7 +107,9 @@ class TakLxmfCarriage(private val rnsCore: RnsCore) {
             // its announce asked for now rather than waited for. LXMF has
             // already proved who sent it, so there is somebody to ask.
             CotRenderer.Rendered.Unattributed -> {
-                pending.hold(inbound.frame, System.currentTimeMillis())
+                // With the node LXMF proved, so release is to that node and no
+                // other -- see PendingAttribution.releasable.
+                pending.hold(inbound.frame, System.currentTimeMillis(), signedBy)
                 signedBy?.let { rnsCore.requestPath(it) }
                 Log.i(TAG, "Held a frame from a sender not yet known; asked for its announce")
             }

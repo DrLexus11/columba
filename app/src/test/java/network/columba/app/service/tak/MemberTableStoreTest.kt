@@ -70,4 +70,55 @@ class MemberTableStoreTest {
         File(folder.root, "tak_members.json").writeText("{not json")
         assertEquals(0, store().load(registry(), 200))
     }
+
+    /** A snapshot with the right tag and one bad key, as it would be read back. */
+    private fun snapshotWith(extraKey: String): String {
+        val saved = registry()
+        saved.remember(lexus, TakMembership.memberPayload(team, secret, "LEXUS"), 1_000)
+        val json = org.json.JSONObject(saved.snapshot())
+        json.getJSONObject("members").put(
+            extraKey,
+            org.json.JSONObject().put("callsign", "BAD").put("role", "X").put("heard", 1_000),
+        )
+        return json.toString()
+    }
+
+    /**
+     * A key that is not a destination hash rejects the whole snapshot.
+     *
+     * It used to go straight into the table, where the next members() call
+     * threw from unHex() and the endpoint could not start.
+     */
+    @Test
+    fun `a non hex key restores nothing and leaves the table usable`() {
+        val restored = registry()
+
+        assertEquals(0, restored.restore(snapshotWith("not-a-destination-hash!!!!!!!!!"), 2_000))
+        // Would have thrown before.
+        assertTrue(restored.members(2_000).isEmpty())
+    }
+
+    @Test
+    fun `a key of the wrong length restores nothing`() {
+        val restored = registry()
+
+        assertEquals(0, restored.restore(snapshotWith("abcd"), 2_000))
+        assertTrue(restored.members(2_000).isEmpty())
+    }
+
+    /**
+     * All or none. Entries were inserted inside the loop, so a bad one partway
+     * through left the good ones before it restored while the call reported 0.
+     */
+    @Test
+    fun `a damaged snapshot does not restore the entries before the damage`() {
+        val restored = registry()
+
+        restored.restore(snapshotWith("zz".repeat(16)), 2_000)
+
+        assertTrue(
+            "a good entry survived a restore reported as nothing",
+            restored.members(2_000).none { it.contentEquals(lexus) },
+        )
+    }
 }
