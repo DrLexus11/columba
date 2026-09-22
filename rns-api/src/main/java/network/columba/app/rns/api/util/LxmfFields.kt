@@ -45,6 +45,13 @@ object LxmfFields {
     /** Audio payload `[mode, bytes]`. */
     const val FIELD_AUDIO = 0x07
 
+    /**
+     * Upstream LXMF's marker for an application payload (`FIELD_CUSTOM_TYPE`).
+     * What it names is the application's business; that it is there says the
+     * message is for an application, not for a human's conversation.
+     */
+    const val FIELD_CUSTOM_TYPE = 0xFB
+
     const val AM_CODEC2_700C = 0x03
     const val AM_CODEC2_1200 = 0x04
     const val AM_CODEC2_1300 = 0x05

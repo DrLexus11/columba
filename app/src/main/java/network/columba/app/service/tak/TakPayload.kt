@@ -25,6 +25,7 @@ object TakPayload {
     const val POSITION_V2 = 2
     const val CHAT_V1 = 3
     const val MARKER_V1 = 4
+    const val FRAGMENT_V1 = 5
 
     /**
      * Every kind that may appear as byte zero, and what produced it. A reader
@@ -38,6 +39,7 @@ object TakPayload {
             POSITION_V2 to "position-v2",
             CHAT_V1 to "chat-v1",
             MARKER_V1 to "marker-v1",
+            FRAGMENT_V1 to "fragment-v1",
         )
 
     /** The kind byte of a frame, or null if it is empty or unknown. */

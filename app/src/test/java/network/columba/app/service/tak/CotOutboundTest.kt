@@ -3,6 +3,7 @@ package network.columba.app.service.tak
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /** The three steps between ATAK and the mesh, and the order they happen in. */
@@ -105,5 +106,63 @@ class CotOutboundTest {
         outbound.frame(pli(atak))
         val frame = outbound.frame(marker)!!
         assertEquals(marker, CotTier2.decode(frame))
+    }
+
+    /**
+     * A marker whose remarks will not compress into one packet.
+     *
+     * Deterministic, so the test does not depend on luck: a fixed-seed
+     * sequence of letters defeats the tier-2 dictionary the way a real
+     * drawing's coordinates do.
+     */
+    private fun oversizedMarker(): String {
+        val random = java.util.Random(42)
+        val remarks = (1..900).map { ('a' + random.nextInt(26)) }.joinToString("")
+        return """<event uid="0b3c1a2d-4e5f-4a6b-8c7d-9e0f1a2b3c4d" type="a-h-G" """ +
+            """how="h-g-i-g-o" version="2.0"><point lat="40.954" lon="29.094" """ +
+            """hae="48.0" ce="9999999.0" le="9999999.0"/><detail>""" +
+            """<contact callsign="R.10.144053"/><remarks>$remarks</remarks>""" +
+            """</detail></event>"""
+    }
+
+    /**
+     * After one oversized event, our own echo is still refused -- not cut up
+     * and put on the air in pieces.
+     *
+     * The size refusal lived in a field. The echo guard returns early without
+     * resetting it, so the next event after an oversized one read a stale
+     * "too large" and was fragmented: our own report, sent back out. The
+     * answer now belongs to the call that produced it.
+     */
+    @Test
+    fun `an echo after an oversized event is refused, not fragmented`() {
+        val outbound = CotOutbound(ours)
+        outbound.frame(pli(atak))
+
+        val pieces = outbound.frames(oversizedMarker())
+        assertTrue("the oversized event should have been cut up", pieces.size > 1)
+
+        assertTrue(
+            "our own echo went out in pieces",
+            outbound.frames(pli(ours)).isEmpty(),
+        )
+    }
+
+    /** Malformed input after an oversized event is refused the same way. */
+    @Test
+    fun `malformed input after an oversized event is not fragmented`() {
+        val outbound = CotOutbound(ours)
+        outbound.frames(oversizedMarker())
+
+        assertTrue(outbound.frames("<not cot").isEmpty())
+    }
+
+    /** An ordinary event is still one frame, unaffected by what came before. */
+    @Test
+    fun `an ordinary event after an oversized one is one frame`() {
+        val outbound = CotOutbound(ours)
+        outbound.frames(oversizedMarker())
+
+        assertEquals(1, outbound.frames(pli(atak)).size)
     }
 }

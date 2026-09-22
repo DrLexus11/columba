@@ -46,3 +46,30 @@ fun ReceivedMessage.isUserVisibleChatMessage(): Boolean {
         false
     }
 }
+
+/**
+ * Whether an inbound LXMessage carries an application payload.
+ *
+ * True when `fields[0xFB]` ([LxmfFields.FIELD_CUSTOM_TYPE]) is present --
+ * upstream LXMF's own marker for "this is for an application". Such a message
+ * is emitted to observers **even with no visible content**, because an
+ * application frame need not carry any: a TAK drawing fragment is a few hundred
+ * bytes of payload and not one character of text.
+ *
+ * Before this, the emission gate was [isUserVisibleChatMessage] alone, and every
+ * content-less application message was dropped inside the backend before any
+ * application could see it. Measured on the bench 2026-09-21: every fragment of
+ * a drawing was proved delivered at the LXMF layer and not one reached TAK.
+ *
+ * **Consumers that render chat must still ask [isUserVisibleChatMessage]**
+ * before making a row, or an application frame becomes an empty bubble -- the
+ * exact failure the chat predicate above was written to stop.
+ */
+fun ReceivedMessage.carriesApplicationPayload(): Boolean {
+    val json = fieldsJson?.takeIf { it.isNotEmpty() } ?: return false
+    return try {
+        JSONObject(json).has(LxmfFields.FIELD_CUSTOM_TYPE.toString())
+    } catch (_: Exception) {
+        false
+    }
+}

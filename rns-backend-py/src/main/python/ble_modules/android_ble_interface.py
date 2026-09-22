@@ -39,6 +39,80 @@ if os.path.exists(_interfaces_dir) and _interfaces_dir not in sys.path:
 from BLEInterface import BLEInterface
 from drivers.android_ble_driver import AndroidBLEDriver
 
+import threading
+import time
+
+
+# How long an announce sent with no BLE peer connected is held for one to come
+# up, and how many are held. An announce is a node saying where it is; one that
+# waits two minutes is still true, one that waits ten may no longer be.
+HELD_ANNOUNCE_SECONDS = 120
+MAX_HELD_ANNOUNCES = 16
+
+_PACKET_TYPE_MASK = 0x03
+_ANNOUNCE = 0x01
+_HEADER_2 = 0x40
+_DESTINATION_BYTES = 16
+
+
+def announce_destination(data):
+    """The destination an announce is for, or None if `data` is not one.
+
+    Read straight off the Reticulum header: the packet type is the low two
+    bits of the flags byte, and the destination hash follows the hops byte --
+    after a transport id as well, for a HEADER_2 packet.
+    """
+    if not data or len(data) < 2 + _DESTINATION_BYTES:
+        return None
+    flags = data[0]
+    if flags & _PACKET_TYPE_MASK != _ANNOUNCE:
+        return None
+    start = 2 + _DESTINATION_BYTES if flags & _HEADER_2 else 2
+    if len(data) < start + _DESTINATION_BYTES:
+        return None
+    return bytes(data[start:start + _DESTINATION_BYTES])
+
+
+class HeldAnnounces:
+    """Announces handed to the interface while no peer could receive them.
+
+    Measured on the bench 2026-09-21: after a Columba restart the node's
+    announces went out "to 0 peer(s)" -- BLE had not reconnected yet -- and
+    were silently lost, and nothing re-sent them once the board came back. A
+    handset whose only way onto the mesh is one BLE board stayed unknown to
+    its team until its next scheduled announce, up to half an hour away.
+
+    Only the latest announce per destination is kept: a newer one supersedes
+    the older, and replaying both would say the same thing twice.
+    """
+
+    def __init__(self, hold_seconds=HELD_ANNOUNCE_SECONDS,
+                 max_held=MAX_HELD_ANNOUNCES, clock=time.monotonic):
+        self.hold_seconds = hold_seconds
+        self.max_held = max_held
+        self.clock = clock
+        self._lock = threading.Lock()
+        self._held = {}   # destination -> (when, data)
+
+    def hold(self, data):
+        """Keep `data` if it is an announce. True if it was kept."""
+        destination = announce_destination(data)
+        if destination is None:
+            return False
+        with self._lock:
+            self._held.pop(destination, None)
+            self._held[destination] = (self.clock(), bytes(data))
+            while len(self._held) > self.max_held:
+                del self._held[next(iter(self._held))]
+        return True
+
+    def release(self):
+        """Everything still worth sending, oldest first; the hold is emptied."""
+        now = self.clock()
+        with self._lock:
+            held, self._held = self._held, {}
+        return [data for when, data in held.values() if now - when <= self.hold_seconds]
+
 
 class AndroidBLEInterface(BLEInterface):
     """
@@ -61,6 +135,10 @@ class AndroidBLEInterface(BLEInterface):
             owner: The Reticulum Transport instance that owns this interface.
             config: A dictionary containing configuration options.
         """
+        # Before the parent constructor: it can start the driver, and anything
+        # sent from then on may need holding.
+        self._held_announces = HeldAnnounces()
+
         # Call parent constructor - it will use our driver_class
         super().__init__(owner, config)
 
@@ -88,6 +166,37 @@ class AndroidBLEInterface(BLEInterface):
         if hasattr(self, 'enable_peripheral'):
             RNS.log(f"  Peripheral: {'Enabled' if self.enable_peripheral else 'Disabled'}", RNS.LOG_INFO)
         RNS.log(f"  Max Peers: {self.max_peers}", RNS.LOG_INFO)
+
+    def process_outgoing(self, data):
+        """Send as the parent does, and hold an announce nobody could receive.
+
+        With no peer connected the parent hands the packet to nobody and it is
+        gone. An announce is kept so the first peer to connect still hears it.
+        """
+        if self.online and not self._any_peer_online():
+            if self._held_announces.hold(data):
+                RNS.log(f"{self} no BLE peer yet; holding an announce until one connects",
+                        RNS.LOG_DEBUG)
+        super().process_outgoing(data)
+
+    def _any_peer_online(self):
+        with self.peer_lock:
+            return any(peer.online for peer in self.spawned_interfaces.values())
+
+    def _spawn_peer_interface(self, *args, **kwargs):
+        """Bring a peer up as the parent does, then tell it what it missed.
+
+        Flushed after the parent returns, so the peer lock is not held across
+        the sends -- the parent documents the deadlock that would cause.
+        """
+        peer_if = super()._spawn_peer_interface(*args, **kwargs)
+        held = self._held_announces.release()
+        if held:
+            RNS.log(f"{self} peer up; sending {len(held)} announce(s) held while none was",
+                    RNS.LOG_INFO)
+            for data in held:
+                peer_if.process_outgoing(data)
+        return peer_if
 
     def get_rssi(self):
         """Get the RSSI of the most recently received message.

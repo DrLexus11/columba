@@ -220,18 +220,38 @@ class TakLxmfTest {
      * The envelope's identity is the only one here worth anything.
      *
      * The sender id inside a frame is four bytes the sender chose for itself;
-     * the source hash is what LXMF authenticated. Before these agreed had to
-     * be checked, any LXMF sender at all -- no fleet secret, no membership --
-     * could put words on an operator's screen under a member's name, needing
-     * only four bytes of that member's destination hash, which every announce
-     * publishes.
+     * the carrier's source hash is what LXMF authenticated. Before these agreed
+     * had to be checked, any LXMF sender at all -- no fleet secret, no
+     * membership -- could put words on an operator's screen under a member's
+     * name, needing only four bytes of that member's destination hash, which
+     * every announce publishes.
+     *
+     * **What this argument is takes care.** These tests passed a *node*
+     * destination hash while the endpoint passed the LXMF *inbox* hash, which
+     * is a different destination built from the same identity and shares no
+     * bytes with it. The check could therefore never pass in the field, and
+     * every chat line arriving over LXMF was dropped as a forgery, while the
+     * tests here went on agreeing with themselves. Measured on the bench,
+     * 2026-09-21: one identity, node `c4be0a5b...`, inbox `42f8f27a...`.
      */
     @Test
     fun `a frame is authentic only when its sender id matches the envelope`() {
-        val member = ByteArray(16) { (it + 1).toByte() }
-        val theirId = TakMembership.senderIdFor(member)
+        val node = ByteArray(16) { (it + 1).toByte() }
+        val theirId = TakMembership.senderIdFor(node)
 
-        assertTrue(TakLxmf.senderIsAuthentic(member, theirId))
+        assertTrue(TakLxmf.senderIsAuthentic(node, theirId))
+    }
+
+    /**
+     * An inbox that resolves to nobody vouches for nobody.
+     *
+     * `memberForLxmf` returns null when the identity cannot be recalled, and a
+     * null there must refuse rather than fall through to a comparison against
+     * whatever happened to be passed.
+     */
+    @Test
+    fun `an unresolved sender is not authentic`() {
+        assertFalse(TakLxmf.senderIsAuthentic(null, 0))
     }
 
     @Test

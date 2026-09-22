@@ -18,6 +18,7 @@ import network.columba.app.rns.api.model.NodeType
 import network.columba.app.rns.api.model.ReceivedMessage
 import network.columba.app.rns.api.model.ReceivedPacket
 import network.columba.app.rns.api.util.AppDataParser
+import network.columba.app.rns.api.util.carriesApplicationPayload
 import network.columba.app.rns.api.util.isUserVisibleChatMessage
 import network.columba.app.rns.api.util.LxmfFields
 import network.columba.app.rns.api.util.ReactionWireCodec
@@ -269,7 +270,10 @@ class PythonEventBridge {
             // implementation the Kotlin backend
             // (NativeRnsBackendImpl) calls — adding a new
             // user-visible field touches one place.
-            if (message.isUserVisibleChatMessage()) {
+            // An application payload is emitted with no visible content too;
+            // chat consumers skip it by the chat predicate. See
+            // `carriesApplicationPayload()` in :rns-api.
+            if (message.isUserVisibleChatMessage() || message.carriesApplicationPayload()) {
                 _messages.tryEmit(message)
             } else {
                 Log.d(

@@ -69,3 +69,54 @@ different size and risk from the rest of that review.
 Whether `releaseDestination` should be idempotent — the endpoint's `finally`
 can run after a backend restart has already discarded the registration, and
 throwing there would surface as a spurious teardown failure.
+
+---
+
+## Fragments from a not-yet-announced sender are refused, not held
+
+**Raised:** 2026-09-22, review of `feature/tak-tier3-fragments`
+**Severity:** lost events during cold start — a reliability cost taken for a security fix
+**Files:** `app/src/main/java/network/columba/app/service/tak/TakLxmfCarriage.kt`,
+`PendingAttribution.kt`, `CotReassembler.kt`
+
+### What happens
+
+A fragment arriving over LXMF is now refused unless its proven signer is a
+current team member. That closed an injection path: a fragment carries no sender
+id of its own, and the event it reassembles into was drawn through the tier-2
+fallback with no check at all, so any LXMF identity able to address the inbox
+could inject a whole event.
+
+The cost is a cold start. Membership is learned from announces, so for a while
+after a peer joins -- or after this node restarts -- the peer is proved by LXMF
+but not yet on the team table. A drawing or nine-line MEDEVAC sent in that window
+is refused fragment by fragment, and **LXMF does not resend it**: the transport
+already delivered it, so from LXMF's side nothing failed. The event is gone.
+
+Chat and markers do not have this problem. They go to `PendingAttribution`, are
+held with the proven signer, and are released to that exact node once it
+announces. Fragments bypass that path.
+
+### Why it was not fixed in that PR
+
+Holding a fragment transfer is not the same shape as holding a single frame.
+`PendingAttribution` holds complete frames keyed by the sender id each one
+claims; a fragment has no sender id, and a *transfer* is only meaningful once
+whole. Doing it properly means deciding where unverified partial state lives and
+how it is bounded -- the review was about closing the injection, and improvising
+the holding design inside that fix risked reopening it.
+
+### What a fix has to cover
+
+- Where an unverified transfer is held: inside `CotReassembler` behind a
+  "provisional" flag, or reassembled first and the *whole* event held in
+  `PendingAttribution` with its proven signer. The second reuses the release
+  rule that already exists and is probably the smaller change.
+- Bounds. An unverified sender must not be able to occupy the reassembler's
+  sixteen transfer slots and starve real members -- the provisional pool needs
+  its own, smaller cap.
+- Release must stay keyed on the **whole** proven signer hash, never on anything
+  the payload claims -- the same rule `PendingAttribution.releasable` applies.
+- Tests: a transfer from a peer that announces mid-transfer is drawn; one from a
+  peer that never announces is dropped when the hold expires; an unverified
+  sender cannot exhaust the verified pool.

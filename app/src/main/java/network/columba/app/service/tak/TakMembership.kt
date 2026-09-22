@@ -1,5 +1,7 @@
 package network.columba.app.service.tak
 
+import network.columba.app.rns.api.util.hexToBytes
+import org.json.JSONObject
 import javax.crypto.Mac
 import javax.crypto.spec.SecretKeySpec
 
@@ -261,6 +263,85 @@ object TakMembership {
         private fun prune(now: Long) {
             members.entries.removeAll { now - it.value.heard > expiryMs }
         }
+
+        /**
+         * The table as JSON, to outlive a restart.
+         *
+         * Mirrors `tools/tak_membership.py` in structure, not in units: `heard`
+         * is milliseconds here and seconds there, and each side only ever reads
+         * its own file. The table lives in
+         * memory, so a node that restarts is blind to its team until somebody
+         * announces -- and announces are rare by design. Seen on the bench
+         * 2026-09-21: a bridge restarted just after the phone announced knew
+         * nobody, dropped the phone's positions and sent its own to no one,
+         * and both ATAKs showed the other offline.
+         */
+        fun snapshot(): String =
+            synchronized(lock) {
+                val table = JSONObject()
+                members.forEach { (key, entry) ->
+                    table.put(
+                        key,
+                        JSONObject()
+                            .put("callsign", entry.callsign)
+                            .put("role", entry.role)
+                            .put("heard", entry.heard),
+                    )
+                }
+                JSONObject().put("tag", tag.toHex()).put("members", table).toString()
+            }
+
+        /**
+         * Read back a [snapshot]. Returns how many members were restored.
+         *
+         * Nothing crosses a change of team or secret: the saved tag must be
+         * this registry's, or a node moved to another team would start out
+         * addressing the old one. Entries past expiry stay behind, so a node
+         * that was off for a day does not come back addressing people who have
+         * gone. Anything unreadable restores nothing.
+         */
+        fun restore(json: String, now: Long): Int {
+            // Parsed and validated in full before the registry is touched.
+            // Inserting inside the loop meant a bad entry partway through left
+            // everything before it restored while the call reported zero --
+            // and a key that was not a destination hash went straight into the
+            // table, where the next members() call threw from unHex() and the
+            // endpoint could not start. "Damaged restores nothing" has to mean
+            // nothing, all or none.
+            val staged = runCatching { stage(json, now) }.getOrNull() ?: return 0
+            synchronized(lock) { members.putAll(staged) }
+            return staged.size
+        }
+
+        /**
+         * Every entry of a snapshot worth keeping, or null if any of it is
+         * damaged. Throws on malformed JSON; the caller treats that the same.
+         */
+        private fun stage(json: String, now: Long): Map<String, Entry>? {
+            val saved = JSONObject(json)
+            // hexToBytes throws on anything malformed, which the caller turns
+            // into "restored nothing".
+            if (!constantTimeEquals(saved.getString("tag").hexToBytes(), tag)) return emptyMap()
+            val table = saved.getJSONObject("members")
+            val staged = LinkedHashMap<String, Entry>()
+            for (key in table.keys()) {
+                // A key is a destination hash or the snapshot is not ours to
+                // trust: one malformed key rejects the whole file.
+                if (!isDestinationKey(key)) return null
+                val entry = table.getJSONObject(key)
+                val heard = entry.getLong("heard")
+                val own = ownHash != null && key == ownHash.toHex()
+                if (now - heard <= expiryMs && !own) {
+                    staged[key] = Entry(entry.optString("callsign"), entry.optString("role"), heard)
+                }
+            }
+            return staged
+        }
+
+        /** Sixteen bytes as lower-case hex: the only shape a member key takes. */
+        private fun isDestinationKey(key: String): Boolean =
+            key.length == TakIdentity.DESTINATION_HASH_LENGTH * 2 &&
+                key.all { it in '0'..'9' || it in 'a'..'f' }
 
         /** Destination hashes worth addressing, most recently heard first. */
         fun members(now: Long): List<ByteArray> =

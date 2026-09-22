@@ -39,6 +39,13 @@ class CotRenderer(
 
         /** Not one of our codecs. The caller tries tier 2. */
         data object NotOurs : Rendered
+
+        /**
+         * Ours, from a sender this node cannot name *yet*. The caller holds it
+         * and renders it again once that sender announces; see
+         * PendingAttribution for what dropping it cost on the bench.
+         */
+        data object Unattributed : Rendered
     }
 
     companion object {
@@ -69,7 +76,10 @@ class CotRenderer(
      * it.
      *
      * The sender id inside a frame is four bytes the sender chose for itself;
-     * the envelope's source hash is what LXMF authenticated. Rendering on the
+     * `signedBy` is the TAK node destination the carrier's authenticated
+     * source hash resolves to. It has to be resolved rather than compared
+     * directly: an inbox and a node are different destinations built from the
+     * same identity, so their hashes share nothing. Rendering on the
      * claim alone let any LXMF sender at all -- no fleet secret, no membership
      * -- put words on an operator's screen under a member's name, needing only
      * four bytes of that member's destination hash, which every announce
@@ -79,14 +89,27 @@ class CotRenderer(
      * it arrives on this node's own destination. Hence two entry points rather
      * than one that sometimes checks.
      */
-    fun render(inbound: TakLxmf.Inbound, now: Long): Rendered {
-        val claimed = CotChat.decode(inbound.frame)?.senderId
-        if (claimed == null || !TakLxmf.senderIsAuthentic(inbound.sourceHash, claimed)) {
-            Log.w(TAG, "LXMF chat frame does not match its sender, not shown")
+    fun render(inbound: TakLxmf.Inbound, now: Long, signedBy: ByteArray?): Rendered {
+        // A chat line, or a marker sent to this node in particular. Either way
+        // the frame's claimed sender must agree with the one LXMF proved, or
+        // any member could put words, or a pin, under another member's name.
+        val claimed = CotChat.decode(inbound.frame)?.senderId ?: CotMarker.decode(inbound.frame)?.senderId
+        if (claimed == null || !TakLxmf.senderIsAuthentic(signedBy, claimed)) {
+            Log.w(TAG, "LXMF frame does not match its sender, not shown")
             return Rendered.Handled
         }
         return render(inbound.frame, now)
     }
+
+    /**
+     * Whether [hash] names a node on this team right now.
+     *
+     * Here because the renderer already holds the team table, and a carrier
+     * deciding whether to accept a frame at all needs exactly this question
+     * answered the same way the renderer answers it.
+     */
+    fun isCurrentMember(hash: ByteArray?, now: Long): Boolean =
+        hash != null && registry.isMember(hash, now)
 
     /** A peer's position report. */
     private fun position(raw: ByteArray, now: Long): Rendered {
@@ -110,10 +133,10 @@ class CotRenderer(
     /** A peer's marker. */
     private fun marker(raw: ByteArray, now: Long): Rendered {
         val marker = CotMarker.decode(raw) ?: return Rendered.NotOurs
-        // A marker from a node this team has never heard announce. Drawing it
-        // under an invented identity puts an object on the map nobody can be
-        // asked about.
-        val sender = registry.resolveSenderId(marker.senderId, now) ?: return Rendered.Handled
+        // A marker from a node this team has not heard announce -- yet. Drawing
+        // it under an invented identity puts an object on the map nobody can
+        // be asked about, so it waits for the announce instead.
+        val sender = registry.resolveSenderId(marker.senderId, now) ?: return Rendered.Unattributed
         return Rendered.Cot(
             CotMarker.buildMarkerCot(
                 marker,
@@ -146,7 +169,9 @@ class CotRenderer(
         val sender = registry.resolveSenderId(message.senderId, now)
         if (!forUs || sender == null) {
             if (!forUs) Log.i(TAG, "Direct chat addressed to another member, not shown")
-            return Rendered.Handled
+            // Not yet named is not the same as not ours: it waits, where a
+            // line addressed to somebody else is simply not shown.
+            return if (forUs) Rendered.Unattributed else Rendered.Handled
         }
         return Rendered.Cot(
             CotChat.buildChatCot(

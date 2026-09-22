@@ -42,6 +42,8 @@ import java.net.ServerSocket
 import java.net.Socket
 import javax.inject.Inject
 import javax.inject.Singleton
+import android.content.Context
+import dagger.hilt.android.qualifiers.ApplicationContext
 
 /**
  * The local CoT endpoint: ATAK connects to 127.0.0.1, never to anyone's IP.
@@ -69,6 +71,7 @@ import javax.inject.Singleton
 class CotEndpointManager
     @Inject
     constructor(
+        @ApplicationContext private val context: Context,
         private val settingsRepository: SettingsRepository,
         private val identityRepository: IdentityRepository,
         private val rnsCore: RnsCore,
@@ -201,6 +204,11 @@ class CotEndpointManager
          */
         private val inboxAnnouncer = InboxAnnouncer(identityRepository, rnsCore)
 
+        /** The team table on disk, so a restart does not leave this node blind. */
+        private val memberStore by lazy {
+            MemberTableStore(java.io.File(context.noBackupFilesDir, "tak_members.json"))
+        }
+
         fun start() {
             if (supervisor != null) return
             supervisor =
@@ -330,12 +338,16 @@ class CotEndpointManager
                     TakIdentity.NODE_ASPECTS,
                 ).orFail("could not claim a node address")
             val registry = TakMembership.Registry(keys.team, keys.secret, ownHash = node.hash)
+            memberStore.load(registry, System.currentTimeMillis()).takeIf { it > 0 }?.let {
+                Log.i(TAG, "Restored $it team member(s) from before the restart")
+            }
             return Session(
                 node = node,
                 keys = keys,
                 lxmf = TakLxmf.Carrier(rnsCore, rnsLxmf, nodeIdentity),
                 pipeline = CotOutbound(TakIdentity.uidFor(node.hash)),
                 registry = registry,
+                fragments = TakLxmfCarriage(rnsCore),
                 renderer =
                     CotRenderer(
                         registry = registry,
@@ -391,6 +403,7 @@ class CotEndpointManager
                             "point ATAK at $BIND_HOST:$PORT, TCP, no SSL",
                     )
                     publishState(session, clientsLock.withLock { clients.size })
+                    session.versions.attach(this)
 
                     val fromMesh = launch { pumpMeshToClients(session) }
                     // The same renderer the packet path uses: a chat line is
@@ -408,15 +421,12 @@ class CotEndpointManager
                             session.lxmf.frames().collect { inbound ->
                                 Log.i(
                                     TAG,
-                                    "TAK chat arrived over LXMF, ${inbound.frame.size} bytes",
+                                    "TAK frame arrived over LXMF, ${inbound.frame.size} bytes",
                                 )
-                                val rendered =
-                                    session.renderer.render(inbound, System.currentTimeMillis())
-                                if (rendered is CotRenderer.Rendered.Cot) {
-                                    deliver(rendered.xml.toByteArray(Charsets.UTF_8))
-                                } else {
-                                    Log.w(TAG, "LXMF frame not drawn: $rendered")
-                                }
+                                session.fragments.deliver(
+                                    inbound, session.reassembler, session.renderer,
+                                    session.freshness, session.pending, deliver,
+                                )
                             }
                         }
                     // The sender's tick, from LXMF's proof. See DeliveryTicks.
@@ -500,6 +510,7 @@ class CotEndpointManager
                         System.currentTimeMillis(),
                     )
                 if (arrival == null) return@collect
+                memberStore.save(session.registry)
                 if (arrival == TakMembership.Arrival.NEW) {
                     val claims = session.registry.describe(announceEvent.destinationHash)
                     Log.i(
@@ -508,6 +519,16 @@ class CotEndpointManager
                             TakIdentity.uidFor(announceEvent.destinationHash),
                     )
                     publishState(session, clientsLock.withLock { clients.size })
+                    // Anything that arrived before this member could be named
+                    // is drawn now, instead of having been dropped.
+                    val now = System.currentTimeMillis()
+                    session.pending.ready(session.registry, now).forEach { raw ->
+                        (session.renderer.render(raw, now) as? CotRenderer.Rendered.Cot)?.let {
+                            val bytes = it.xml.toByteArray(Charsets.UTF_8)
+                            session.replay.hold(bytes, now)
+                            writeToClients(bytes, held = true)
+                        }
+                    }
                 }
                 // Say who we are back -- to whoever just announced, not only to
                 // a member that is new to us.
@@ -627,8 +648,24 @@ class CotEndpointManager
                     forwardChat(cotXml, session) ||
                     forwardMarker(cotXml, session)
             if (typed) return
-            val frame = session.pipeline.frame(cotXml) ?: return
-            fanOut(frame, session)
+            // Cut up rather than refused. An event over the one-packet bound
+            // used to be dropped outright, which is why drawings and a
+            // nine-line MEDEVAC never crossed. An ordinary event still comes
+            // back as one frame and pays nothing for this.
+            // An edited and re-sent drawing arrives as several versions of one
+            // event, and a version costs about 7.7 s of channel for a team of
+            // seven. Latest wins; see CotCoalesce. A fragment goes over LXMF,
+            // a single frame takes the cheap fan-out; see TakLxmfCarriage.
+            val frames = session.pipeline.frames(cotXml)
+            session.versions.submit(cotXml, frames) { version ->
+                if (version.size > 1) {
+                    session.fragments.send(
+                        version, session.registry, session.lxmf, System.currentTimeMillis(),
+                    )
+                } else {
+                    fanOut(version[0], session)
+                }
+            }
         }
 
         /**
@@ -764,7 +801,20 @@ class CotEndpointManager
                     return true
                 }
             }
-            fanOut(frame, session)
+            // Sent to somebody in particular goes to them alone, over LXMF so
+            // it is proved; see MarkerAddressees. The bare packet is the
+            // fallback for a peer whose identity cannot be recalled, as for
+            // addressed chat.
+            val recipients = MarkerAddressees.of(cotXml, session.registry, System.currentTimeMillis())
+            when {
+                recipients == null -> fanOut(frame, session)
+                recipients.isEmpty() ->
+                    Log.i(TAG, "Marker addressed to nobody on this team; not sent, and not broadcast instead")
+                else ->
+                    recipients.forEach { member ->
+                        if (session.lxmf.send(member, frame, "") == null) sendTo(member, frame)
+                    }
+            }
             return true
         }
 
@@ -818,25 +868,48 @@ class CotEndpointManager
                 if (!packet.destination.hash.contentEquals(session.node.hash)) return@collect
                 Log.i(TAG, "mesh packet for this node: ${packet.data.size} bytes, " +
                     "kind=${TakPayload.nameOf(packet.data)}")
+                // No fragment is reassembled from a bare packet. This path has
+                // no sender to key or attribute on: the packet API carries no
+                // source, and what was passed as "the sender" here was the
+                // packet's *destination* -- this node's own hash, identical for
+                // every peer. Every mesh transfer therefore shared one key, and
+                // two peers whose random transfer ids met were merged into an
+                // event neither of them sent. Worse, nothing here could check
+                // the sender was on the team at all.
+                //
+                // Nothing conforming sends one this way any more: a fragment is
+                // a whole LXMF message (see TakLxmfCarriage), which carries a
+                // proved source, is gated on membership and keyed per sender.
+                if (TakPayload.kindOf(packet.data) == TakPayload.FRAGMENT_V1) {
+                    Log.w(TAG, "fragment arrived as a bare packet; fragments travel over LXMF, refused")
+                    return@collect
+                }
+                val data = packet.data
                 val payload =
-                    when (val rendered = session.renderer.render(packet.data, System.currentTimeMillis())) {
+                    when (val rendered = session.renderer.render(data, System.currentTimeMillis())) {
                         is CotRenderer.Rendered.Cot -> rendered.xml
                         // Ours, and deliberately not drawn. Falling through to
                         // tier 2 here would put a frame we just declined onto
                         // the map by another route.
                         CotRenderer.Rendered.Handled -> return@collect
+                        // From a sender not yet in the team table: held, and
+                        // drawn when they announce. See PendingAttribution.
+                        CotRenderer.Rendered.Unattributed -> {
+                            session.pending.hold(data, System.currentTimeMillis())
+                            return@collect
+                        }
                         CotRenderer.Rendered.NotOurs ->
                             try {
-                                CotTier2.decode(packet.data)
+                                CotTier2.decode(data)
                             } catch (_: IllegalArgumentException) {
                                 // A frame we cannot read is ordinary: an older
                                 // node, a newer dictionary, or simply not ours.
                                 return@collect
-                            }
+                            }.takeIf { session.freshness.admit(it) } ?: return@collect
                     }
                 val bytes = payload.toByteArray(Charsets.UTF_8)
                 // Position is latest-wins and is not held; everything else is.
-                val keep = TakPayload.kindOf(packet.data) != TakPayload.POSITION_V2
+                val keep = TakPayload.kindOf(data) != TakPayload.POSITION_V2
                 if (keep) {
                     session.replay.hold(bytes, System.currentTimeMillis())
                 }
@@ -924,6 +997,8 @@ class CotEndpointManager
             val pipeline: CotOutbound,
             val registry: TakMembership.Registry,
             val renderer: CotRenderer,
+            /** How an event too big for one packet travels, and arrives. */
+            val fragments: TakLxmfCarriage,
             /** Kept so the announce can be rebuilt around a new callsign. */
             val keys: Keys,
         ) {
@@ -945,6 +1020,26 @@ class CotEndpointManager
              * this run owns rather than something handed to it.
              */
             val proofs = ChatProofs()
+
+            /** Fragments of events too big for one packet, until they are whole. */
+            /** Latest wins across repeated versions of one event. */
+            val versions = CotVersions()
+
+            /** Never draw a version older than one already drawn. */
+            val freshness = Freshness()
+
+            /** Chat and markers from a sender not yet known, until they are. */
+            val pending = PendingAttribution()
+            val reassembler =
+                CotReassembler(
+                    observer = { index, count, held, elapsedMs ->
+                        Log.i(
+                            TAG,
+                            "fragment ${index + 1} of $count, $held held, " +
+                                "${elapsedMs}ms since the first",
+                        )
+                    },
+                )
 
             /**
              * Held events belong to this run, not to the process.

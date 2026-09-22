@@ -90,6 +90,17 @@ class BleGattClient(
 
     // Active connections: address -> ConnectionData
     private val connections = mutableMapOf<String, ConnectionData>()
+
+    /**
+     * Retry counts for addresses between a status-133 failure and the retry.
+     *
+     * The count used to live only on the ConnectionData, which the 133 handler
+     * removes before scheduling the retry -- so writing the incremented count
+     * back afterwards found no entry and was lost. Every failure started again
+     * at attempt 1, MAX_CONNECTION_RETRIES was never reached, and a board was
+     * retried once a minute for ever. Held under [connectionsMutex].
+     */
+    private val pendingRetries = mutableMapOf<String, Int>()
     private val connectionsMutex = Mutex()
 
     // Track manual disconnects to prevent duplicate callbacks
@@ -265,6 +276,7 @@ class BleGattClient(
                             gatt = gatt,
                             address = address,
                             connectionJob = connectionJob,
+                            retryCount = pendingRetries[address] ?: 0,
                         )
                 }
 
@@ -444,6 +456,7 @@ class BleGattClient(
                 // Cancel timeout
                 connectionsMutex.withLock {
                     connections[address]?.connectionJob?.cancel()
+                    pendingRetries.remove(address)
                 }
 
                 // Request high connection priority for better stability and throughput
@@ -1052,12 +1065,21 @@ class BleGattClient(
         if (connData.retryCount < MAX_CONNECTION_RETRIES) {
             // Retry with exponential backoff
             val retryCount = connData.retryCount + 1
-            val backoffMs = BleConstants.CONNECTION_RETRY_BACKOFF_MS * (1L shl retryCount)
+            // Seconds, not minutes. Status 133 is Android's generic, usually
+            // transient, connection failure -- typically the previous link to
+            // the same board not yet released, as after an app restart. On a
+            // handset whose only way onto the mesh is this board, the old 30 s
+            // base (60 s, then 120 s, then 240 s) left the phone off the mesh
+            // for three minutes on the bench. Deliberately a separate base
+            // from CONNECTION_RETRY_BACKOFF_MS, which still governs blacklisting
+            // a device that keeps failing.
+            val backoffMs = BleConstants.GATT_133_RETRY_BASE_MS * (1L shl retryCount)
 
             Log.d(TAG, "Retrying connection to $address (attempt $retryCount/$MAX_CONNECTION_RETRIES) in ${backoffMs}ms")
 
             connectionsMutex.withLock {
                 connections.remove(address)
+                pendingRetries[address] = retryCount
             }
 
             scope.launch {
@@ -1068,14 +1090,12 @@ class BleGattClient(
                 }
             }
 
-            connectionsMutex.withLock {
-                connections[address]?.retryCount = retryCount
-            }
         } else {
             // Max retries exceeded
             Log.e(TAG, "Max connection retries exceeded for $address")
             connectionsMutex.withLock {
                 connections.remove(address)
+                pendingRetries.remove(address)
             }
             onConnectionFailed?.invoke(address, "GATT error 133: max retries exceeded")
         }
