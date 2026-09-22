@@ -21,6 +21,12 @@ import java.util.TimeZone
  */
 object TakFiles {
     const val HASH_BYTES = 32
+
+    /**
+     * The largest file stored or sent. A QuickPic measured 3,008,206 bytes on
+     * the bench; the LXMF router accepts this much in one transfer.
+     */
+    const val MAX_FILE_BYTES = 16_000_000
     private const val MAX_NAME_BYTES = 200
     const val FILESHARE_TYPE = "b-f-t-r"
 

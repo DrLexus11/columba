@@ -25,7 +25,7 @@ class TakFileStore(private val root: File) {
     @Synchronized
     fun put(data: ByteArray, name: String, expectedHash: String? = null): String? {
         val hash = TakFiles.sha256Hex(data)
-        if (expectedHash != null && expectedHash != hash) return null
+        if (data.size > TakFiles.MAX_FILE_BYTES || (expectedHash != null && expectedHash != hash)) return null
         val target = fileFor(hash)
         if (!target.isFile) {
             val part = File(root, "$hash.part")
