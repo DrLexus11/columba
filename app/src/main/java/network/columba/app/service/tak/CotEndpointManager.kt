@@ -157,6 +157,13 @@ class CotEndpointManager
             private const val POSITION_STALE_MS = 2 * CotPosition.DEFAULT_INTERVAL_MS
 
             /**
+             * How long ATAK may go without reporting before this handset
+             * reports in its place: the same two report floors after which a
+             * receiver would grey the track out.
+             */
+            const val ATAK_QUIET_MS = 2 * CotPosition.DEFAULT_INTERVAL_MS
+
+            /**
              * How long a rebuilt chat line stays on screen.
              *
              * A day, because a chat message is a thing somebody said rather
@@ -542,6 +549,7 @@ class CotEndpointManager
 
         private suspend fun serveClient(connection: Socket, session: Session) {
             TrafficStats.setThreadStatsTag(SOCKET_TAG)
+            session.atakConnectedAtMs = System.currentTimeMillis()
             val stream = CotStream()
             val buffer = ByteArray(READ_BUFFER)
             publishState(session, clientsLock.withLock { clients.add(connection); clients.size })
@@ -635,7 +643,12 @@ class CotEndpointManager
             // A new codec is a term in this expression rather than another
             // early return threaded through the routing.
             val typed =
-                CotPosition.isPosition(cotXml) && forwardPosition(cotXml, session) ||
+                // Only ATAK's own report -- the one carrying <takv> -- is this
+                // node's position. A friendly unit marker is position-shaped
+                // too, and taking it here moved the operator's track to
+                // wherever the marker was dropped; it is a marker.
+                CotPosition.isPosition(cotXml) && CotEvent.learnAtakUid(cotXml) != null &&
+                    forwardPosition(cotXml, session) ||
                     forwardChat(cotXml, session) ||
                     forwardMarker(cotXml, session)
             if (typed) return
@@ -671,10 +684,31 @@ class CotEndpointManager
                 // Shaped like a position and carrying none. Not ours to encode,
                 // so it falls through to tier 2 rather than being dropped.
                 ?: return false
+            // Before the gate: ATAK reporting at all is what lets this handset
+            // stand by, whether or not this particular report goes on the air.
+            session.lastAtakFixMs = System.currentTimeMillis()
             if (!session.gate.allows(fix, System.currentTimeMillis())) return true
             fanOut(PositionCodec.encode(fix), session)
             return true
         }
+
+        /**
+         * Whether ATAK is connected and has reported its own position lately.
+         *
+         * Not merely connected. A Nexus 6P indoors kept ATAK connected for
+         * seven minutes and sent nothing: ATAK reports only with a GPS fix, and
+         * it had none, while the phone's network location was good. Standing
+         * by on "connected" left the operator off the map for exactly that
+         * long. ATAK gets [ATAK_QUIET_MS] from connecting, and from each
+         * report, before this handset reports in its place.
+         */
+        val atakIsReporting: Boolean
+            get() {
+                val session = live ?: return false
+                val connected = (_state.value as? State.Listening)?.clients?.let { it > 0 } == true
+                val lastHeard = maxOf(session.lastAtakFixMs, session.atakConnectedAtMs)
+                return connected && System.currentTimeMillis() - lastHeard < ATAK_QUIET_MS
+            }
 
         /**
          * This handset's own position, sent to the team while ATAK is closed.
@@ -688,7 +722,7 @@ class CotEndpointManager
          */
         suspend fun reportOwnPosition(fix: PositionCodec.Fix): Boolean {
             val session = live ?: return false
-            if (clientsLock.withLock { clients.isNotEmpty() }) return false
+            if (atakIsReporting) return false
             val own = fix.copy(senderId = TakMembership.senderIdFor(session.node.hash))
             return fanOut(PositionCodec.encode(own), session) > 0
         }
@@ -1028,7 +1062,15 @@ class CotEndpointManager
              * handset restarted with ATAK closed keeps its name on the team's
              * map instead of reverting to the placeholder.
              */
+            @Volatile
             var rememberedCallsign: String? = null
+
+            /** When ATAK last reported its own position, and last connected. */
+            @Volatile
+            var lastAtakFixMs = 0L
+
+            @Volatile
+            var atakConnectedAtMs = 0L
 
             /**
              * Sent messages whose delivery proof will draw their tick.

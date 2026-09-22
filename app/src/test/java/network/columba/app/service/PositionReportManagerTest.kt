@@ -49,6 +49,9 @@ class PositionReportManagerTest {
 
     private val sent = mutableListOf<PositionCodec.Fix>()
 
+    /** What the endpoint says about ATAK: connected and reporting lately. */
+    private var atakReporting = false
+
     // Context is the sanctioned exception: an Android system handle with far
     // more surface than this touches. Everything else is strict.
     @Suppress("NoRelaxedMocks")
@@ -61,6 +64,7 @@ class PositionReportManagerTest {
         every { settingsRepository.positionReportIntervalMinutesFlow } returns interval
         coEvery { settingsRepository.saveLastPositionReportTime(any()) } returns Unit
         every { endpoint.state } returns endpointState
+        every { endpoint.atakIsReporting } answers { atakReporting }
         val fix = slot<PositionCodec.Fix>()
         coEvery { endpoint.reportOwnPosition(capture(fix)) } answers {
             sent.add(fix.captured)
@@ -110,7 +114,8 @@ class PositionReportManagerTest {
             Status.NeedsEndpoint,
             PositionReportManager.statusFor(true, 5, CotEndpointManager.State.Failed("port")),
         )
-        assertEquals(Status.AtakReporting, PositionReportManager.statusFor(true, 5, listening(1)))
+        // Connected is not reporting; that is judged each cycle.
+        assertEquals(Status.Reporting(5), PositionReportManager.statusFor(true, 5, listening(1)))
         assertEquals(Status.Reporting(5), PositionReportManager.statusFor(true, 5, listening(0)))
     }
 
@@ -133,9 +138,10 @@ class PositionReportManagerTest {
         }
 
     @Test
-    fun `with ATAK connected nothing is sent -- ATAK is reporting`() =
+    fun `with ATAK reporting nothing is sent`() =
         runTest(UnconfinedTestDispatcher()) {
             endpointState.value = listening(clients = 1)
+            atakReporting = true
             val manager = started()
             advanceTimeBy(30 * 60_000L)
 
@@ -145,15 +151,33 @@ class PositionReportManagerTest {
         }
 
     @Test
-    fun `ATAK connecting stops the reports, and closing resumes them`() =
+    fun `ATAK reporting stops the reports, and ATAK stopping resumes them`() =
         runTest(UnconfinedTestDispatcher()) {
             started()
             endpointState.value = listening(clients = 1)
+            atakReporting = true
             advanceTimeBy(30 * 60_000L)
-            assertEquals("only the report from before ATAK connected", 1, sent.size)
+            assertEquals("only the report from before ATAK took over", 1, sent.size)
 
+            atakReporting = false
             endpointState.value = listening(clients = 0)
-            assertEquals("ATAK closing hands straight back", 2, sent.size)
+            advanceTimeBy(PositionReportManager.CHECK_MS + 1)
+            assertEquals("back within one check", 2, sent.size)
+        }
+
+    /**
+     * The Nexus 6P case: ATAK connected for seven minutes indoors with no GPS
+     * fix and sent nothing, while the phone's network location was good.
+     */
+    @Test
+    fun `ATAK connected but silent is reported for`() =
+        runTest(UnconfinedTestDispatcher()) {
+            endpointState.value = listening(clients = 1)
+            atakReporting = false
+            val manager = started()
+
+            assertEquals(1, sent.size)
+            assertEquals(Status.Reporting(5, atakSilent = true), manager.status.value)
         }
 
     @Test

@@ -65,9 +65,9 @@ fun PositionReportCard(
     ) {
         Text(
             text =
-                "While ATAK is open it reports your position itself, and this " +
-                    "stays out of the way. When ATAK is closed -- phone locked, in " +
-                    "a pocket, or ATAK stopped -- Columba reports for you, as the " +
+                "While ATAK is reporting your position, this stays out of the way. " +
+                    "When ATAK is closed -- phone locked, in a pocket, or ATAK stopped " +
+                    "-- or open but without a GPS fix, Columba reports for you, as the " +
                     "same contact under the same callsign, so your team still sees you.",
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -170,5 +170,11 @@ private fun describe(status: Status): String =
         Status.Off -> "Off. Teammates see you only while ATAK is open."
         Status.NeedsEndpoint -> "Waiting for the TAK endpoint to start."
         Status.AtakReporting -> "ATAK is connected and reporting your position. Standing by."
-        is Status.Reporting -> "ATAK is closed. Reporting every ${status.intervalMinutes} min."
+        is Status.Reporting ->
+            if (status.atakSilent) {
+                "ATAK is connected but not reporting -- usually no GPS fix. " +
+                    "Reporting for it every ${status.intervalMinutes} min."
+            } else {
+                "ATAK is closed. Reporting every ${status.intervalMinutes} min."
+            }
     }

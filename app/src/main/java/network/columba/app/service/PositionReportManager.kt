@@ -87,6 +87,14 @@ class PositionReportManager
              */
             internal const val RETRY_MS = 30_000L
 
+            /**
+             * How often to look again while ATAK is reporting. Cheap -- no fix
+             * is taken and nothing is sent -- and short, so a handset whose
+             * ATAK stops reporting is back on the map within half a minute of
+             * the endpoint's quiet window running out.
+             */
+            internal const val CHECK_MS = 30_000L
+
             /** What reporting should be doing, from the switch and the endpoint. */
             internal fun statusFor(
                 enabled: Boolean,
@@ -96,7 +104,8 @@ class PositionReportManager
                 when {
                     !enabled -> Status.Off
                     endpoint !is CotEndpointManager.State.Listening -> Status.NeedsEndpoint
-                    endpoint.clients > 0 -> Status.AtakReporting
+                    // Whether ATAK is actually reporting is judged each cycle,
+                    // not here: connected is not the same as reporting.
                     else -> Status.Reporting(intervalMinutes)
                 }
         }
@@ -112,8 +121,12 @@ class PositionReportManager
             /** On, and ATAK is connected and reporting for itself. */
             data object AtakReporting : Status
 
-            /** On, ATAK is closed, and this is reporting every [intervalMinutes]. */
-            data class Reporting(val intervalMinutes: Int) : Status
+            /**
+             * On, and this is reporting every [intervalMinutes]: ATAK is closed,
+             * or [atakSilent] -- connected but not reporting, usually for want
+             * of a GPS fix.
+             */
+            data class Reporting(val intervalMinutes: Int, val atakSilent: Boolean = false) : Status
         }
 
         private val _status = MutableStateFlow<Status>(Status.Off)
@@ -144,17 +157,17 @@ class PositionReportManager
                         cotEndpointManager.state,
                         ::statusFor,
                     )
-                        // The endpoint's state also carries a member count, and
-                        // a teammate joining must not restart the loop -- that
-                        // would send a report every time anyone announced.
+                        // The endpoint's state also carries member and client
+                        // counts, and neither may restart the loop -- a teammate
+                        // joining would otherwise send a report each time.
                         .distinctUntilChanged()
-                        // collectLatest: the loop below never returns, and ATAK
-                        // connecting has to stop it.
+                        // collectLatest: the loop below never returns, and the
+                        // switch or the endpoint going off has to stop it.
                         .collectLatest { status ->
                             _status.value = status
                             when (status) {
                                 is Status.Reporting -> runReportLoop(status.intervalMinutes)
-                                Status.AtakReporting -> Log.d(TAG, "ATAK is connected and reporting; standing by")
+                                Status.AtakReporting -> Unit
                                 Status.NeedsEndpoint ->
                                     Log.i(TAG, "Position reporting is on but the TAK endpoint is not running")
                                 Status.Off -> Log.d(TAG, "Position reporting off")
@@ -174,8 +187,7 @@ class PositionReportManager
          * Send one report now, if reporting is what this handset should be doing.
          *
          * Arriving somewhere and wanting the map to show it should not mean
-         * waiting out an interval. Declined while ATAK is connected, which is
-         * already reporting.
+         * waiting out an interval. Declined while ATAK is reporting for itself.
          */
         suspend fun reportNow(): Boolean {
             val status = _status.value as? Status.Reporting ?: run {
@@ -186,9 +198,25 @@ class PositionReportManager
         }
 
         private suspend fun runReportLoop(intervalMinutes: Int) {
-            Log.i(TAG, "ATAK is closed; reporting this handset's position every ${intervalMinutes}min")
             val intervalMillis = intervalMinutes.toLong() * 60L * 1000L
             while (true) {
+                if (cotEndpointManager.atakIsReporting) {
+                    if (_status.value != Status.AtakReporting) Log.d(TAG, "ATAK is reporting; standing by")
+                    _status.value = Status.AtakReporting
+                    delay(CHECK_MS)
+                    continue
+                }
+                val atakSilent =
+                    (cotEndpointManager.state.value as? CotEndpointManager.State.Listening)?.clients?.let { it > 0 } == true
+                val reporting = Status.Reporting(intervalMinutes, atakSilent)
+                if (_status.value != reporting) {
+                    Log.i(
+                        TAG,
+                        (if (atakSilent) "ATAK is connected but not reporting" else "ATAK is closed") +
+                            "; reporting this handset's position every ${intervalMinutes}min",
+                    )
+                }
+                _status.value = reporting
                 val sent = emitReport(intervalMinutes)
                 delay(if (sent) intervalMillis else minOf(intervalMillis, RETRY_MS))
             }
