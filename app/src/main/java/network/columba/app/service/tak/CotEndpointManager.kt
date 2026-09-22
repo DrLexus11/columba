@@ -680,14 +680,7 @@ class CotEndpointManager
             }
             val frames = session.pipeline.frames(cotXml)
             session.versions.submit(cotXml, frames, recipients) { version ->
-                when {
-                    version.size > 1 ->
-                        session.fragments.send(
-                            version, session.registry, session.lxmf, System.currentTimeMillis(), recipients,
-                        )
-                    recipients == null -> fanOut(version[0], session)
-                    else -> recipients.forEach { sendTo(it, version[0]) }
-                }
+                session.fragments.sendVersion(version, session.registry, session.lxmf, recipients) { fanOut(it, session) }
             }
         }
 
