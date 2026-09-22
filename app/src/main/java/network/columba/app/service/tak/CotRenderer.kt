@@ -124,11 +124,27 @@ class CotRenderer(
                 fix,
                 TakIdentity.uidFor(sender),
                 callsignOf(sender),
-                positionStaleMs,
+                staleFor(fix),
                 team = team,
             ),
         )
     }
+
+    /**
+     * Twice the sender's stated cadence, never less than the default.
+     *
+     * A handset reporting while ATAK is closed does so every few minutes and
+     * says so. Held to the one-minute default its track went grey between every
+     * pair of reports, and the feature built to keep a locked phone on the map
+     * showed it as lost most of the time. The Kotlin half of
+     * `position_stale_seconds` in `tools/cot_bridge.py`.
+     */
+    private fun staleFor(fix: PositionCodec.Fix): Long =
+        if (fix.intervalMin > 0) {
+            maxOf(positionStaleMs, 2L * fix.intervalMin * 60_000L)
+        } else {
+            positionStaleMs
+        }
 
     /** A peer's marker. */
     private fun marker(raw: ByteArray, now: Long): Rendered {

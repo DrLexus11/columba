@@ -3,13 +3,8 @@ package network.columba.app.service
 import android.content.Context
 import android.location.Location
 import network.columba.app.repository.SettingsRepository
-import network.columba.app.rns.api.RnsCore
-import network.columba.app.rns.api.RnsLxmf
-import network.columba.app.rns.api.model.Destination
-import network.columba.app.rns.api.model.DestinationType
-import network.columba.app.rns.api.model.Direction
-import network.columba.app.rns.api.model.Identity
-import network.columba.app.rns.api.model.PacketReceipt
+import network.columba.app.service.PositionReportManager.Status
+import network.columba.app.service.tak.CotEndpointManager
 import network.columba.app.util.LocationCompat
 import network.columba.app.util.LocationPermissionManager
 import io.mockk.coEvery
@@ -17,89 +12,69 @@ import io.mockk.coVerify
 import io.mockk.every
 import io.mockk.mockk
 import io.mockk.mockkObject
+import io.mockk.slot
 import io.mockk.unmockkAll
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.test.TestScope
 import kotlinx.coroutines.test.UnconfinedTestDispatcher
+import kotlinx.coroutines.test.advanceTimeBy
 import kotlinx.coroutines.test.runTest
 import org.junit.After
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
 
 /**
- * What this pins down is the difference between "the call did not throw" and
- * "the packet went out".
+ * Position is reported by ATAK while ATAK is connected, and by Columba only
+ * while it is not.
  *
- * `sendPacket` returns `Result.success` for both, and the two backends disagree
- * about what a receipt means: Python RNS returns False from `Packet.send()`
- * when it could not send, and the Kotlin backend's `sendPacket` is still a stub
- * that sends nothing and reports `delivered = false` every time. Treating
- * either as a delivered report writes a timestamp into the settings card for a
- * position that never left the phone -- the one lie this feature must not tell,
- * and one that is invisible from the outside because the UI looks healthy.
+ * The first design reported alongside ATAK, to a gateway that drew the second
+ * report under a different uid: a teammate saw this person twice, one of them
+ * as a stranger. What is pinned here is the handover -- never both at once,
+ * and never neither while the switch is on and a team is there to tell.
  */
 @OptIn(ExperimentalCoroutinesApi::class)
 class PositionReportManagerTest {
-    private val testDispatcher = UnconfinedTestDispatcher()
-
     private lateinit var context: Context
     private lateinit var settingsRepository: SettingsRepository
-    private lateinit var rnsCore: RnsCore
-    private lateinit var rnsLxmf: RnsLxmf
+    private lateinit var endpoint: CotEndpointManager
 
-    /** A real 32-character destination hash, the only shape now accepted. */
-    private val gatewayHash = "a1b2c3d4e5f60718293a4b5c6d7e8f90"
+    private val enabled = MutableStateFlow(true)
+    private val interval = MutableStateFlow(5)
+    private val endpointState = MutableStateFlow<CotEndpointManager.State>(listening(clients = 0))
 
-    // Plain data classes, so real ones rather than mocks.
-    private val gatewayIdentity = Identity(ByteArray(16) { 0x0a }, ByteArray(64) { 0x0b }, null)
-    private val gatewayDestination =
-        Destination(
-            hash = ByteArray(16) { 0x0a },
-            hexHash = gatewayHash,
-            identity = gatewayIdentity,
-            direction = Direction.OUT,
-            type = DestinationType.SINGLE,
-            appName = "rnstransport",
-            aspects = listOf("position", "report"),
-        )
+    private val sent = mutableListOf<PositionCodec.Fix>()
 
-    // Context is the sanctioned exception: it is an Android system handle with
-    // far more surface than this test touches. Everything else is strict, so an
-    // unstubbed call means the manager changed rather than quietly returning a
-    // default.
+    // Context is the sanctioned exception: an Android system handle with far
+    // more surface than this touches. Everything else is strict.
     @Suppress("NoRelaxedMocks")
     @Before
     fun setUp() {
         context = mockk(relaxed = true)
         settingsRepository = mockk()
-        rnsCore = mockk()
-        rnsLxmf = mockk()
+        endpoint = mockk()
+        every { settingsRepository.positionReportEnabledFlow } returns enabled
+        every { settingsRepository.positionReportIntervalMinutesFlow } returns interval
         coEvery { settingsRepository.saveLastPositionReportTime(any()) } returns Unit
-        coEvery { rnsCore.requestPath(any()) } returns Result.success(Unit)
+        every { endpoint.state } returns endpointState
+        val fix = slot<PositionCodec.Fix>()
+        coEvery { endpoint.reportOwnPosition(capture(fix)) } answers {
+            sent.add(fix.captured)
+            true
+        }
 
-        // Both are objects reached statically from inside the manager.
         mockkObject(LocationCompat)
         mockkObject(LocationPermissionManager)
-
-        // No Play Services, so the fused paths are skipped entirely and the
-        // fix arrives through LocationCompat, which is stubbed below.
+        // No Play Services, so the fix arrives through LocationCompat.
         every { LocationCompat.isPlayServicesAvailable(any()) } returns false
         every { LocationPermissionManager.hasFineLocationPermission(any()) } returns true
         every { LocationCompat.getCurrentLocation(any(), any(), any()) } answers {
             thirdArg<(Location?) -> Unit>().invoke(freshFix())
         }
-
-        coEvery { settingsRepository.currentPositionGatewayHash() } returns gatewayHash
-        // No LXMF identity: senderId() falls back to zero, which is a case the
-        // gateway already handles and keeps this test off that path.
-        coEvery { rnsLxmf.getLxmfIdentity() } returns Result.failure(IllegalStateException("no identity"))
-        coEvery { rnsCore.hasPath(any()) } returns true
-        coEvery { rnsCore.recallIdentity(any()) } returns gatewayIdentity
-        coEvery {
-            rnsCore.createDestination(any(), any(), any(), any(), any())
-        } returns Result.success(gatewayDestination)
     }
 
     @After
@@ -107,158 +82,129 @@ class PositionReportManagerTest {
         unmockkAll()
     }
 
-    private fun manager() =
-        PositionReportManager(
-            context = context,
-            settingsRepository = settingsRepository,
-            rnsCore = rnsCore,
-            rnsLxmf = rnsLxmf,
-            scope = CoroutineScope(testDispatcher),
-        )
+    private fun listening(clients: Int, members: Int = 2) =
+        CotEndpointManager.State.Listening("Cyan", "00".repeat(16), clients, members)
+
+    private fun TestScope.started(): PositionReportManager =
+        PositionReportManager(context, settingsRepository, endpoint, CoroutineScope(backgroundScope.coroutineContext))
+            .also { it.start() }
 
     /**
-     * A fix from now, so the age check in freshLocation() lets it through.
-     *
-     * Relaxed because Location is an Android framework type with a dozen
-     * accessors the codec probes (hasAccuracy, hasAltitude, hasBearing,
-     * hasSpeed and their getters); a real one is no use here, since with
-     * returnDefaultValues its time reads back as zero.
+     * A fix from now, so the age check lets it through. Relaxed because
+     * Location is a framework type whose accessors the codec probes; a real one
+     * reads back zero for its time under returnDefaultValues.
      */
     @Suppress("NoRelaxedMocks")
-    private fun freshFix(): Location =
+    private fun freshFix(ageMs: Long = 0): Location =
         mockk<Location>(relaxed = true) {
-            every { time } returns System.currentTimeMillis()
+            every { time } returns System.currentTimeMillis() - ageMs
             every { latitude } returns 41.0082
             every { longitude } returns 28.9784
         }
 
-    private fun receipt(delivered: Boolean) =
-        PacketReceipt(
-            hash = ByteArray(32),
-            delivered = delivered,
-            timestamp = System.currentTimeMillis(),
+    @Test
+    fun `the status follows the switch and the endpoint`() {
+        assertEquals(Status.Off, PositionReportManager.statusFor(false, 5, listening(0)))
+        assertEquals(Status.NeedsEndpoint, PositionReportManager.statusFor(true, 5, CotEndpointManager.State.Stopped))
+        assertEquals(
+            Status.NeedsEndpoint,
+            PositionReportManager.statusFor(true, 5, CotEndpointManager.State.Failed("port")),
         )
+        assertEquals(Status.AtakReporting, PositionReportManager.statusFor(true, 5, listening(1)))
+        assertEquals(Status.Reporting(5), PositionReportManager.statusFor(true, 5, listening(0)))
+    }
 
     @Test
-    fun `a receipt the transport refused is not a report`() =
-        runTest {
-            coEvery { rnsCore.sendPacket(any(), any(), any()) } returns Result.success(receipt(delivered = false))
+    fun `with ATAK closed the handset reports at once, stating its interval`() =
+        runTest(UnconfinedTestDispatcher()) {
+            started()
 
-            val reported = manager().reportNow()
-
-            assertFalse("a refused packet must not count as a report", reported)
-            coVerify(exactly = 0) { settingsRepository.saveLastPositionReportTime(any()) }
-        }
-
-    @Test
-    fun `a receipt the transport accepted is a report`() =
-        runTest {
-            coEvery { rnsCore.sendPacket(any(), any(), any()) } returns Result.success(receipt(delivered = true))
-
-            val reported = manager().reportNow()
-
-            assertTrue("an accepted packet is a report", reported)
+            assertEquals(1, sent.size)
+            assertEquals("the receiver keeps the track current until the next", 5, sent.single().intervalMin)
             coVerify(exactly = 1) { settingsRepository.saveLastPositionReportTime(any()) }
         }
 
     @Test
-    fun `a thrown send is not a report`() =
-        runTest {
-            coEvery {
-                rnsCore.sendPacket(any(), any(), any())
-            } returns Result.failure(IllegalStateException("no interface"))
+    fun `and again every interval`() =
+        runTest(UnconfinedTestDispatcher()) {
+            started()
+            advanceTimeBy(5 * 60_000L + 1)
+            assertEquals(2, sent.size)
+        }
 
-            val reported = manager().reportNow()
+    @Test
+    fun `with ATAK connected nothing is sent -- ATAK is reporting`() =
+        runTest(UnconfinedTestDispatcher()) {
+            endpointState.value = listening(clients = 1)
+            val manager = started()
+            advanceTimeBy(30 * 60_000L)
 
-            assertFalse(reported)
+            assertTrue(sent.isEmpty())
+            assertEquals(Status.AtakReporting, manager.status.value)
+            assertFalse("the button is declined too", manager.reportNow())
+        }
+
+    @Test
+    fun `ATAK connecting stops the reports, and closing resumes them`() =
+        runTest(UnconfinedTestDispatcher()) {
+            started()
+            endpointState.value = listening(clients = 1)
+            advanceTimeBy(30 * 60_000L)
+            assertEquals("only the report from before ATAK connected", 1, sent.size)
+
+            endpointState.value = listening(clients = 0)
+            assertEquals("ATAK closing hands straight back", 2, sent.size)
+        }
+
+    @Test
+    fun `a teammate joining does not trigger a report`() =
+        runTest(UnconfinedTestDispatcher()) {
+            started()
+            endpointState.value = listening(clients = 0, members = 3)
+            endpointState.value = listening(clients = 0, members = 4)
+            assertEquals(1, sent.size)
+        }
+
+    @Test
+    fun `without the endpoint nothing is sent`() =
+        runTest(UnconfinedTestDispatcher()) {
+            endpointState.value = CotEndpointManager.State.Stopped
+            val manager = started()
+            assertTrue(sent.isEmpty())
+            assertEquals(Status.NeedsEndpoint, manager.status.value)
+        }
+
+    @Test
+    fun `a report no teammate took is not recorded, and is retried soon`() =
+        runTest(UnconfinedTestDispatcher()) {
+            var attempts = 0
+            coEvery { endpoint.reportOwnPosition(any()) } answers {
+                attempts++
+                false
+            }
+            started()
+            advanceTimeBy(PositionReportManager.RETRY_MS + 1)
+
+            assertEquals("retried after thirty seconds, not five minutes", 2, attempts)
             coVerify(exactly = 0) { settingsRepository.saveLastPositionReportTime(any()) }
         }
 
-    /**
-     * A short hash is not a near miss. It addresses nothing, so the report has
-     * to stop here rather than be built and handed to a destination that cannot
-     * exist -- the UI refuses these now, but the debug harness writes this
-     * setting directly.
-     */
-    @Test
-    fun `a gateway hash of the wrong length sends nothing`() =
-        runTest {
-            coEvery { settingsRepository.currentPositionGatewayHash() } returns "a1b2c3d4"
-
-            val reported = manager().reportNow()
-
-            assertFalse(reported)
-            coVerify(exactly = 0) { rnsCore.sendPacket(any(), any(), any()) }
-            coVerify(exactly = 0) { settingsRepository.saveLastPositionReportTime(any()) }
-        }
-
-    @Test
-    fun `a gateway hash that is not hex sends nothing`() =
-        runTest {
-            coEvery { settingsRepository.currentPositionGatewayHash() } returns "z1b2c3d4e5f60718293a4b5c6d7e8f90"
-
-            val reported = manager().reportNow()
-
-            assertFalse(reported)
-            coVerify(exactly = 0) { rnsCore.sendPacket(any(), any(), any()) }
-        }
-
-    /**
-     * Reticulum prints destination hashes as <hex> and people paste them back
-     * with the brackets attached, so those are stripped rather than rejected.
-     */
-    @Test
-    fun `a gateway hash in angle brackets is accepted`() =
-        runTest {
-            coEvery { settingsRepository.currentPositionGatewayHash() } returns "<$gatewayHash>"
-            coEvery { rnsCore.sendPacket(any(), any(), any()) } returns Result.success(receipt(delivered = true))
-
-            val reported = manager().reportNow()
-
-            assertTrue("brackets are punctuation, not part of the hash", reported)
-        }
-
-    @Suppress("NoRelaxedMocks") // Location, as above.
     @Test
     fun `a stale fix is not reported`() =
-        runTest {
-            val stale =
-                mockk<Location>(relaxed = true) {
-                    every { time } returns
-                        System.currentTimeMillis() - (PositionReportManager.MAX_FIX_AGE_MS + 60_000L)
-                    every { latitude } returns 41.0082
-                    every { longitude } returns 28.9784
-                }
+        runTest(UnconfinedTestDispatcher()) {
             every { LocationCompat.getCurrentLocation(any(), any(), any()) } answers {
-                thirdArg<(Location?) -> Unit>().invoke(stale)
+                thirdArg<(Location?) -> Unit>().invoke(freshFix(PositionReportManager.MAX_FIX_AGE_MS + 60_000L))
             }
             every { LocationCompat.getLastKnownLocation(any()) } returns null
-
-            val reported = manager().reportNow()
-
-            assertFalse("a position from minutes ago is not where you are", reported)
-            coVerify(exactly = 0) { rnsCore.sendPacket(any(), any(), any()) }
+            started()
+            assertTrue("a position from minutes ago is not where you are", sent.isEmpty())
         }
 
     @Test
     fun `without precise location nothing is sent`() =
-        runTest {
+        runTest(UnconfinedTestDispatcher()) {
             every { LocationPermissionManager.hasFineLocationPermission(any()) } returns false
-
-            val reported = manager().reportNow()
-
-            assertFalse(reported)
-            coVerify(exactly = 0) { rnsCore.sendPacket(any(), any(), any()) }
-        }
-
-    @Test
-    fun `with no gateway set nothing is sent`() =
-        runTest {
-            coEvery { settingsRepository.currentPositionGatewayHash() } returns null
-
-            val reported = manager().reportNow()
-
-            assertFalse(reported)
-            coVerify(exactly = 0) { rnsCore.sendPacket(any(), any(), any()) }
+            started()
+            assertTrue(sent.isEmpty())
         }
 }

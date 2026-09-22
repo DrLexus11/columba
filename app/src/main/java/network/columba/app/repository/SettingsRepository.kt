@@ -87,6 +87,7 @@ class SettingsRepository
             val TAK_ENDPOINT_ENABLED = booleanPreferencesKey("tak_endpoint_enabled")
             val TAK_TEAM = stringPreferencesKey("tak_team")
             val TAK_FLEET_SECRET = stringPreferencesKey("tak_fleet_secret")
+            val TAK_CALLSIGN = stringPreferencesKey("tak_callsign")
             val AUTO_ANNOUNCE_INTERVAL_MINUTES = intPreferencesKey("auto_announce_interval_minutes") // Legacy, for migration
             val AUTO_ANNOUNCE_INTERVAL_HOURS = intPreferencesKey("auto_announce_interval_hours")
             val LAST_AUTO_ANNOUNCE_TIME = longPreferencesKey("last_auto_announce_time")
@@ -767,6 +768,23 @@ class SettingsRepository
                 } else {
                     preferences[PreferencesKeys.TAK_TEAM] = cleaned
                 }
+            }
+        }
+
+        /**
+         * The callsign ATAK last reported, or null if ATAK has never connected.
+         *
+         * Learned, never typed -- the operator already set it in ATAK. Kept so
+         * the endpoint announces the right name after a restart with ATAK
+         * closed, which is exactly when this handset reports its own position.
+         */
+        suspend fun currentTakCallsign(): String? =
+            context.dataStore.data.first()[PreferencesKeys.TAK_CALLSIGN]
+
+        /** Remember the callsign ATAK reported. */
+        suspend fun saveTakCallsign(callsign: String) {
+            context.dataStore.edit { preferences ->
+                preferences[PreferencesKeys.TAK_CALLSIGN] = callsign
             }
         }
 

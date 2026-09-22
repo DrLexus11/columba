@@ -13,31 +13,26 @@ import androidx.compose.material.icons.filled.MyLocation
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
-import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.remember
-import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import network.columba.app.ui.components.CollapsibleSettingsCard
-import network.columba.app.util.DestinationHashValidator
+import network.columba.app.service.PositionReportManager.Status
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 
 /**
- * Report this device's position to a gateway that serves ATAK.
+ * Keep this handset on the team's map while ATAK is closed.
  *
- * The card carries the gateway field because the feature does nothing without
- * it, and says so rather than looking enabled while sending nowhere. It also
- * states plainly what turning this on means: position is the most sensitive
- * thing this app emits, and the switch should not feel like any other switch.
+ * A dependant of the endpoint switch, and shown as one: with no endpoint
+ * running there is no team to report to, so the switch is disabled and says
+ * why rather than looking on while sending nothing. What it is doing right now
+ * -- standing by for ATAK, or reporting in its place -- is stated, because the
+ * whole point is that it acts when nobody is looking at the phone.
  */
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
@@ -45,52 +40,57 @@ fun PositionReportCard(
     isExpanded: Boolean,
     onExpandedChange: (Boolean) -> Unit,
     enabled: Boolean,
+    endpointReady: Boolean,
     intervalMinutes: Int,
-    gatewayHash: String?,
+    status: Status,
     lastReportTime: Long?,
     onToggle: (Boolean) -> Unit,
     onIntervalChange: (Int) -> Unit,
-    onGatewayChange: (String) -> Unit,
     onReportNow: () -> Unit,
 ) {
     val presetIntervals = listOf(1, 2, 5, 10)
-    var gatewayField by remember(gatewayHash) { mutableStateOf(gatewayHash ?: "") }
-    // The app already has one answer to "is this a destination hash", used by
-    // the manual relay field and the nomadnet parser. A second, looser one here
-    // would let this card accept addresses the rest of the app calls invalid.
-    val validation = DestinationHashValidator.validate(gatewayField)
-    val gatewayIsValid = validation is DestinationHashValidator.ValidationResult.Valid
-    val gatewayError = (validation as? DestinationHashValidator.ValidationResult.Error)?.message
 
     CollapsibleSettingsCard(
-        title = "Position Reporting",
+        title = "Position while ATAK is closed",
         icon = Icons.Default.MyLocation,
         isExpanded = isExpanded,
         onExpandedChange = onExpandedChange,
         headerAction = {
             Switch(
-                checked = enabled,
+                checked = enabled && endpointReady,
                 onCheckedChange = onToggle,
+                enabled = endpointReady,
             )
         },
     ) {
         Text(
             text =
-                "Send this device's position to a gateway that expands it into a " +
-                    "CoT feed for ATAK. Twenty bytes over the mesh, so it fits on a " +
-                    "radio that a full CoT message would not.",
+                "While ATAK is open it reports your position itself, and this " +
+                    "stays out of the way. When ATAK is closed -- phone locked, in " +
+                    "a pocket, or ATAK stopped -- Columba reports for you, as the " +
+                    "same contact under the same callsign, so your team still sees you.",
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
 
         Spacer(modifier = Modifier.height(8.dp))
 
+        if (!endpointReady) {
+            Text(
+                text = "Needs the TAK endpoint on, with a team and fleet secret. " +
+                    "There is nobody to report to without one.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.error,
+            )
+            Spacer(modifier = Modifier.height(8.dp))
+        }
+
         // Said once, plainly, where the switch is. Not a dialog nobody reads.
         Text(
             text =
-                "This shares where you are, on a schedule, until you turn it off. " +
-                    "It needs precise location: approximate location is kilometres " +
-                    "out, and a marker that far off is worse than none.",
+                "This shares where you are with your team, on a schedule, until " +
+                    "you turn it off. It needs precise location: approximate location " +
+                    "is kilometres out, and a marker that far off is worse than none.",
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.error,
         )
@@ -98,7 +98,7 @@ fun PositionReportCard(
         Spacer(modifier = Modifier.height(12.dp))
 
         Text(
-            text = "How often",
+            text = "How often, while ATAK is closed",
             style = MaterialTheme.typography.labelLarge,
             fontWeight = FontWeight.Medium,
         )
@@ -111,15 +111,16 @@ fun PositionReportCard(
                 FilterChip(
                     selected = intervalMinutes == minutes,
                     onClick = { onIntervalChange(minutes) },
-                    enabled = enabled,
+                    enabled = enabled && endpointReady,
                     label = { Text("${minutes}m") },
                 )
             }
         }
         Text(
             text =
-                "Ten nodes reporting once a minute fits the airtime budget; " +
-                    "twenty-five does not. Slow this down as the fleet grows.",
+                "Each report says when the next is due, so teammates keep your " +
+                    "track current until then. Slower is lighter on the radio; " +
+                    "every teammate receives a copy of every report.",
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             modifier = Modifier.padding(top = 4.dp),
@@ -127,73 +128,26 @@ fun PositionReportCard(
 
         Spacer(modifier = Modifier.height(12.dp))
 
-        // Without this the switch is inert, so it is a field rather than
-        // something buried behind an advanced screen.
-        Text(
-            text = "Gateway destination",
-            style = MaterialTheme.typography.labelLarge,
-            fontWeight = FontWeight.Medium,
-        )
-        Spacer(modifier = Modifier.height(4.dp))
-        OutlinedTextField(
-            value = gatewayField,
-            onValueChange = { entered ->
-                // Filtered and capped rather than validated after the fact, so
-                // a stray character cannot be typed at all. Same treatment the
-                // manual relay field gives the same kind of value.
-                val filtered =
-                    entered
-                        .filter { it.isDigit() || it.lowercaseChar() in 'a'..'f' }
-                        .lowercase()
-                        .take(DestinationHashValidator.REQUIRED_LENGTH)
-                gatewayField = filtered
-                // Persisted only when it is a whole hash or nothing at all.
-                // Every write here restarts the reporting loop through
-                // collectLatest, and saving each keystroke meant 32 restarts
-                // and 32 DataStore writes to enter one gateway -- each one
-                // briefly pointing the loop at a prefix that addresses nothing.
-                if (filtered.isEmpty() || filtered.length == DestinationHashValidator.REQUIRED_LENGTH) {
-                    onGatewayChange(filtered)
-                }
-            },
-            label = { Text("Destination hash") },
-            placeholder = { Text("32 hex characters") },
-            singleLine = true,
-            isError = gatewayField.isNotEmpty() && !gatewayIsValid,
-            supportingText = {
-                Text(
-                    text =
-                        when {
-                            gatewayField.isEmpty() -> "Nothing is sent until a gateway is set"
-                            // Says which of the two things is wrong, and how
-                            // far off: "Hash must be 32 characters (got 12)"
-                            // rather than a flat "invalid".
-                            gatewayError != null -> gatewayError
-                            else -> "Reports go only here, not to the whole mesh"
-                        },
-                )
-            },
-            textStyle = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
-            modifier = Modifier.fillMaxWidth(),
-        )
-
-        Spacer(modifier = Modifier.height(12.dp))
-
         Column(modifier = Modifier.fillMaxWidth()) {
+            Text(
+                text = describe(status),
+                style = MaterialTheme.typography.bodyMedium,
+            )
+            Spacer(modifier = Modifier.height(4.dp))
             Text(
                 text =
                     lastReportTime?.let {
                         val stamp =
                             SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date(it))
-                        "Last reported at $stamp"
-                    } ?: "Nothing reported yet",
+                        "Columba last reported at $stamp"
+                    } ?: "Columba has not reported yet",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
             Spacer(modifier = Modifier.height(8.dp))
             OutlinedButton(
                 onClick = onReportNow,
-                enabled = enabled && gatewayIsValid,
+                enabled = status is Status.Reporting,
                 modifier = Modifier.fillMaxWidth(),
             ) {
                 Text("Report position now")
@@ -209,3 +163,12 @@ fun PositionReportCard(
         }
     }
 }
+
+/** What reporting is doing right now, in the operator's terms. */
+private fun describe(status: Status): String =
+    when (status) {
+        Status.Off -> "Off. Teammates see you only while ATAK is open."
+        Status.NeedsEndpoint -> "Waiting for the TAK endpoint to start."
+        Status.AtakReporting -> "ATAK is connected and reporting your position. Standing by."
+        is Status.Reporting -> "ATAK is closed. Reporting every ${status.intervalMinutes} min."
+    }

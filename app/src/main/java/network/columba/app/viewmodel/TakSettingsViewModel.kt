@@ -45,7 +45,6 @@ class TakSettingsViewModel
             val secretTooShort: Boolean = false,
             val positionEnabled: Boolean = false,
             val positionIntervalMinutes: Int = 1,
-            val positionGatewayHash: String? = null,
             val lastPositionReportTime: Long? = null,
         )
 
@@ -54,6 +53,9 @@ class TakSettingsViewModel
 
         /** What the endpoint is actually doing, as opposed to what is configured. */
         val endpointState: StateFlow<CotEndpointManager.State> = cotEndpointManager.state
+
+        /** What position reporting is doing: off, standing by for ATAK, or reporting. */
+        val positionStatus: StateFlow<PositionReportManager.Status> = positionReportManager.status
 
         init {
             observeEndpointSettings()
@@ -91,17 +93,15 @@ class TakSettingsViewModel
                 combine(
                     settingsRepository.positionReportEnabledFlow,
                     settingsRepository.positionReportIntervalMinutesFlow,
-                    settingsRepository.positionGatewayHashFlow,
                     settingsRepository.lastPositionReportTimeFlow,
-                ) { enabled, interval, gateway, last ->
-                    listOf(enabled, interval, gateway, last)
-                }.collect { values ->
+                ) { enabled, interval, last ->
+                    Triple(enabled, interval, last)
+                }.collect { (enabled, interval, last) ->
                     _state.value =
                         _state.value.copy(
-                            positionEnabled = values[0] as Boolean,
-                            positionIntervalMinutes = values[1] as Int,
-                            positionGatewayHash = values[2] as String?,
-                            lastPositionReportTime = values[3] as Long?,
+                            positionEnabled = enabled,
+                            positionIntervalMinutes = interval,
+                            lastPositionReportTime = last,
                         )
                 }
             }
@@ -125,10 +125,6 @@ class TakSettingsViewModel
 
         fun setPositionInterval(minutes: Int) {
             viewModelScope.launch { settingsRepository.savePositionReportIntervalMinutes(minutes) }
-        }
-
-        fun setPositionGatewayHash(hash: String) {
-            viewModelScope.launch { settingsRepository.savePositionGatewayHash(hash) }
         }
 
         fun reportPositionNow() {

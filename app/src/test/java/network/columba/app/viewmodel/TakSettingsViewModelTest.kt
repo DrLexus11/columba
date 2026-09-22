@@ -47,14 +47,12 @@ class TakSettingsViewModelTest {
                 every { takFleetSecretFlow } returns flowOf(secret)
                 every { positionReportEnabledFlow } returns flowOf(false)
                 every { positionReportIntervalMinutesFlow } returns flowOf(1)
-                every { positionGatewayHashFlow } returns flowOf(null)
                 every { lastPositionReportTimeFlow } returns flowOf(null)
                 coEvery { saveTakEndpointEnabled(any()) } returns Unit
                 coEvery { saveTakTeam(any()) } returns Unit
                 coEvery { saveTakFleetSecret(any()) } returns Unit
                 coEvery { savePositionReportEnabled(any()) } returns Unit
                 coEvery { savePositionReportIntervalMinutes(any()) } returns Unit
-                coEvery { savePositionGatewayHash(any()) } returns Unit
             }
         val endpoint =
             mockk<CotEndpointManager> {
@@ -63,6 +61,7 @@ class TakSettingsViewModelTest {
         val reports =
             mockk<PositionReportManager> {
                 coEvery { reportNow() } returns true
+                every { status } returns MutableStateFlow(PositionReportManager.Status.Off)
             }
         return TakSettingsViewModel(settings, reports, endpoint)
     }
