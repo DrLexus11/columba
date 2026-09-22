@@ -31,6 +31,9 @@ class TakFileTransfers(
     private val lxmf: TakLxmf.Carrier,
     private val toAtak: suspend (ByteArray) -> Unit,
     private val isMember: (ByteArray) -> Boolean = { false },
+    /** This node's UID, which a status line is addressed to. Empty sends none. */
+    private val ourUid: String = "",
+    private val nameOf: (ByteArray) -> String = { "a teammate" },
     private val clock: () -> Long = System::currentTimeMillis,
 ) {
     companion object {
@@ -51,6 +54,16 @@ class TakFileTransfers(
         private const val REQUEST_WAIT_MS = 2L * 60 * 1000
         const val HOLD_MS = 24L * 60 * 60 * 1000
 
+        /**
+         * One measurement per sender serves every file waiting on them for this
+         * long. Each probe is a link handshake, over LoRa when the path is slow,
+         * and three files from one sender were three handshakes on the bench.
+         */
+        const val PROBE_REUSE_MS = 30_000L
+
+        /** How long an offered file may go unfetched before the sender is told. */
+        const val UNFETCHED_MS = 60_000L
+
         fun isFast(probe: LinkSpeedProbeResult): Boolean =
             probe.isSuccess && (probe.rttSeconds ?: Double.MAX_VALUE) < FAST_RTT_S
 
@@ -60,12 +73,16 @@ class TakFileTransfers(
             rnsCore: RnsCore,
             lxmf: TakLxmf.Carrier,
             registry: TakMembership.Registry,
+            ourUid: String,
             toAtak: suspend (ByteArray) -> Unit,
         ): TakFileTransfers {
             val store = TakFileStore(java.io.File(parent, "tak_files"))
-            return TakFileTransfers(store, TakFileServer(store), rnsCore, lxmf, toAtak, {
-                registry.isMember(it, System.currentTimeMillis())
-            })
+            return TakFileTransfers(
+                store, TakFileServer(store), rnsCore, lxmf, toAtak,
+                isMember = { registry.isMember(it, System.currentTimeMillis()) },
+                ourUid = ourUid,
+                nameOf = { registry.describe(it)?.callsign ?: "a teammate" },
+            )
         }
     }
 
@@ -78,9 +95,18 @@ class TakFileTransfers(
         @Volatile var nextTryAt = since
 
         @Volatile var backoffMs = FIRST_RETRY_MS
+
+        @Volatile var told = false
+    }
+
+    /** A file this ATAK offered one member, until they fetch it. */
+    private class Offer(val filename: String, val size: Long, val member: ByteArray, val since: Long) {
+        @Volatile var told = false
     }
 
     private val pending = ConcurrentHashMap<String, Pending>()
+    private val offers = ConcurrentHashMap<String, Offer>()
+    private val probes = ConcurrentHashMap<String, Pair<Long, LinkSpeedProbeResult?>>()
 
     /** Files offered and not yet here. */
     fun waiting(): Int = pending.size
@@ -113,11 +139,21 @@ class TakFileTransfers(
         val notice = TakFiles.parseNotice(cotXml) ?: return
         if (store.has(notice.hash)) {
             store.grant(notice.hash, recipients)
+            recipients?.forEach {
+                offers[notice.hash + it.toHex()] = Offer(notice.filename, notice.size, it, clock())
+            }
             Log.i(TAG, "${notice.filename} offered to ${recipients?.let { "${it.size} member(s)" } ?: "the team"}")
         } else {
             Log.w(TAG, "${notice.filename} offered but never uploaded here; nobody will be able to fetch it")
         }
     }
+
+    /**
+     * [deliver], except that a file notice from [sourceHash] is held here until
+     * its file is -- so ATAK is never offered what it cannot fetch.
+     */
+    fun passing(sourceHash: ByteArray, deliver: suspend (ByteArray) -> Unit): suspend (ByteArray) -> Unit =
+        { event -> if (!intercept(event, sourceHash)) deliver(event) }
 
     /** Take an inbound frame if it is a file or a request for one. True when it was. */
     suspend fun takeFile(inbound: TakLxmf.Inbound): Boolean {
@@ -140,6 +176,7 @@ class TakFileTransfers(
             !store.mayFetch(hash, member, isMember) -> Log.w(TAG, "Asked for ${store.nameOf(hash)} by someone never offered it; refused")
             else -> {
                 val name = store.nameOf(hash)
+                offers.remove(hash + member.toHex())
                 val sent = lxmf.sendFile(member, TakFiles.encodeFile(hash, name, data))
                 Log.i(TAG, "Sending $name (${data.size} bytes)" + if (sent == null) ", but LXMF refused" else "")
             }
@@ -180,6 +217,19 @@ class TakFileTransfers(
 
     suspend fun retryDue() {
         val now = clock()
+        for ((key, offer) in offers) {
+            when {
+                now - offer.since > HOLD_MS -> offers.remove(key)
+                !offer.told && now - offer.since > UNFETCHED_MS -> {
+                    offer.told = true
+                    status(
+                        "${offer.filename} (${TakFiles.sizeText(offer.size)}) not fetched yet by " +
+                            "${nameOf(offer.member)}. Over a slow path a file waits for a fast one; " +
+                            "ATAK may report this send as failed while it waits.",
+                    )
+                }
+            }
+        }
         for ((hash, entry) in pending) {
             when {
                 now - entry.since > HOLD_MS -> {
@@ -196,8 +246,7 @@ class TakFileTransfers(
         // Claimed before the probe, which takes seconds over LoRa: the retry
         // tick must not start a second probe of the same path meanwhile.
         entry.nextTryAt = now + REQUEST_WAIT_MS
-        val inbox = lxmf.inboxFor(entry.sender)
-        val probe = inbox?.let { rnsCore.probeLinkSpeed(it, PROBE_TIMEOUT_S, "direct") }
+        val probe = probe(entry.sender, now)
         Log.i(
             TAG,
             "path to the sender of ${entry.notice.filename}: ${probe?.status ?: "no inbox"}, " +
@@ -212,8 +261,31 @@ class TakFileTransfers(
             Log.i(TAG, "Slow or no path; ${entry.notice.filename} waits, next try in ${entry.backoffMs / 1000}s")
             entry.nextTryAt = now + entry.backoffMs
             entry.backoffMs = minOf(entry.backoffMs * 2, MAX_RETRY_MS)
+            if (!entry.told) {
+                entry.told = true
+                status(
+                    "${entry.notice.filename} (${TakFiles.sizeText(entry.notice.size)}) from " +
+                        "${nameOf(entry.sender)} is waiting: the path is too slow to bring it now. " +
+                        "It arrives when a fast path appears.",
+                )
+            }
         }
     }
+
+    /** The path to [sender], measured at most once per [PROBE_REUSE_MS] for all its files. */
+    private suspend fun probe(sender: ByteArray, now: Long): LinkSpeedProbeResult? {
+        val key = sender.toHex()
+        probes[key]?.takeIf { now - it.first < PROBE_REUSE_MS }?.let { return it.second }
+        val measured = lxmf.inboxFor(sender)?.let { rnsCore.probeLinkSpeed(it, PROBE_TIMEOUT_S, "direct") }
+        probes[key] = now to measured
+        return measured
+    }
+
+    private suspend fun status(text: String) {
+        if (ourUid.isNotEmpty()) toAtak(TakFiles.statusLine(ourUid, text, clock()))
+    }
+
+    private fun ByteArray.toHex(): String = joinToString("") { "%02x".format(it) }
 
     private suspend fun deliver(notice: TakFiles.Notice, xml: String) {
         val url = TakFiles.contentUrl(server.base, notice.hash)

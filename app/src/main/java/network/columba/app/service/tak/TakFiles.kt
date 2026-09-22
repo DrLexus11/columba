@@ -122,6 +122,48 @@ object TakFiles {
             .replaceFirst(Regex("\\bstale=\"[^\"]*\""), "stale=\"${stamp(nowMs + NOTICE_STALE_MS)}\"")
     }
 
+    /** Who a status line comes from in ATAK's chat: this handset, not a teammate. */
+    const val STATUS_UID = "COLUMBA-FILES"
+    const val STATUS_CALLSIGN = "Columba files"
+    private const val STATUS_STALE_MS = 24L * 60 * 60 * 1000
+
+    /**
+     * A chat line to this handset's own ATAK about a file, from Columba.
+     *
+     * Local only -- nothing goes on the air. It exists because ATAK cannot show
+     * "queued, waiting for a fast path": a receiver sees nothing, and a sender
+     * sees its send time out as a failure, while the file is simply waiting.
+     * From its own contact rather than the teammate's, so nothing is put in a
+     * teammate's mouth.
+     */
+    fun statusLine(ourUid: String, text: String, nowMs: Long): ByteArray {
+        val stamp = { ms: Long ->
+            SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US)
+                .apply { timeZone = TimeZone.getTimeZone("UTC") }
+                .format(Date(ms))
+        }
+        val message =
+            CotChat.Message(
+                kind = CotChat.KIND_MESSAGE,
+                senderId = 0,
+                messageId = java.util.UUID.randomUUID().toString(),
+                room = STATUS_CALLSIGN,
+                text = text,
+                recipient = ourUid,
+                sentUnix = nowMs / 1000,
+            )
+        return CotChat.buildChatCot(message, STATUS_UID, STATUS_CALLSIGN, stamp(nowMs), stamp(nowMs + STATUS_STALE_MS))
+            .toByteArray(Charsets.UTF_8)
+    }
+
+    /** A size an operator reads at a glance. */
+    fun sizeText(bytes: Long): String =
+        when {
+            bytes >= 1_000_000 -> "%.1f MB".format(Locale.US, bytes / 1_000_000.0)
+            bytes >= 1_000 -> "${bytes / 1_000} KB"
+            else -> "$bytes B"
+        }
+
     private fun ByteArray.toHex(): String = joinToString("") { "%02x".format(it) }
 
     private fun String.hexToBytes(): ByteArray = ByteArray(length / 2) { substring(it * 2, it * 2 + 2).toInt(16).toByte() }

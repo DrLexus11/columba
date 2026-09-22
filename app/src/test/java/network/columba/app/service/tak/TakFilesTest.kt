@@ -86,7 +86,9 @@ class TakFilesTest {
 
     private val identity = Identity(ByteArray(16) { 0x01 }, ByteArray(64) { 0x02 }, null)
 
-    private fun transfers(fastPath: Boolean, sender: ByteArray = deck): TakFileTransfers {
+    private var now = 1_790_000_000_000L
+
+    private fun transfers(fastPath: Boolean, sender: ByteArray = deck, ourUid: String = ""): TakFileTransfers {
         coEvery { rnsCore.recallIdentity(any()) } returns identity
         coEvery { rnsCore.createDestination(any(), any(), any(), any(), any()) } returns
             Result.success(
@@ -104,7 +106,10 @@ class TakFilesTest {
                 rttSeconds = if (fastPath) 0.04 else 1.8, hops = 2, linkReused = false,
             )
         store = TakFileStore(folder.newFolder())
-        return TakFileTransfers(store, TakFileServer(store), rnsCore, carrier, { toAtak += String(it, Charsets.UTF_8) })
+        return TakFileTransfers(
+            store, TakFileServer(store), rnsCore, carrier, { toAtak += String(it, Charsets.UTF_8) },
+            ourUid = ourUid, nameOf = { if (it.contentEquals(deck)) "DECK" else "LEXUS" }, clock = { now },
+        )
     }
 
     private lateinit var store: TakFileStore
@@ -243,4 +248,62 @@ class TakFilesTest {
         val bytes = (if (code < 400) connection.inputStream else connection.errorStream)?.use { it.readBytes() } ?: ByteArray(0)
         return code to bytes
     }
+
+    // ---- saying what ATAK cannot ----
+
+    private val ours = "urtn-" + "44".repeat(16)
+
+    @Test
+    fun `a deferred file is announced to this ATAK once, from Columba`() =
+        runTest {
+            val files = transfers(fastPath = false, ourUid = ours)
+            files.intercept(notice().toByteArray(), sourceHash = inboxOfDeck)
+            now += TakFileTransfers.MAX_RETRY_MS
+            files.retryDue()
+
+            assertEquals("one line, not one per retry", 1, toAtak.size)
+            val line = toAtak.single()
+            assertTrue(line.contains("Recon1.zip") && line.contains("from DECK is waiting"))
+            assertTrue("from Columba, not in the teammate's name", line.contains(TakFiles.STATUS_UID))
+        }
+
+    @Test
+    fun `files waiting on one sender share one probe`() =
+        runTest {
+            val files = transfers(fastPath = false)
+            files.intercept(notice().toByteArray(), sourceHash = inboxOfDeck)
+            val other = TakFiles.sha256Hex("another file".toByteArray())
+            files.intercept(notice(other).toByteArray(), sourceHash = inboxOfDeck)
+
+            assertEquals(2, files.waiting())
+            coVerify(exactly = 1) { rnsCore.probeLinkSpeed(any(), any(), any()) }
+        }
+
+    @Test
+    fun `a sender is told when an offer goes unfetched`() =
+        runTest {
+            val files = transfers(fastPath = true, ourUid = ours)
+            store.put(data, "Recon1.zip", hash)
+            files.offered(notice(), listOf(stranger))
+            files.retryDue()
+            assertTrue("not before a minute", toAtak.isEmpty())
+
+            now += TakFileTransfers.UNFETCHED_MS + 1
+            files.retryDue()
+            files.retryDue()
+            assertEquals(1, toAtak.size)
+            assertTrue(toAtak.single().contains("not fetched yet by LEXUS"))
+        }
+
+    @Test
+    fun `an offer that is fetched says nothing`() =
+        runTest {
+            val files = transfers(fastPath = true, ourUid = ours)
+            store.put(data, "Recon1.zip", hash)
+            files.offered(notice(), listOf(deck))
+            files.onRequest(TakLxmf.Inbound(inboxOfDeck, TakFiles.encodeRequest(hash)))
+            now += TakFileTransfers.UNFETCHED_MS + 1
+            files.retryDue()
+            assertTrue(toAtak.isEmpty())
+        }
 }
