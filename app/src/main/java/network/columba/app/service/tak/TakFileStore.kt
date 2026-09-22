@@ -41,6 +41,32 @@ class TakFileStore(private val root: File) {
 
     fun read(hash: String): ByteArray? = if (has(hash)) fileFor(hash).readBytes() else null
 
+    /**
+     * Record who a notice for this file went to: member hashes, or null for
+     * the whole team. Grants accumulate -- one file shared with A and then B
+     * may be fetched by both.
+     */
+    @Synchronized
+    fun grant(hash: String, members: List<ByteArray>?) {
+        if (!TakFiles.isHash(hash)) return
+        val grants = File(root, "$hash.grants")
+        val lines = if (grants.isFile) grants.readLines().toMutableSet() else mutableSetOf()
+        if (members == null) lines += TEAM else members.forEach { lines += it.toHex() }
+        grants.writeText(lines.joinToString("\n"))
+    }
+
+    /** Whether [member] was sent a notice for this file. */
+    fun mayFetch(hash: String, member: ByteArray, isMember: (ByteArray) -> Boolean): Boolean {
+        val grants = File(root, "$hash.grants").takeIf { TakFiles.isHash(hash) && it.isFile }?.readLines() ?: return false
+        return member.toHex() in grants || (TEAM in grants && isMember(member))
+    }
+
+    private fun ByteArray.toHex(): String = joinToString("") { "%02x".format(it) }
+
+    private companion object {
+        const val TEAM = "team"
+    }
+
     fun nameOf(hash: String): String =
         File(root, "$hash.name").takeIf { TakFiles.isHash(hash) && it.isFile }?.readText() ?: hash
 }

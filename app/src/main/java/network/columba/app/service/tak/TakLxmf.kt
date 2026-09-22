@@ -194,6 +194,7 @@ object TakLxmf {
             frame: ByteArray,
             text: String,
             propagate: Boolean = true,
+            method: DeliveryMethod = DeliveryMethod.OPPORTUNISTIC,
         ): String? {
             val inbox = inboxFor(memberHash) ?: return null
             return rnsLxmf.sendLxmfMessageWithMethod(
@@ -206,7 +207,7 @@ object TakLxmf {
                 // Encrypted LXMF packets retain proofs, retries and the
                 // propagation fallback without a handshake for each cold
                 // conversation. LXMF promotes oversized payloads to DIRECT.
-                deliveryMethod = DeliveryMethod.OPPORTUNISTIC,
+                deliveryMethod = method,
                 // A file request is not left at a propagation node: answered
                 // later, it would bring the file over whatever path exists
                 // then, which may be the LoRa leg the fetch gate avoided.
@@ -214,6 +215,14 @@ object TakLxmf {
                 extraFields = extraFields(frame),
             ).getOrNull()?.messageHash?.toHexString()
         }
+
+        /**
+         * Send one whole file: DIRECT, as a Resource over a Link, and never
+         * left at a propagation node, which would hand it on over whatever
+         * path the receiver has -- the LoRa leg the fetch gate avoids.
+         */
+        suspend fun sendFile(memberHash: ByteArray, frame: ByteArray): String? =
+            send(memberHash, frame, "", propagate = false, method = DeliveryMethod.DIRECT)
 
         /**
          * A member's LXMF inbox, derived from the identity we already hold.

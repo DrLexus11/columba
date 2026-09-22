@@ -93,15 +93,22 @@ class TakFilesTest {
                 Destination(sender, "", identity, Direction.OUT, DestinationType.SINGLE, "rnstransport", listOf("tak", "node")),
             )
         coEvery { carrier.inboxFor(any()) } returns inboxOfDeck
-        coEvery { carrier.send(any(), any(), any(), any()) } returns "sent"
+        coEvery { carrier.send(any(), any(), any(), any(), any()) } returns "sent"
+        coEvery { carrier.sendFile(any(), any()) } answers {
+            sentFiles += firstArg<ByteArray>() to secondArg<ByteArray>()
+            "sent"
+        }
         coEvery { rnsCore.probeLinkSpeed(any(), any(), any()) } returns
             LinkSpeedProbeResult(
                 status = "success", establishmentRateBps = 40_000, expectedRateBps = null,
                 rttSeconds = if (fastPath) 0.04 else 1.8, hops = 2, linkReused = false,
             )
-        val store = TakFileStore(folder.newFolder())
+        store = TakFileStore(folder.newFolder())
         return TakFileTransfers(store, TakFileServer(store), rnsCore, carrier, { toAtak += String(it, Charsets.UTF_8) })
     }
+
+    private lateinit var store: TakFileStore
+    private val sentFiles = mutableListOf<Pair<ByteArray, ByteArray>>()
 
     @Test
     fun `over a fast path the file is asked for, and ATAK sees nothing until it is here`() =
@@ -115,7 +122,7 @@ class TakFilesTest {
             files.onFile(TakLxmf.Inbound(inboxOfDeck, TakFiles.encodeFile(hash, "Recon1.zip", data)))
 
             assertEquals(1, toAtak.size)
-            assertTrue(toAtak.single().contains("http://127.0.0.1:18080/Marti/sync/content?hash=$hash"))
+            assertTrue(toAtak.single().contains("http://127.0.0.1:8080/Marti/sync/content?hash=$hash"))
             assertEquals(0, files.waiting())
         }
 
@@ -125,7 +132,7 @@ class TakFilesTest {
             val files = transfers(fastPath = false)
             files.intercept(notice().toByteArray(), sourceHash = inboxOfDeck)
 
-            coVerify(exactly = 0) { carrier.send(any(), any(), any(), any()) }
+            coVerify(exactly = 0) { carrier.send(any(), any(), any(), any(), any()) }
             assertEquals(1, files.waiting())
             assertTrue(toAtak.isEmpty())
         }
@@ -160,4 +167,80 @@ class TakFilesTest {
             val files = transfers(fastPath = true)
             assertFalse(files.intercept(notice().replace("b-f-t-r", "u-d-f").toByteArray(), inboxOfDeck))
         }
+
+    // ---- sending: this ATAK's file, asked for by a teammate ----
+
+    @Test
+    fun `a teammate the file was offered to is sent it`() =
+        runTest {
+            val files = transfers(fastPath = true)
+            store.put(data, "Recon1.zip", hash)
+            files.offered(notice(), listOf(deck))
+            files.onRequest(TakLxmf.Inbound(inboxOfDeck, TakFiles.encodeRequest(hash)))
+
+            assertEquals(1, sentFiles.size)
+            assertArrayEquals(deck, sentFiles.single().first)
+            assertArrayEquals(TakFiles.encodeFile(hash, "Recon1.zip", data), sentFiles.single().second)
+        }
+
+    @Test
+    fun `a teammate who was not offered it is refused`() =
+        runTest {
+            val files = transfers(fastPath = true, sender = stranger)
+            store.put(data, "Recon1.zip", hash)
+            files.offered(notice(), listOf(deck))
+            files.onRequest(TakLxmf.Inbound(inboxOfDeck, TakFiles.encodeRequest(hash)))
+
+            assertTrue(sentFiles.isEmpty())
+        }
+
+    /**
+     * ATAK's calls over real HTTP. Measured on the A54: ATAK checks and uploads
+     * on http://127.0.0.1:8080 before it sends a file notice through the stream,
+     * and with nothing listening the notice never went.
+     */
+    @Test
+    fun `atak's upload calls are answered`() {
+        val served = TakFileStore(folder.newFolder())
+        val server = TakFileServer(served, port = 28080)
+        val scope = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.IO)
+        server.start(scope)
+        try {
+            Thread.sleep(300)
+            assertEquals(404, call("GET", "/Marti/sync/missionquery?hash=$hash").first)
+
+            val boundary = "atakboundary"
+            val body =
+                (
+                    "--$boundary\r\nContent-Disposition: form-data; name=\"assetfile\"; filename=\"Recon1.zip\"\r\n" +
+                        "Content-Type: application/octet-stream\r\n\r\n"
+                ).toByteArray() + data + "\r\n--$boundary--\r\n".toByteArray()
+            val upload =
+                call("POST", "/Marti/sync/missionupload?hash=$hash&filename=Recon1.zip", body, "multipart/form-data; boundary=$boundary")
+            assertEquals(200, upload.first)
+            assertTrue(String(upload.second).contains(hash))
+
+            assertEquals(200, call("PUT", "/Marti/api/sync/metadata/$hash/tool", "x".toByteArray()).first)
+            assertEquals(200, call("GET", "/Marti/sync/missionquery?hash=$hash").first)
+            assertArrayEquals(data, call("GET", "/Marti/sync/content?hash=$hash").second)
+
+            val tampered = data + byteArrayOf(1)
+            assertEquals(400, call("POST", "/Marti/sync/missionupload?hash=$hash", tampered, "application/octet-stream").first)
+        } finally {
+            scope.coroutineContext[kotlinx.coroutines.Job]?.cancel()
+        }
+    }
+
+    private fun call(method: String, path: String, body: ByteArray? = null, type: String? = null): Pair<Int, ByteArray> {
+        val connection = java.net.URL("http://127.0.0.1:28080$path").openConnection() as java.net.HttpURLConnection
+        connection.requestMethod = method
+        if (body != null) {
+            connection.doOutput = true
+            type?.let { connection.setRequestProperty("Content-Type", it) }
+            connection.outputStream.use { it.write(body) }
+        }
+        val code = connection.responseCode
+        val bytes = (if (code < 400) connection.inputStream else connection.errorStream)?.use { it.readBytes() } ?: ByteArray(0)
+        return code to bytes
+    }
 }

@@ -30,6 +30,7 @@ class TakFileTransfers(
     private val rnsCore: RnsCore,
     private val lxmf: TakLxmf.Carrier,
     private val toAtak: suspend (ByteArray) -> Unit,
+    private val isMember: (ByteArray) -> Boolean = { false },
     private val clock: () -> Long = System::currentTimeMillis,
 ) {
     companion object {
@@ -58,10 +59,13 @@ class TakFileTransfers(
             parent: java.io.File,
             rnsCore: RnsCore,
             lxmf: TakLxmf.Carrier,
+            registry: TakMembership.Registry,
             toAtak: suspend (ByteArray) -> Unit,
         ): TakFileTransfers {
             val store = TakFileStore(java.io.File(parent, "tak_files"))
-            return TakFileTransfers(store, TakFileServer(store), rnsCore, lxmf, toAtak)
+            return TakFileTransfers(store, TakFileServer(store), rnsCore, lxmf, toAtak, {
+                registry.isMember(it, System.currentTimeMillis())
+            })
         }
     }
 
@@ -100,11 +104,46 @@ class TakFileTransfers(
         return true
     }
 
-    /** Take an inbound frame if it is a file. True when it was. */
+    /**
+     * This ATAK sent a file notice to [recipients] (null for the team). Only
+     * they may fetch the file -- the rule that keeps a pin sent to one person
+     * off everyone else's map.
+     */
+    fun offered(cotXml: String, recipients: List<ByteArray>?) {
+        val notice = TakFiles.parseNotice(cotXml) ?: return
+        if (store.has(notice.hash)) {
+            store.grant(notice.hash, recipients)
+            Log.i(TAG, "${notice.filename} offered to ${recipients?.let { "${it.size} member(s)" } ?: "the team"}")
+        } else {
+            Log.w(TAG, "${notice.filename} offered but never uploaded here; nobody will be able to fetch it")
+        }
+    }
+
+    /** Take an inbound frame if it is a file or a request for one. True when it was. */
     suspend fun takeFile(inbound: TakLxmf.Inbound): Boolean {
-        if (TakPayload.kindOf(inbound.frame) != TakPayload.FILE_V1) return false
-        onFile(inbound)
+        when (TakPayload.kindOf(inbound.frame)) {
+            TakPayload.FILE_V1 -> onFile(inbound)
+            TakPayload.FILE_REQUEST_V1 -> onRequest(inbound)
+            else -> return false
+        }
         return true
+    }
+
+    /** A teammate asked for a file: sent if the member LXMF proved was offered it. */
+    suspend fun onRequest(inbound: TakLxmf.Inbound) {
+        val hash = TakFiles.decodeRequest(inbound.frame)
+        val member = hash?.let { TakLxmf.memberForLxmf(rnsCore, inbound.sourceHash) }
+        val data = hash?.let { store.read(it) }
+        when {
+            hash == null || member == null -> Log.w(TAG, "A file request from a sender this node cannot name; refused")
+            data == null -> Log.w(TAG, "Asked for a file that is not held here")
+            !store.mayFetch(hash, member, isMember) -> Log.w(TAG, "Asked for ${store.nameOf(hash)} by someone never offered it; refused")
+            else -> {
+                val name = store.nameOf(hash)
+                val sent = lxmf.sendFile(member, TakFiles.encodeFile(hash, name, data))
+                Log.i(TAG, "Sending $name (${data.size} bytes)" + if (sent == null) ", but LXMF refused" else "")
+            }
+        }
     }
 
     /** A file arrived. Kept only if it was asked for, from whom it was asked. */
@@ -154,6 +193,9 @@ class TakFileTransfers(
 
     private suspend fun attempt(entry: Pending) {
         val now = clock()
+        // Claimed before the probe, which takes seconds over LoRa: the retry
+        // tick must not start a second probe of the same path meanwhile.
+        entry.nextTryAt = now + REQUEST_WAIT_MS
         val inbox = lxmf.inboxFor(entry.sender)
         val probe = inbox?.let { rnsCore.probeLinkSpeed(it, PROBE_TIMEOUT_S, "direct") }
         Log.i(

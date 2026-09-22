@@ -407,8 +407,9 @@ class CotEndpointManager
                         session.replay.hold(bytes, System.currentTimeMillis())
                         writeToClients(bytes, held = true)
                     }
-                    val files = TakFileTransfers.inDirectory(context.noBackupFilesDir, rnsCore, session.lxmf, deliver)
-                    val fileJobs = files.start(this)
+                    val files =
+                        TakFileTransfers.inDirectory(context.noBackupFilesDir, rnsCore, session.lxmf, session.registry, deliver)
+                    val fileJobs = files.also { session.files = it }.start(this)
                     val fromLxmf =
                         launch {
                             session.lxmf.frames().collect { inbound ->
@@ -453,6 +454,7 @@ class CotEndpointManager
                         }
                     } finally {
                         live = null
+                        session.files = null
                         fileJobs.forEach { it.cancel() }
                         beacon.cancel()
                         fromProofs.cancel()
@@ -678,6 +680,7 @@ class CotEndpointManager
                 Log.i(TAG, "Event addressed to nobody on this team; not sent, and not broadcast instead")
                 return
             }
+            session.files?.offered(cotXml, recipients)
             val frames = session.pipeline.frames(cotXml)
             session.versions.submit(cotXml, frames, recipients) { version ->
                 session.fragments.sendVersion(version, session.registry, session.lxmf, recipients) { fanOut(it, session) }
@@ -1076,6 +1079,10 @@ class CotEndpointManager
              */
             @Volatile
             var rememberedCallsign: String? = null
+
+            /** Files offered to and by this ATAK, while the session serves. */
+            @Volatile
+            var files: TakFileTransfers? = null
 
             /** When ATAK last reported its own position, and last connected. */
             @Volatile
