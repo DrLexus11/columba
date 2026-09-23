@@ -159,7 +159,8 @@ class TakFileOfferTest {
         runTest {
             val (frame, hash) = offerFrame()
             transfers(rtt = 0.04).onOffer(frame, inboxOfDeck)
-            assertEquals(listOf(TakFiles.encodeRequest(hash).hex()), requests.map { it.hex() })
+            val size = quickpic().size
+            assertEquals(listOf(TakFileParts.encodeRequest(hash, 0, size).hex()), requests.map { it.hex() })
             assertTrue(toAtak.isEmpty())
         }
 

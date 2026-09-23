@@ -67,6 +67,24 @@ class TakFileStore(private val root: File) {
         const val TEAM = "team"
     }
 
+    /** How much of a file being fetched is here already. */
+    fun partialSize(hash: String): Long = File(root, "$hash.partial").takeIf { TakFiles.isHash(hash) }?.length() ?: 0L
+
+    /** Add a part where it belongs. False if it is not the next part. */
+    @Synchronized
+    fun appendPartial(hash: String, offset: Long, data: ByteArray): Boolean {
+        if (!TakFiles.isHash(hash) || offset != partialSize(hash)) return false
+        File(root, "$hash.partial").appendBytes(data)
+        return true
+    }
+
+    /** The whole of a fetched file, removed from the partial store. */
+    @Synchronized
+    fun takePartial(hash: String): ByteArray? {
+        val file = File(root, "$hash.partial").takeIf { TakFiles.isHash(hash) && it.isFile } ?: return null
+        return file.readBytes().also { file.delete() }
+    }
+
     /** One file held here, for the retention page. */
     data class Held(val hash: String, val name: String, val size: Long, val storedAtMs: Long, val kind: Kind)
 
@@ -103,7 +121,7 @@ class TakFileStore(private val root: File) {
     @Synchronized
     fun delete(hash: String): Boolean {
         if (!TakFiles.isHash(hash)) return false
-        listOf("", ".name", ".grants", ".part").forEach { File(root, hash + it).delete() }
+        listOf("", ".name", ".grants", ".part", ".partial").forEach { File(root, hash + it).delete() }
         return !has(hash)
     }
 

@@ -122,7 +122,7 @@ class TakFilesTest {
             val files = transfers(fastPath = true)
             assertTrue(files.intercept(notice().toByteArray(), sourceHash = inboxOfDeck))
 
-            coVerify { carrier.send(deck, TakFiles.encodeRequest(hash), "", propagate = false) }
+            coVerify { carrier.send(deck, TakFileParts.encodeRequest(hash, 0, data.size), "", propagate = false) }
             assertTrue("ATAK is not offered what it cannot fetch yet", toAtak.isEmpty())
 
             files.onFile(TakLxmf.Inbound(inboxOfDeck, TakFiles.encodeFile(hash, "Recon1.zip", data)))
@@ -182,7 +182,7 @@ class TakFilesTest {
             val files = transfers(fastPath = true)
             store.put(data, "Recon1.zip", hash)
             files.offered(notice(), listOf(deck))
-            files.onRequest(TakLxmf.Inbound(inboxOfDeck, TakFiles.encodeRequest(hash)))
+            files.takeFile(TakLxmf.Inbound(inboxOfDeck, TakFiles.encodeRequest(hash)))
 
             assertEquals(1, sentFiles.size)
             assertArrayEquals(deck, sentFiles.single().first)
@@ -195,7 +195,7 @@ class TakFilesTest {
             val files = transfers(fastPath = true, sender = stranger)
             store.put(data, "Recon1.zip", hash)
             files.offered(notice(), listOf(deck))
-            files.onRequest(TakLxmf.Inbound(inboxOfDeck, TakFiles.encodeRequest(hash)))
+            files.takeFile(TakLxmf.Inbound(inboxOfDeck, TakFiles.encodeRequest(hash)))
 
             assertTrue(sentFiles.isEmpty())
         }
@@ -302,7 +302,7 @@ class TakFilesTest {
             val files = transfers(fastPath = true, ourUid = ours)
             store.put(data, "Recon1.zip", hash)
             files.offered(notice(), listOf(deck))
-            files.onRequest(TakLxmf.Inbound(inboxOfDeck, TakFiles.encodeRequest(hash)))
+            files.takeFile(TakLxmf.Inbound(inboxOfDeck, TakFiles.encodeRequest(hash)))
             now += TakFileTransfers.UNFETCHED_MS + 1
             files.retryDue()
             assertTrue(toAtak.isEmpty())
