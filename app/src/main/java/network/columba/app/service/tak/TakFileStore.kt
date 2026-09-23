@@ -67,6 +67,46 @@ class TakFileStore(private val root: File) {
         const val TEAM = "team"
     }
 
+    /** One file held here, for the retention page. */
+    data class Held(val hash: String, val name: String, val size: Long, val storedAtMs: Long, val kind: Kind)
+
+    enum class Kind {
+        /** This ATAK offered it; teammates it was offered to may still fetch it. */
+        SENT,
+
+        /** A teammate's file, fetched here. */
+        RECEIVED,
+
+        /** A QuickPic preview made here from a thumbnail over LoRa. */
+        PREVIEW,
+    }
+
+    /** Every file held, newest first. */
+    fun list(): List<Held> =
+        root.listFiles().orEmpty()
+            .filter { it.isFile && TakFiles.isHash(it.name) }
+            .map { file ->
+                val name = nameOf(file.name)
+                val kind =
+                    when {
+                        File(root, "${file.name}.grants").isFile -> Kind.SENT
+                        name.endsWith("_preview.zip") -> Kind.PREVIEW
+                        else -> Kind.RECEIVED
+                    }
+                Held(file.name, name, file.length(), file.lastModified(), kind)
+            }.sortedByDescending { it.storedAtMs }
+
+    /**
+     * Forget a file and everything kept beside it. A file this node offered
+     * can then no longer be fetched by a teammate who has not yet done so.
+     */
+    @Synchronized
+    fun delete(hash: String): Boolean {
+        if (!TakFiles.isHash(hash)) return false
+        listOf("", ".name", ".grants", ".part").forEach { File(root, hash + it).delete() }
+        return !has(hash)
+    }
+
     fun nameOf(hash: String): String =
         File(root, "$hash.name").takeIf { TakFiles.isHash(hash) && it.isFile }?.readText() ?: hash
 }

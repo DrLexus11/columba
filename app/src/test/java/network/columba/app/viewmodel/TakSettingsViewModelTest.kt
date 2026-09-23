@@ -63,7 +63,11 @@ class TakSettingsViewModelTest {
                 coEvery { reportNow() } returns true
                 every { status } returns MutableStateFlow(PositionReportManager.Status.Off)
             }
-        return TakSettingsViewModel(settings, reports, endpoint)
+        val retention =
+            mockk<network.columba.app.service.tak.TakFileRetention> {
+                every { held } returns MutableStateFlow(emptyList())
+            }
+        return TakSettingsViewModel(settings, reports, endpoint, retention)
     }
 
     @Test

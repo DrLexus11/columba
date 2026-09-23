@@ -29,6 +29,7 @@ class TakSettingsViewModel
         private val settingsRepository: SettingsRepository,
         private val positionReportManager: PositionReportManager,
         private val cotEndpointManager: CotEndpointManager,
+        private val fileRetention: network.columba.app.service.tak.TakFileRetention,
     ) : ViewModel() {
         data class State(
             val endpointEnabled: Boolean = false,
@@ -53,6 +54,19 @@ class TakSettingsViewModel
 
         /** What the endpoint is actually doing, as opposed to what is configured. */
         val endpointState: StateFlow<CotEndpointManager.State> = cotEndpointManager.state
+
+        /** Files held for TAK on this handset, for the retention card. */
+        val heldFiles: StateFlow<List<network.columba.app.service.tak.TakFileStore.Held>> = fileRetention.held
+
+        fun refreshHeldFiles() = fileRetention.refresh()
+
+        fun deleteHeldFile(hash: String) {
+            viewModelScope.launch(kotlinx.coroutines.Dispatchers.IO) { fileRetention.delete(hash) }
+        }
+
+        fun deleteAllHeldFiles() {
+            viewModelScope.launch(kotlinx.coroutines.Dispatchers.IO) { fileRetention.deleteAll() }
+        }
 
         /** What position reporting is doing: off, standing by for ATAK, or reporting. */
         val positionStatus: StateFlow<PositionReportManager.Status> = positionReportManager.status
