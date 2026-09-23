@@ -28,6 +28,7 @@ object TakPayload {
     const val FRAGMENT_V1 = 5
     const val FILE_REQUEST_V1 = 6
     const val FILE_V1 = 7
+    const val FILE_OFFER_V1 = 8
 
     /**
      * Every kind that may appear as byte zero, and what produced it. A reader
@@ -44,6 +45,7 @@ object TakPayload {
             FRAGMENT_V1 to "fragment-v1",
             FILE_REQUEST_V1 to "file-request-v1",
             FILE_V1 to "file-v1",
+            FILE_OFFER_V1 to "file-offer-v1",
         )
 
     /** The kind byte of a frame, or null if it is empty or unknown. */

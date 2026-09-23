@@ -30,12 +30,27 @@ class TakFileTransfers(
     private val rnsCore: RnsCore,
     private val lxmf: TakLxmf.Carrier,
     private val toAtak: suspend (ByteArray) -> Unit,
-    private val isMember: (ByteArray) -> Boolean = { false },
-    /** This node's UID, which a status line is addressed to. Empty sends none. */
-    private val ourUid: String = "",
-    private val nameOf: (ByteArray) -> String = { "a teammate" },
+    private val team: Team = Team(),
     private val clock: () -> Long = System::currentTimeMillis,
+    private val thumbnailer: (ByteArray, Int) -> ByteArray? = TakFileOffer::thumbnail,
 ) {
+    /** Who this node is on the team, and what it knows of the others. */
+    class Team(
+        /** This node's UID, which a status line is addressed to. Empty sends none. */
+        val ourUid: String = "",
+        /** This node's sender id, which its offers carry. */
+        val ourSenderId: Int = 0,
+        val isMember: (ByteArray) -> Boolean = { false },
+        val nameOf: (ByteArray) -> String = { "a teammate" },
+        val members: () -> List<ByteArray> = { emptyList() },
+    )
+
+    private val ourUid get() = team.ourUid
+    private val ourSenderId get() = team.ourSenderId
+    private val isMember get() = team.isMember
+    private val nameOf get() = team.nameOf
+    private val members get() = team.members
+
     companion object {
         private const val TAG = "TakFileTransfers"
 
@@ -77,12 +92,15 @@ class TakFileTransfers(
             toAtak: suspend (ByteArray) -> Unit,
         ): TakFileTransfers {
             val store = TakFileStore(java.io.File(parent, "tak_files"))
-            return TakFileTransfers(
-                store, TakFileServer(store), rnsCore, lxmf, toAtak,
-                isMember = { registry.isMember(it, System.currentTimeMillis()) },
-                ourUid = ourUid,
-                nameOf = { registry.describe(it)?.callsign ?: "a teammate" },
-            )
+            val team =
+                Team(
+                    ourUid = ourUid,
+                    ourSenderId = TakIdentity.destinationFor(ourUid)?.let(TakMembership::senderIdFor) ?: 0,
+                    isMember = { registry.isMember(it, System.currentTimeMillis()) },
+                    nameOf = { registry.describe(it)?.callsign ?: "a teammate" },
+                    members = { registry.members(System.currentTimeMillis()) },
+                )
+            return TakFileTransfers(store, TakFileServer(store), rnsCore, lxmf, toAtak, team)
         }
     }
 
@@ -91,7 +109,10 @@ class TakFileTransfers(
         val xml: String,
         val sender: ByteArray,
         val since: Long,
+        val offer: TakFileOffer.Offer? = null,
     ) {
+        @Volatile var previewed = false
+
         @Volatile var nextTryAt = since
 
         @Volatile var backoffMs = FIRST_RETRY_MS
@@ -135,17 +156,72 @@ class TakFileTransfers(
      * they may fetch the file -- the rule that keeps a pin sent to one person
      * off everyone else's map.
      */
-    fun offered(cotXml: String, recipients: List<ByteArray>?) {
-        val notice = TakFiles.parseNotice(cotXml) ?: return
+    suspend fun offered(cotXml: String, recipients: List<ByteArray>?): Boolean {
+        val notice = TakFiles.parseNotice(cotXml) ?: return false
         if (store.has(notice.hash)) {
+            sendOffer(notice, recipients)
             store.grant(notice.hash, recipients)
             recipients?.forEach {
                 offers[notice.hash + it.toHex()] = Offer(notice.filename, notice.size, it, clock())
             }
             Log.i(TAG, "${notice.filename} offered to ${recipients?.let { "${it.size} member(s)" } ?: "the team"}")
-        } else {
-            Log.w(TAG, "${notice.filename} offered but never uploaded here; nobody will be able to fetch it")
+            return true
         }
+        Log.w(TAG, "${notice.filename} offered but never uploaded here; nobody will be able to fetch it")
+        return false
+    }
+
+    /**
+     * The offer on the air in place of ATAK's notice: about 55 bytes for a
+     * data package, up to three fragments for a QuickPic with its position and
+     * a thumbnail. Always over LXMF -- the receiver must know whom to ask.
+     */
+    private suspend fun sendOffer(notice: TakFiles.Notice, recipients: List<ByteArray>?) {
+        val data = store.read(notice.hash) ?: return
+        val offer = TakFileOffer.encode(TakFileOffer.offerFor(ourSenderId, notice.hash, notice.filename, data, thumbnailer))
+        val frames = if (offer.size <= CotFragment.MAX_FRAGMENT_FRAME_BYTES) listOf(offer) else CotFragment.fragments(offer)
+        for (member in recipients ?: members()) {
+            for (frame in frames) {
+                if (lxmf.send(member, frame, "") == null) Log.w(TAG, "LXMF would not take an offer for a member")
+            }
+        }
+        Log.i(TAG, "Offer for ${notice.filename}: ${offer.size} bytes in ${frames.size} frame(s)")
+    }
+
+    /** An offer arrived: rebuild ATAK's notice and fetch, preview or wait. */
+    suspend fun onOffer(raw: ByteArray, sourceHash: ByteArray) {
+        val offer = TakFileOffer.decode(raw)
+        val sender = offer?.let { TakLxmf.memberForLxmf(rnsCore, sourceHash) }
+        when {
+            offer == null || sender == null || !isMember(sender) ->
+                Log.w(TAG, "An offer from a sender this node cannot name; refused")
+            TakMembership.senderIdFor(sender) != offer.senderId ->
+                Log.w(TAG, "An offer whose claimed sender is not the one proved; refused")
+            else -> {
+                val xml = TakFileOffer.notice(offer, TakIdentity.uidFor(sender), nameOf(sender), clock())
+                val notice = TakFiles.Notice(offer.hash, offer.filename, offer.size)
+                if (store.has(offer.hash)) {
+                    deliver(notice, xml)
+                } else {
+                    Log.i(TAG, "${offer.filename} (${offer.size} bytes) offered; measuring the path to its sender")
+                    attempt(pending.getOrPut(offer.hash) { Pending(notice, xml, sender, clock(), offer) })
+                }
+            }
+        }
+    }
+
+    /** Over a slow path, a QuickPic's thumbnail at its position, once. */
+    private suspend fun preview(entry: Pending): Boolean {
+        val offer = entry.offer?.takeIf { it.thumbnail != null && it.point != null && !entry.previewed } ?: return false
+        entry.previewed = true
+        val (bytes, filename) = TakFileOffer.preview(offer, nameOf(entry.sender), clock())
+        val hash = store.put(bytes, filename) ?: return false
+        val shown = TakFileOffer.Offer(offer.senderId, hash, bytes.size.toLong(), filename, offer.point)
+        deliver(
+            TakFiles.Notice(hash, filename, bytes.size.toLong()),
+            TakFileOffer.notice(shown, TakIdentity.uidFor(entry.sender), nameOf(entry.sender), clock()),
+        )
+        return true
     }
 
     /**
@@ -160,6 +236,7 @@ class TakFileTransfers(
         when (TakPayload.kindOf(inbound.frame)) {
             TakPayload.FILE_V1 -> onFile(inbound)
             TakPayload.FILE_REQUEST_V1 -> onRequest(inbound)
+            TakPayload.FILE_OFFER_V1 -> onOffer(inbound.frame, inbound.sourceHash)
             else -> return false
         }
         return true
@@ -261,12 +338,13 @@ class TakFileTransfers(
             Log.i(TAG, "Slow or no path; ${entry.notice.filename} waits, next try in ${entry.backoffMs / 1000}s")
             entry.nextTryAt = now + entry.backoffMs
             entry.backoffMs = minOf(entry.backoffMs * 2, MAX_RETRY_MS)
+            val previewed = preview(entry)
             if (!entry.told) {
                 entry.told = true
                 status(
                     "${entry.notice.filename} (${TakFiles.sizeText(entry.notice.size)}) from " +
                         "${nameOf(entry.sender)} is waiting: the path is too slow to bring it now. " +
-                        "It arrives when a fast path appears.",
+                        "It arrives when a fast path appears." + if (previewed) " A preview is on the map." else "",
                 )
             }
         }

@@ -21,6 +21,12 @@ import network.columba.app.rns.api.RnsCore
  * incomplete against, and the airtime costing assumed that.
  */
 class TakLxmfCarriage(private val rnsCore: RnsCore) {
+    /**
+     * Where a whole file offer goes once reassembled: it is not CoT, so it is
+     * not drawn. Set by the session that owns the file transfers.
+     */
+    @Volatile var onOffer: (suspend (ByteArray, ByteArray) -> Unit)? = null
+
     companion object {
         private const val TAG = "TakLxmfCarriage"
     }
@@ -130,7 +136,12 @@ class TakLxmfCarriage(private val rnsCore: RnsCore) {
                     reassembler.feed(inbound.sourceHash, inbound.frame, System.currentTimeMillis())
                         ?.also { Log.i(TAG, "reassembled ${it.size} bytes over LXMF") }
                 }
-            whole?.let { draw(it, renderer, freshness, deliver) }
+            val offers = onOffer
+            when {
+                whole == null -> Unit
+                offers != null && TakPayload.kindOf(whole) == TakPayload.FILE_OFFER_V1 -> offers(whole, inbound.sourceHash)
+                else -> draw(whole, renderer, freshness, deliver)
+            }
             return
         }
         when (val rendered = renderer.render(inbound, System.currentTimeMillis(), signedBy)) {

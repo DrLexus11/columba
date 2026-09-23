@@ -404,7 +404,7 @@ class CotEndpointManager
                         TakFileTransfers.inDirectory(
                             context.noBackupFilesDir, rnsCore, session.lxmf, session.registry, session.pipeline.ourUid, deliver,
                         )
-                    val fileJobs = files.also { session.files = it }.start(this)
+                    val fileJobs = files.also { session.files = it; session.fragments.onOffer = it::onOffer }.start(this)
                     val fromLxmf =
                         launch {
                             session.lxmf.frames().collect { inbound ->
@@ -667,14 +667,15 @@ class CotEndpointManager
             // the bench, 2026-09-22. Nobody on the team by that name is
             // refused, not broadcast.
             val recipients = MarkerAddressees.of(cotXml, session.registry, System.currentTimeMillis())
-            if (recipients != null && recipients.isEmpty()) {
-                Log.i(TAG, "Event addressed to nobody on this team; not sent, and not broadcast instead")
-                return
-            }
-            session.files?.offered(cotXml, recipients)
-            val frames = session.pipeline.frames(cotXml)
-            session.versions.submit(cotXml, frames, recipients) { version ->
-                session.fragments.sendVersion(version, session.registry, session.lxmf, recipients) { fanOut(it, session) }
+            when {
+                recipients != null && recipients.isEmpty() ->
+                    Log.i(TAG, "Event addressed to nobody on this team; not sent, and not broadcast instead")
+                // A file notice goes as a compact offer, not as ATAK's CoT.
+                session.files?.offered(cotXml, recipients) == true -> Unit
+                else ->
+                    session.versions.submit(cotXml, session.pipeline.frames(cotXml), recipients) { version ->
+                        session.fragments.sendVersion(version, session.registry, session.lxmf, recipients) { fanOut(it, session) }
+                    }
             }
         }
 

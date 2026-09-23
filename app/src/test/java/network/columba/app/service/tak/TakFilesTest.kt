@@ -108,7 +108,8 @@ class TakFilesTest {
         store = TakFileStore(folder.newFolder())
         return TakFileTransfers(
             store, TakFileServer(store), rnsCore, carrier, { toAtak += String(it, Charsets.UTF_8) },
-            ourUid = ourUid, nameOf = { if (it.contentEquals(deck)) "DECK" else "LEXUS" }, clock = { now },
+            TakFileTransfers.Team(ourUid = ourUid, nameOf = { if (it.contentEquals(deck)) "DECK" else "LEXUS" }),
+            clock = { now },
         )
     }
 
