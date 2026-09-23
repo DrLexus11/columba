@@ -127,6 +127,7 @@ class TakFileOfferTest {
     private val carrier = mockk<TakLxmf.Carrier>()
     private val toAtak = mutableListOf<String>()
     private val requests = mutableListOf<ByteArray>()
+    private lateinit var store: TakFileStore
 
     private fun transfers(rtt: Double): TakFileTransfers {
         val identity = Identity(ByteArray(16) { 0x01 }, ByteArray(64) { 0x02 }, null)
@@ -140,7 +141,7 @@ class TakFileOfferTest {
         }
         coEvery { rnsCore.probeLinkSpeed(any(), any(), any()) } returns
             LinkSpeedProbeResult("success", 40_000, null, rtt, 2, false)
-        val store = TakFileStore(folder.newFolder())
+        store = TakFileStore(folder.newFolder())
         return TakFileTransfers(
             store, TakFileServer(store), rnsCore, carrier, { toAtak += String(it, Charsets.UTF_8) },
             TakFileTransfers.Team(ourUid = "urtn-" + "44".repeat(16), isMember = { true }, nameOf = { "DECK" }),
@@ -171,6 +172,21 @@ class TakFileOfferTest {
             assertEquals(1, notices.size)
             assertTrue(TakFiles.parseNotice(notices.single())!!.filename.endsWith("_preview.zip"))
             assertTrue(toAtak.any { "A preview is on the map" in it })
+        }
+
+    @Test
+    fun `the preview is deleted when the full file arrives`() =
+        runTest {
+            val files = transfers(rtt = 1.8)
+            val (frame, hash) = offerFrame()
+            files.onOffer(frame, inboxOfDeck)
+            val preview = TakFiles.parseNotice(toAtak.first { "b-f-t-r" in it })!!.hash
+            assertTrue(store.has(preview))
+
+            files.onFile(TakLxmf.Inbound(inboxOfDeck, TakFiles.encodeFile(hash, "20260922_182231.jpg.zip", quickpic())))
+
+            assertTrue(store.has(hash))
+            assertTrue("the preview is gone once the picture is here", !store.has(preview))
         }
 
     @Test

@@ -45,6 +45,12 @@ fun HeldFilesCard(
     onDeleteAll: () -> Unit,
 ) {
     var confirmAll by remember { mutableStateOf(false) }
+    // A page at a time: over a day in the field this list only grows, and a
+    // card that scrolls for ever buries everything below it on the page.
+    var page by remember { mutableStateOf(0) }
+    val pages = maxOf(1, (held.size + PAGE_SIZE - 1) / PAGE_SIZE)
+    if (page >= pages) page = pages - 1
+    val shown = held.drop(page * PAGE_SIZE).take(PAGE_SIZE)
 
     network.columba.app.ui.components.CollapsibleSettingsCard(
         title = "Files held",
@@ -57,7 +63,10 @@ fun HeldFilesCard(
                 if (held.isEmpty()) {
                     "No data packages or QuickPics are held on this phone."
                 } else {
-                    "${held.size} file(s), ${TakFiles.sizeText(held.sumOf { it.size })}. Kept until deleted here."
+                    "${held.size} file(s), ${TakFiles.sizeText(held.sumOf { it.size })}: " +
+                        TakFileStore.Kind.entries.mapNotNull { kind ->
+                            held.count { it.kind == kind }.takeIf { it > 0 }?.let { "$it ${kindText(kind).lowercase()}" }
+                        }.joinToString(", ") + ". Kept until deleted here."
                 },
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -71,7 +80,7 @@ fun HeldFilesCard(
         )
         Spacer(modifier = Modifier.height(8.dp))
 
-        held.forEach { file ->
+        shown.forEach { file ->
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 verticalAlignment = Alignment.CenterVertically,
@@ -93,6 +102,21 @@ fun HeldFilesCard(
                 IconButton(onClick = { onDelete(file.hash) }) {
                     Icon(Icons.Default.Delete, contentDescription = "Delete ${file.name}")
                 }
+            }
+        }
+
+        if (pages > 1) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween,
+            ) {
+                TextButton(onClick = { page -= 1 }, enabled = page > 0) { Text("Newer") }
+                Text(
+                    text = "${page * PAGE_SIZE + 1}-${page * PAGE_SIZE + shown.size} of ${held.size}",
+                    style = MaterialTheme.typography.bodySmall,
+                )
+                TextButton(onClick = { page += 1 }, enabled = page < pages - 1) { Text("Older") }
             }
         }
 
@@ -119,6 +143,9 @@ fun HeldFilesCard(
         )
     }
 }
+
+/** Rows per page: enough to recognise the latest, few enough to leave the page usable. */
+private const val PAGE_SIZE = 5
 
 private fun kindText(kind: TakFileStore.Kind) =
     when (kind) {

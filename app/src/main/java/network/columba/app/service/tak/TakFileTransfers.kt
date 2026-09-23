@@ -113,6 +113,9 @@ class TakFileTransfers(
     ) {
         @Volatile var previewed = false
 
+        /** The preview package made for this file, deleted when the file arrives. */
+        @Volatile var previewHash: String? = null
+
         @Volatile var nextTryAt = since
 
         @Volatile var backoffMs = FIRST_RETRY_MS
@@ -216,6 +219,7 @@ class TakFileTransfers(
         entry.previewed = true
         val (bytes, filename) = TakFileOffer.preview(offer, nameOf(entry.sender), clock())
         val hash = store.put(bytes, filename) ?: return false
+        entry.previewHash = hash
         val shown = TakFileOffer.Offer(offer.senderId, hash, bytes.size.toLong(), filename, offer.point)
         deliver(
             TakFiles.Notice(hash, filename, bytes.size.toLong()),
@@ -274,6 +278,9 @@ class TakFileTransfers(
                 Log.w(TAG, "${entry.notice.filename} could not be stored")
             else -> {
                 pending.remove(file.hash)
+                // The full package replaces the preview in ATAK; here too, so
+                // the list does not keep a copy nobody needs.
+                entry.previewHash?.let { store.delete(it) }
                 Log.i(TAG, "${entry.notice.filename} arrived, ${file.data.size} bytes, in ${(clock() - entry.since) / 1000}s")
                 deliver(entry.notice, entry.xml)
             }
