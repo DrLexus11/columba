@@ -33,7 +33,13 @@ object TakFileParts {
     fun decodeRequest(frame: ByteArray?): Request? {
         if (frame == null || frame.size != HEAD_BYTES || frame[0].toInt() != TakPayload.FILE_PART_REQUEST_V1) return null
         val buffer = ByteBuffer.wrap(frame, 1 + TakFiles.HASH_BYTES, 8)
-        return Request(hashOf(frame), buffer.int.toLong() and 0xFFFFFFFFL, buffer.int)
+        val offset = buffer.int.toLong() and 0xFFFFFFFFL
+        // Signed on the wire, so a negative length decodes as one -- and the
+        // sender then computes an end before the offset and copyOfRange throws
+        // inside the LXMF collector. No request asks for nothing or for more
+        // than a part.
+        val length = buffer.int
+        return Request(hashOf(frame), offset, length).takeIf { length in 1..PART_BYTES }
     }
 
     fun encodePart(hash: String, offset: Long, total: Long, data: ByteArray): ByteArray =
@@ -46,6 +52,10 @@ object TakFileParts {
         val buffer = ByteBuffer.wrap(frame, 1 + TakFiles.HASH_BYTES, 8)
         val offset = buffer.int.toLong() and 0xFFFFFFFFL
         val total = buffer.int.toLong() and 0xFFFFFFFFL
+        // Bounded before the data is copied: a total up to 4 GiB, or a part
+        // larger than any request asks for, describes nothing this store would
+        // keep.
+        if (total !in 1..TakFiles.MAX_FILE_BYTES.toLong() || frame.size - HEAD_BYTES > PART_BYTES) return null
         val data = frame.copyOfRange(HEAD_BYTES, frame.size)
         return Part(hashOf(frame), offset, total, data).takeIf { offset + data.size <= total }
     }

@@ -76,7 +76,7 @@ object TakFileOffer {
 
     /** An offer, or null for anything that is not a well-formed one. */
     fun decode(frame: ByteArray?): Offer? {
-        if (frame == null || frame.size < HEAD_BYTES || frame[0].toInt() != TakPayload.FILE_OFFER_V1) return null
+        if (frame == null || frame.size !in HEAD_BYTES..MAX_OFFER_BYTES || frame[0].toInt() != TakPayload.FILE_OFFER_V1) return null
         val buffer = ByteBuffer.wrap(frame)
         buffer.get()
         val senderId = buffer.int
@@ -84,6 +84,9 @@ object TakFileOffer {
         val size = buffer.int.toLong() and 0xFFFFFFFFL
         val flags = buffer.get().toInt() and 0xFF
         val nameLength = buffer.get().toInt() and 0xFF
+        // A layout this decoder does not know is refused, not guessed at; so
+        // is a size nothing here would store.
+        if (flags and (FLAG_POINT or FLAG_THUMB).inv() != 0 || size !in 1..TakFiles.MAX_FILE_BYTES.toLong()) return null
         return runCatching {
             val name = String(ByteArray(nameLength).also { buffer.get(it) }, Charsets.UTF_8)
             val point =
@@ -202,14 +205,14 @@ object TakFileOffer {
             "<?xml version='1.0' encoding='UTF-8' standalone='yes'?><event version='2.0' uid='$uid' type='b-i-x-i' " +
                 "time='$stamp' start='$stamp' stale='2099-01-01T00:00:00.000Z' how='h-g-i-g-o'>" +
                 "<point lat='${"%.7f".format(Locale.US, point.latE7 / 1e7)}' lon='${"%.7f".format(Locale.US, point.lonE7 / 1e7)}' " +
-                "hae='9999999.0' ce='9999999.0' le='9999999.0'/><detail><contact callsign='${senderCallsign.replace("'", "")} preview'/>" +
+                "hae='9999999.0' ce='9999999.0' le='9999999.0'/><detail><contact callsign='${esc(senderCallsign)} preview'/>" +
                 "<remarks>Preview over LoRa; the full picture follows on a fast path.</remarks></detail></event>"
         val manifest =
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?><MissionPackageManifest version=\"2\"><Configuration>" +
                 "<Parameter name=\"uid\" value=\"$uid\"/><Parameter name=\"name\" value=\"${esc(name)} (preview)\"/>" +
                 "<Parameter name=\"onReceiveImport\" value=\"true\"/><Parameter name=\"onReceiveDelete\" value=\"true\"/>" +
                 "</Configuration><Contents><Content ignore=\"false\" zipEntry=\"$uid/$uid.cot\"><Parameter name=\"uid\" value=\"$uid\"/>" +
-                "</Content><Content ignore=\"false\" zipEntry=\"$imageEntry\"><Parameter name=\"uid\" value=\"$uid\"/></Content>" +
+                "</Content><Content ignore=\"false\" zipEntry=\"${esc(imageEntry)}\"><Parameter name=\"uid\" value=\"$uid\"/></Content>" +
                 "</Contents></MissionPackageManifest>"
         val out = ByteArrayOutputStream()
         ZipOutputStream(out).use { zip ->
@@ -226,8 +229,7 @@ object TakFileOffer {
     private fun stamp(ms: Long): String =
         SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US).apply { timeZone = TimeZone.getTimeZone("UTC") }.format(Date(ms))
 
-    private fun esc(text: String) =
-        text.replace("&", "&amp;").replace("\"", "&quot;").replace("<", "&lt;").replace(">", "&gt;")
+    private fun esc(text: String) = CotAttributes.escape(text)
 
     private fun hexToBytes(hex: String): ByteArray = ByteArray(hex.length / 2) { hex.substring(it * 2, it * 2 + 2).toInt(16).toByte() }
 }

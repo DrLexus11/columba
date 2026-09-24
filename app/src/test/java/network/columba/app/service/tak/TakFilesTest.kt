@@ -125,7 +125,10 @@ class TakFilesTest {
             coVerify { carrier.send(deck, TakFileParts.encodeRequest(hash, 0, data.size), "", propagate = false) }
             assertTrue("ATAK is not offered what it cannot fetch yet", toAtak.isEmpty())
 
-            files.onFile(TakLxmf.Inbound(inboxOfDeck, TakFiles.encodeFile(hash, "Recon1.zip", data)))
+            // Answered the way a sender answers a part request: with the part.
+            // It used to be answered with a whole FILE_V1, which no sender sends
+            // in reply to a part request and which is now refused (review note 3).
+            files.onPart(TakLxmf.Inbound(inboxOfDeck, TakFileParts.encodePart(hash, 0, data.size.toLong(), data)))
 
             assertEquals(1, toAtak.size)
             assertTrue(toAtak.single().contains("http://127.0.0.1:8080/Marti/sync/content?hash=$hash"))
@@ -152,7 +155,7 @@ class TakFilesTest {
         }
 
     @Test
-    fun `a file from someone other than its sender is discarded`() =
+    fun `a part from someone other than its sender is discarded`() =
         runTest {
             val files = transfers(fastPath = true)
             files.intercept(notice().toByteArray(), sourceHash = inboxOfDeck)
@@ -161,11 +164,101 @@ class TakFilesTest {
                 Result.success(
                     Destination(stranger, "", identity, Direction.OUT, DestinationType.SINGLE, "rnstransport", listOf("tak", "node")),
                 )
-            files.onFile(TakLxmf.Inbound(inboxOfDeck, TakFiles.encodeFile(hash, "Recon1.zip", data)))
+            files.onPart(TakLxmf.Inbound(inboxOfDeck, TakFileParts.encodePart(hash, 0, data.size.toLong(), data)))
 
             assertTrue(toAtak.isEmpty())
             assertEquals(1, files.waiting())
         }
+
+    // ---- review notes ----
+
+    /**
+     * Note 3. A whole file is never asked for -- this handset fetches in parts
+     * -- so one arriving is pushed, not fetched. A pending offer used to be
+     * enough to accept it, which let a sender deliver over a slow path exactly
+     * the file the fetch gate had deferred.
+     */
+    @Test
+    fun `a whole file pushed while its offer waits on a slow path is refused`() =
+        runTest {
+            val files = transfers(fastPath = false)
+            files.intercept(notice().toByteArray(), sourceHash = inboxOfDeck)
+            assertEquals("deferred: the path is slow", 1, files.waiting())
+
+            files.onFile(TakLxmf.Inbound(inboxOfDeck, TakFiles.encodeFile(hash, "Recon1.zip", data)))
+
+            assertFalse("a pushed file must not be stored", store.has(hash))
+            assertEquals("still waiting for a fast path", 1, files.waiting())
+            assertTrue(toAtak.none { "Marti/sync/content" in it })
+        }
+
+    /** Note 7. The length is signed on the wire; a request for nothing or for too much means nothing. */
+    @Test
+    fun `a part request of no length, a negative one, or more than a part is refused`() {
+        for (length in listOf(-1, 0, Int.MIN_VALUE, TakFileParts.PART_BYTES + 1)) {
+            assertNull("length $length", TakFileParts.decodeRequest(TakFileParts.encodeRequest(hash, 0, length)))
+        }
+        assertEquals(TakFileParts.PART_BYTES, TakFileParts.decodeRequest(TakFileParts.encodeRequest(hash, 0, TakFileParts.PART_BYTES))!!.length)
+    }
+
+    /** Note 7, the same file's second site: a part's total has the store's bound too. */
+    @Test
+    fun `a part claiming a total nothing here would store is refused`() {
+        for (total in listOf(0L, TakFiles.MAX_FILE_BYTES + 1L)) {
+            assertNull("total $total", TakFileParts.decodePart(TakFileParts.encodePart(hash, 0, total, ByteArray(0))))
+        }
+        assertTrue(TakFileParts.decodePart(TakFileParts.encodePart(hash, 0, data.size.toLong(), data)) != null)
+    }
+
+    /**
+     * Note 9. Granted before the offer is sent. The sends suspend, and a
+     * recipient on a fast path can ask for the file before they return --
+     * which used to find no grant and be refused.
+     */
+    @Test
+    fun `a recipient is granted the file before the offer reaches them`() =
+        runTest {
+            val files = transfers(fastPath = true)
+            assertEquals(hash, store.put(data, "Recon1.zip"))
+            var grantedWhenSent: Boolean? = null
+            coEvery { carrier.send(any(), any(), any(), any(), any()) } answers {
+                grantedWhenSent = store.mayFetch(hash, deck) { false }
+                "sent"
+            }
+
+            assertTrue(files.offered(notice(), listOf(deck)))
+
+            assertEquals("the grant must already be recorded when the offer goes out", true, grantedWhenSent)
+        }
+
+    /**
+     * Note 2. A declared body past the cap is refused before a byte is
+     * allocated. coerceIn used to clamp it to the cap and then allocate and
+     * read all 64 MiB. Sent over a raw socket, because no HTTP client will
+     * declare a length it does not then send.
+     */
+    @Test
+    fun `a declared body over the cap is refused without being read`() {
+        val server = TakFileServer(TakFileStore(folder.newFolder()), port = 28081)
+        val scope = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.IO)
+        server.start(scope)
+        try {
+            Thread.sleep(300)
+            for (declared in listOf("999999999999", "-5", "not-a-number")) {
+                java.net.Socket("127.0.0.1", 28081).use { socket ->
+                    socket.soTimeout = 5_000
+                    socket.getOutputStream().write(
+                        ("POST /Marti/sync/missionupload?hash=$hash HTTP/1.1\r\n" +
+                            "Content-Length: $declared\r\n\r\n").toByteArray(),
+                    )
+                    val status = socket.getInputStream().bufferedReader().readLine().orEmpty()
+                    assertTrue("declared $declared answered: $status", status.startsWith("HTTP/1.1 413"))
+                }
+            }
+        } finally {
+            scope.coroutineContext[kotlinx.coroutines.Job]?.cancel()
+        }
+    }
 
     @Test
     fun `anything that is not a notice passes through`() =

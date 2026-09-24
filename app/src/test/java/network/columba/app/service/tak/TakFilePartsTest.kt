@@ -149,4 +149,38 @@ class TakFilePartsTest {
             partArrives(files, 100)
             assertEquals(0L, store.partialSize(bigHash))
         }
+
+    // Review note 4: only the part asked for, while it is still waited for.
+
+    @Test
+    fun `a part of another length, or claiming another size, is not kept`() =
+        runTest {
+            val files = transfers()
+            offered(files)
+            files.onPart(TakLxmf.Inbound(inbox, TakFileParts.encodePart(bigHash, 0, big.size.toLong(), big.copyOfRange(0, 1000))))
+            files.onPart(
+                TakLxmf.Inbound(
+                    inbox,
+                    TakFileParts.encodePart(bigHash, 0, big.size * 4L, big.copyOfRange(0, TakFileParts.FIRST_PART_BYTES)),
+                ),
+            )
+            assertEquals(0L, store.partialSize(bigHash))
+        }
+
+    @Test
+    fun `a late part after the transfer paused is not kept`() =
+        runTest {
+            val files = transfers()
+            offered(files)
+            partArrives(files, 20_000)
+            val had = store.partialSize(bigHash)
+            val late = TakFileParts.FIRST_PART_BYTES.toLong()
+            files.onPart(
+                TakLxmf.Inbound(
+                    inbox,
+                    TakFileParts.encodePart(bigHash, late, big.size.toLong(), big.copyOfRange(late.toInt(), late.toInt() + TakFileParts.PART_BYTES)),
+                ),
+            )
+            assertEquals("paused: nothing outstanding to accept", had, store.partialSize(bigHash))
+        }
 }

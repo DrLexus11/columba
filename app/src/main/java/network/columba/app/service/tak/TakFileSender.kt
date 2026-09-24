@@ -44,9 +44,15 @@ class TakFileSender(
             Log.w(TAG, "${notice.filename} offered but never uploaded here; nobody will be able to fetch it")
             return false
         }
-        sendOffer(notice, recipients)
+        // Granted before the offer is published, not after. The sends below
+        // suspend, and a recipient on a fast path can read the offer and ask
+        // for the first part before they return -- which then found no grant,
+        // was refused, and was not necessarily asked again, leaving a valid
+        // transfer stuck. Nothing can ask for a file before it is offered, so
+        // granting first opens no window that sending first had closed.
         store.grant(notice.hash, recipients)
         recipients?.forEach { offers[notice.hash + it.toHex()] = Offer(notice.filename, notice.size, it, clock()) }
+        sendOffer(notice, recipients)
         Log.i(TAG, "${notice.filename} offered to ${recipients?.let { "${it.size} member(s)" } ?: "the team"}")
         return true
     }

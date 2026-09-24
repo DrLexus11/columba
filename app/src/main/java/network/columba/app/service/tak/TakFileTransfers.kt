@@ -6,6 +6,8 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import network.columba.app.rns.api.RnsCore
 import network.columba.app.rns.api.model.LinkSpeedProbeResult
 import java.util.concurrent.ConcurrentHashMap
@@ -122,6 +124,37 @@ class TakFileTransfers(
 
         /** When the part in flight was asked for; 0 when none is. */
         @Volatile var askedAt = 0L
+
+        /** Where the part in flight starts, and how long it is. */
+        @Volatile var askedOffset = -1L
+
+        @Volatile var askedLength = 0
+
+        /**
+         * Whether [part] is the one asked for and still waited for: a request
+         * is in flight, and the part matches it on offset, length and the
+         * file's size. A late answer after a pause, another offset or length,
+         * or a different total would each drive the gate on something it did
+         * not measure.
+         */
+        fun isOutstanding(part: TakFileParts.Part): Boolean =
+            askedAt != 0L &&
+                part.offset == askedOffset &&
+                part.data.size == askedLength &&
+                part.total == notice.size
+
+        /**
+         * Serialises everything that asks for a part of this file.
+         *
+         * The retry tick's [attempt] and an arriving [onPart] both end in
+         * [requestPart], and both suspend -- on the probe and on the send --
+         * with the request state updated only around them. Racing, they asked
+         * for the same offset twice: one answer was then thrown away by
+         * appendPartial, a whole direct LXMF transfer wasted, and the next
+         * tick could repeat it. A coroutine lock, because both hold it across
+         * a suspension.
+         */
+        val mutex = Mutex()
     }
 
     private val pending = ConcurrentHashMap<String, Pending>()
@@ -211,18 +244,20 @@ class TakFileTransfers(
         return true
     }
 
-    /** A file arrived. Kept only if it was asked for, from whom it was asked. */
-    suspend fun onFile(inbound: TakLxmf.Inbound) {
-        val file = TakFiles.decodeFile(inbound.frame)
-        val entry = file?.let { pending[it.hash] }
-        val from = entry?.let { TakLxmf.memberForLxmf(rnsCore, inbound.sourceHash) }
-        when {
-            file == null -> Log.w(TAG, "A file arrived that is not what its hash names; discarded")
-            entry == null -> Log.w(TAG, "A file arrived that was not asked for; discarded")
-            from == null || !from.contentEquals(entry.sender) ->
-                Log.w(TAG, "${entry.notice.filename} arrived from someone other than its sender; discarded")
-            else -> complete(entry, file.data, file.name)
-        }
+    /**
+     * A whole file arrived. Always refused: this handset never asks for one.
+     *
+     * It fetches in parts, each requested and timed, only over a path measured
+     * to be fast -- see [onPart]. A whole file is what an *older* receiver
+     * asks for, and this handset answers those in [TakFileSender.onRequest];
+     * it never sends that request itself, so one arriving here was pushed,
+     * not fetched. Accepting it because an offer happened to be pending let a
+     * sender deliver a file the fetch gate had deliberately deferred -- over a
+     * slow path, stored and shown as though it had been asked for.
+     */
+    fun onFile(inbound: TakLxmf.Inbound) {
+        val name = TakFiles.decodeFile(inbound.frame)?.name ?: "a file"
+        Log.w(TAG, "$name arrived whole and unasked; this handset fetches in parts. Discarded")
     }
 
     /**
@@ -233,24 +268,34 @@ class TakFileTransfers(
         val part = TakFileParts.decodePart(inbound.frame)
         val entry = part?.let { pending[it.hash] }
         val from = entry?.let { TakLxmf.memberForLxmf(rnsCore, inbound.sourceHash) }
-        when {
-            part == null || entry == null || from == null || !from.contentEquals(entry.sender) ->
-                Log.w(TAG, "A part arrived that was not asked for, or not from its sender; discarded")
-            !store.appendPartial(part.hash, part.offset, part.data) -> Unit
-            store.partialSize(part.hash) >= part.total ->
-                store.takePartial(part.hash)?.let { complete(entry, it, entry.notice.filename) }
-            else -> {
-                val have = store.partialSize(part.hash)
-                val took = clock() - entry.askedAt
-                val left = TakFileParts.msLeft(part.total - have, part.data.size, took)
-                entry.askedAt = 0
-                Log.i(TAG, "${entry.notice.filename}: $have of ${part.total} bytes, last part in ${took}ms; the rest ~${left / 1000}s")
-                if (left <= TakFileParts.FETCH_BUDGET_MS) {
-                    requestPart(entry)
-                } else {
-                    waitForFastPath(entry, "at the rate this path is giving, the rest would take about ${maxOf(1, left / 60_000)} min")
+        if (part == null || entry == null || from?.contentEquals(entry.sender) != true) {
+            Log.w(TAG, "A part arrived that was not asked for, or not from its sender; discarded")
+            return
+        }
+        // The same lock attempt() takes: see Pending.mutex.
+        entry.mutex.withLock {
+            when {
+                // Only the part asked for, while it is still waited for: a late
+                // answer after a pause, another offset or length, or a different
+                // total would each drive the gate on something it did not measure.
+                !entry.isOutstanding(part) ->
+                    Log.w(TAG, "A part of ${entry.notice.filename} that was not the one outstanding; discarded")
+                !store.appendPartial(part.hash, part.offset, part.data) -> Unit
+                store.partialSize(part.hash) >= part.total ->
+                    store.takePartial(part.hash)?.let { complete(entry, it, entry.notice.filename) }
+                else -> {
+                    val have = store.partialSize(part.hash)
+                    val took = clock() - entry.askedAt
+                    val left = TakFileParts.msLeft(part.total - have, part.data.size, took)
+                    entry.askedAt = 0
+                    Log.i(TAG, "${entry.notice.filename}: $have of ${part.total} bytes, last part in ${took}ms; the rest ~${left / 1000}s")
+                    if (left <= TakFileParts.FETCH_BUDGET_MS) {
+                        requestPart(entry)
+                    } else {
+                        waitForFastPath(entry, "at the rate this path is giving, the rest would take about ${maxOf(1, left / 60_000)} min")
+                    }
                 }
-            }
+        }
         }
     }
 
@@ -261,6 +306,8 @@ class TakFileTransfers(
         val request = TakFileParts.encodeRequest(entry.notice.hash, offset, length)
         if (lxmf.send(entry.sender, request, "", propagate = false) == null) return false
         entry.askedAt = clock()
+        entry.askedOffset = offset
+        entry.askedLength = length
         // A part that never comes -- a link that dropped -- is asked for again
         // on the retry tick after the budget, from wherever the file got to.
         entry.nextTryAt = entry.askedAt + TakFileParts.FETCH_BUDGET_MS
@@ -308,8 +355,12 @@ class TakFileTransfers(
         }
     }
 
-    private suspend fun attempt(entry: Pending) {
+    private suspend fun attempt(entry: Pending) = entry.mutex.withLock {
         val now = clock()
+        // Re-checked under the lock. An onPart that held it may already have
+        // asked for the next part, moving nextTryAt on; attempting anyway is
+        // the duplicate request this lock exists to prevent.
+        if (now < entry.nextTryAt) return@withLock
         // Claimed before the probe, which takes seconds over LoRa: the retry
         // tick must not start a second probe of the same path meanwhile.
         entry.nextTryAt = now + REQUEST_WAIT_MS
@@ -327,6 +378,7 @@ class TakFileTransfers(
 
     /** Hold the file, show a preview if there is one, and try again later. */
     private suspend fun waitForFastPath(entry: Pending, reason: String?) {
+        entry.askedAt = 0
         Log.i(TAG, "${reason ?: "Slow or no path"}; ${entry.notice.filename} waits, next try in ${entry.backoffMs / 1000}s")
         entry.nextTryAt = clock() + entry.backoffMs
         entry.backoffMs = minOf(entry.backoffMs * 2, MAX_RETRY_MS)

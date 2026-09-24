@@ -129,6 +129,13 @@ class TakFileOfferTest {
     private val requests = mutableListOf<ByteArray>()
     private lateinit var store: TakFileStore
 
+    /** Moved on by hand, so a test can outlast a retry backoff without sleeping. */
+    private var now = 1_790_000_000_000L
+
+    private fun fastProbe() =
+        coEvery { rnsCore.probeLinkSpeed(any(), any(), any()) } returns
+            LinkSpeedProbeResult("success", 40_000, null, 0.04, 2, false)
+
     private fun transfers(rtt: Double): TakFileTransfers {
         val identity = Identity(ByteArray(16) { 0x01 }, ByteArray(64) { 0x02 }, null)
         coEvery { rnsCore.recallIdentity(any()) } returns identity
@@ -145,6 +152,7 @@ class TakFileOfferTest {
         return TakFileTransfers(
             store, TakFileServer(store), rnsCore, carrier, { toAtak += String(it, Charsets.UTF_8) },
             TakFileTransfers.Team(ourUid = "urtn-" + "44".repeat(16), isMember = { true }, nameOf = { "DECK" }),
+            clock = { now },
         )
     }
 
@@ -175,19 +183,63 @@ class TakFileOfferTest {
             assertTrue(toAtak.any { "A preview is on the map" in it })
         }
 
+    /** An offer built from [pkg] itself, so the bytes fetched are the bytes offered. */
+    private fun offerFrameFor(pkg: ByteArray): Pair<ByteArray, String> {
+        val hash = TakFiles.sha256Hex(pkg)
+        val offer = TakFileOffer.offerFor(TakMembership.senderIdFor(deck), hash, "20260922_182231.jpg.zip", pkg, fakeThumbnailer)
+        return TakFileOffer.encode(offer) to hash
+    }
+
+    /**
+     * The file arrives the way it really does: the path turns fast, it is
+     * asked for, and it comes in parts.
+     *
+     * It used to be pushed whole, unasked, over the slow path the preview was
+     * made for -- which is the gate bypass review note 3 closed, and which
+     * this test was quietly relying on. The package is built once: quickpic()
+     * stamps zip entries with the current time, so two builds can hash apart.
+     */
     @Test
     fun `the preview is deleted when the full file arrives`() =
         runTest {
+            val pkg = quickpic()
             val files = transfers(rtt = 1.8)
-            val (frame, hash) = offerFrame()
+            val (frame, hash) = offerFrameFor(pkg)
             files.onOffer(frame, inboxOfDeck)
             val preview = TakFiles.parseNotice(toAtak.first { "b-f-t-r" in it })!!.hash
             assertTrue(store.has(preview))
 
-            files.onFile(TakLxmf.Inbound(inboxOfDeck, TakFiles.encodeFile(hash, "20260922_182231.jpg.zip", quickpic())))
+            fastProbe()
+            now += TakFileTransfers.MAX_RETRY_MS
+            requests.clear()
+            files.retryDue()
+            val asked = TakFileParts.decodeRequest(requests.single())!!
+            val slice = pkg.copyOfRange(asked.offset.toInt(), (asked.offset + asked.length).toInt())
+            files.onPart(TakLxmf.Inbound(inboxOfDeck, TakFileParts.encodePart(hash, asked.offset, pkg.size.toLong(), slice)))
 
             assertTrue(store.has(hash))
             assertTrue("the preview is gone once the picture is here", !store.has(preview))
+        }
+
+    /**
+     * Note 3, the case this file is about: a QuickPic offered over a slow path
+     * gets a preview and waits. The sender pushing the whole picture anyway
+     * must not be taken as the fetch the gate deferred.
+     */
+    @Test
+    fun `a picture pushed whole over the slow path is refused and the preview stays`() =
+        runTest {
+            val pkg = quickpic()
+            val files = transfers(rtt = 1.8)
+            val (frame, hash) = offerFrameFor(pkg)
+            files.onOffer(frame, inboxOfDeck)
+            val preview = TakFiles.parseNotice(toAtak.first { "b-f-t-r" in it })!!.hash
+
+            files.onFile(TakLxmf.Inbound(inboxOfDeck, TakFiles.encodeFile(hash, "20260922_182231.jpg.zip", pkg)))
+
+            assertTrue("a pushed picture must not be stored", !store.has(hash))
+            assertTrue("the preview stays until the picture is fetched", store.has(preview))
+            assertTrue("nothing was asked for over the slow path", requests.isEmpty())
         }
 
     @Test

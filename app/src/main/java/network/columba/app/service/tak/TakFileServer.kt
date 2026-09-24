@@ -46,7 +46,14 @@ class TakFileServer(
     /** What a rewritten notice, and an upload's reply, point ATAK at. */
     val base: String get() = "http://$HOST:$port"
 
-    private class Request(val method: String, val path: String, val headers: Map<String, String>, val body: ByteArray)
+    private class Request(
+        val method: String,
+        val path: String,
+        val headers: Map<String, String>,
+        val body: ByteArray,
+        /** A declared body this server will not read; answered 413, never allocated. */
+        val tooLarge: Boolean = false,
+    )
 
     /** Serve until [scope] ends. The socket is closed with it. */
     fun start(scope: CoroutineScope): Job =
@@ -75,6 +82,10 @@ class TakFileServer(
         val out = client.getOutputStream()
         val reply: Triple<Int, ByteArray, Map<String, String>> =
             when {
+                request.tooLarge -> {
+                    Log.w(TAG, "Refused a request declaring a body over ${MAX_BODY / (1024 * 1024)} MiB")
+                    Triple(413, ByteArray(0), emptyMap())
+                }
                 request.method == "GET" && route == "/Marti/sync/missionquery" ->
                     if (hash != null && store.has(hash)) ok(url(hash)) else notFound()
                 request.method == "GET" && route == "/Marti/sync/content" -> content(hash)
@@ -86,13 +97,34 @@ class TakFileServer(
                 }
             }
         val (code, body, headers) = reply
-        val status = if (code == 200) "200 OK" else if (code == 400) "400 Bad Request" else "404 Not Found"
-        val head = StringBuilder("HTTP/1.1 $status\r\nContent-Length: ${body.size}\r\nConnection: close\r\n")
+        val head = StringBuilder("HTTP/1.1 ${statusText(code)}\r\nContent-Length: ${body.size}\r\nConnection: close\r\n")
         headers.forEach { (key, value) -> head.append("$key: $value\r\n") }
         out.write(head.append("\r\n").toString().toByteArray())
         out.write(body)
         out.flush()
     }
+
+    /**
+     * An attachment header for [name] that cannot become another header. The
+     * name came over the mesh: control characters (a CR/LF would start a new
+     * header), quotes and backslashes go, and a name beyond ASCII is carried
+     * RFC 5987-encoded beside a plain fallback. The Kotlin half of
+     * `content_disposition` in `tools/tak_file_service.py`.
+     */
+    internal fun contentDisposition(name: String): String {
+        val safe = name.filter { !it.isISOControl() && it != '"' && it != '\\' }.ifEmpty { "file" }
+        val plain = safe.map { if (it.code < 128) it else '?' }.joinToString("")
+        val encoded = java.net.URLEncoder.encode(safe, "UTF-8").replace("+", "%20")
+        return "attachment; filename=\"$plain\"" + if (plain != safe) "; filename*=UTF-8''$encoded" else ""
+    }
+
+    private fun statusText(code: Int): String =
+        when (code) {
+            200 -> "200 OK"
+            400 -> "400 Bad Request"
+            413 -> "413 Payload Too Large"
+            else -> "404 Not Found"
+        }
 
     private fun url(hash: String) = TakFiles.contentUrl(base, hash).toByteArray()
 
@@ -106,11 +138,11 @@ class TakFileServer(
             Log.w(TAG, "ATAK asked for a file that is not held here")
             return notFound()
         }
-        val name = store.nameOf(hash).replace("\"", "")
+        val name = store.nameOf(hash)
         Log.i(TAG, "Serving $name (${data.size} bytes) to ATAK")
         return ok(
             data,
-            mapOf("Content-Type" to "application/octet-stream", "Content-Disposition" to "attachment; filename=\"$name\""),
+            mapOf("Content-Type" to "application/octet-stream", "Content-Disposition" to contentDisposition(name)),
         )
     }
 
@@ -173,7 +205,21 @@ class TakFileServer(
             val colon = line.indexOf(':')
             if (colon > 0) headers[line.substring(0, colon).trim().lowercase()] = line.substring(colon + 1).trim()
         }
-        val length = headers["content-length"]?.toIntOrNull()?.coerceIn(0, MAX_BODY) ?: 0
+        val parts = requestLine.split(" ")
+        val method = parts.getOrElse(0) { "" }
+        val path = parts.getOrElse(1) { "" }
+        // Absent means no body. Present and unreadable, negative, or past the
+        // cap is refused before a byte is allocated: coerceIn used to clamp a
+        // declared 4 GB down to MAX_BODY and then allocate and read all 64 MiB
+        // of it before the upload was rejected.
+        val declared = headers["content-length"]
+        val length = if (declared == null) 0 else declared.toIntOrNull()?.takeIf { it in 0..MAX_BODY }
+        val body = length?.let { readBody(input, it) } ?: ByteArray(0)
+        return Request(method, path, headers, body, tooLarge = length == null)
+    }
+
+    /** Up to [length] bytes of body; fewer if the client stops sending. */
+    private fun readBody(input: InputStream, length: Int): ByteArray {
         val body = ByteArray(length)
         var got = 0
         while (got < length) {
@@ -181,8 +227,7 @@ class TakFileServer(
             if (n < 0) break
             got += n
         }
-        val parts = requestLine.split(" ")
-        return Request(parts.getOrElse(0) { "" }, parts.getOrElse(1) { "" }, headers, body.copyOf(got))
+        return body.copyOf(got)
     }
 
     private fun readLine(input: InputStream): String? {

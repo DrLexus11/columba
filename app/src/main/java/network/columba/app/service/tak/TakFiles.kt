@@ -94,7 +94,9 @@ object TakFiles {
                 ?.getElementsByTagName("fileshare")?.item(0) as? org.w3c.dom.Element
         val hash = share?.getAttribute("sha256")?.lowercase()
         return if (share != null && isHash(hash)) {
-            Notice(hash!!, share.getAttribute("filename"), share.getAttribute("sizeInBytes").toLongOrNull() ?: 0L)
+            // A size nothing here would store is not an offer.
+            share.getAttribute("sizeInBytes").toLongOrNull()?.takeIf { it in 1..MAX_FILE_BYTES.toLong() }
+                ?.let { Notice(hash!!, share.getAttribute("filename"), it) }
         } else {
             null
         }
@@ -115,12 +117,18 @@ object TakFiles {
                 .apply { timeZone = TimeZone.getTimeZone("UTC") }
                 .format(Date(ms))
         }
-        return cotXml
-            .replaceFirst(Regex("senderUrl=\"[^\"]*\""), "senderUrl=\"$url\"")
-            .replaceFirst(Regex("\\btime=\"[^\"]*\""), "time=\"${stamp(nowMs)}\"")
-            .replaceFirst(Regex("\\bstart=\"[^\"]*\""), "start=\"${stamp(nowMs)}\"")
-            .replaceFirst(Regex("\\bstale=\"[^\"]*\""), "stale=\"${stamp(nowMs + NOTICE_STALE_MS)}\"")
+        // senderUrl only on <fileshare>, the times only on <event>, each set by
+        // walking the tag's attributes -- never by searching the document, where
+        // an earlier senderUrl, or one inside another attribute's value, would
+        // be the one rewritten. Values go in escaped and literal.
+        val share = Regex("<fileshare\\b[^>]*>").find(cotXml) ?: throw IllegalArgumentException("no fileshare element")
+        var text = cotXml.replaceRange(share.range, CotAttributes.set(share.value, "senderUrl", url))
+        val head = Regex("<event\\b[^>]*>").find(text) ?: return text
+        val times = listOf("time" to stamp(nowMs), "start" to stamp(nowMs), "stale" to stamp(nowMs + NOTICE_STALE_MS))
+        text = text.replaceRange(head.range, times.fold(head.value) { tag, (name, value) -> CotAttributes.set(tag, name, value) })
+        return text
     }
+
 
     /** Who a status line comes from in ATAK's chat: this handset, not a teammate. */
     const val STATUS_UID = "COLUMBA-FILES"
