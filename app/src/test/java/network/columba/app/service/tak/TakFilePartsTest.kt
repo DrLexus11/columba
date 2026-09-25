@@ -2,6 +2,9 @@ package network.columba.app.service.tak
 
 import io.mockk.coEvery
 import io.mockk.mockk
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import network.columba.app.rns.api.RnsCore
 import network.columba.app.rns.api.model.Destination
@@ -182,5 +185,55 @@ class TakFilePartsTest {
                 ),
             )
             assertEquals("paused: nothing outstanding to accept", had, store.partialSize(bigHash))
+        }
+
+    // Review note 12: the retry tick and an arriving part must not both ask.
+
+    /**
+     * An arriving part asks for the next one while holding the file's lock,
+     * and the send suspends. The retry tick fires in that window, due by the
+     * clock. Unserialised, both reached requestPart and asked for the same
+     * offset -- one answer then thrown away by appendPartial, a whole direct
+     * LXMF transfer wasted. Now the tick waits for the lock, finds the part
+     * already asked for, and asks nothing.
+     */
+    @Test
+    fun `a retry tick during a part request does not ask for the same part again`() =
+        runTest {
+            val files = transfers()
+            offered(files)
+            val gate = CompletableDeferred<Unit>()
+            coEvery { carrier.send(any(), any(), any(), any(), any()) } coAnswers {
+                TakFileParts.decodeRequest(secondArg())?.let { requests += it }
+                gate.await()
+                "sent"
+            }
+            val first = requests.single()
+            now += 300
+            val arriving =
+                launch {
+                    files.onPart(
+                        TakLxmf.Inbound(
+                            inbox,
+                            TakFileParts.encodePart(bigHash, 0, big.size.toLong(), big.copyOfRange(0, first.length)),
+                        ),
+                    )
+                }
+            runCurrent()
+            assertEquals("the second part is being asked for", 2, requests.size)
+
+            // Past the first request's budget, so the tick is due by the clock.
+            now += TakFileParts.FETCH_BUDGET_MS + 1_000
+            val tick = launch { files.retryDue() }
+            runCurrent()
+            gate.complete(Unit)
+            arriving.join()
+            tick.join()
+
+            assertEquals(
+                "the same part was asked for twice",
+                1,
+                requests.count { it.offset == TakFileParts.FIRST_PART_BYTES.toLong() },
+            )
         }
 }
