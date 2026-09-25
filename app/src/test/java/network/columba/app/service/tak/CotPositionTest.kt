@@ -300,4 +300,29 @@ class CotPositionTest {
 
         assertEquals(0L, fix.fixUnixSeconds)
     }
+
+    /**
+     * Only ATAK's own report is this node's position. A friendly unit marker
+     * has the same position-shaped type, and routing it as position moved the
+     * operator's track to wherever the marker was dropped. The endpoint tells
+     * them apart by <takv>, which only the self-report carries.
+     */
+    @Test
+    fun `a friendly unit marker is position-shaped but not our own report`() {
+        val point = "<point lat=\"41.0151234\" lon=\"28.9791234\" hae=\"12\" ce=\"10\" le=\"10\"/>"
+        val selfReport =
+            "<event version=\"2.0\" uid=\"ANDROID-7b97a84747a7a79d\" type=\"a-f-G-U-C\" how=\"m-g\"" +
+                " time=\"2026-09-22T10:30:00Z\" start=\"2026-09-22T10:30:00Z\" stale=\"2026-09-22T10:32:00Z\">" +
+                point + "<detail><takv platform=\"ATAK-CIV\" version=\"5.8\"/>" +
+                "<contact callsign=\"IDLER\"/></detail></event>"
+        val friendlyMarker =
+            "<event version=\"2.0\" uid=\"c4f2e1a0-1111-2222-3333-444455556666\" type=\"a-f-G-U-C\"" +
+                " how=\"h-g-i-g-o\" time=\"2026-09-22T10:30:00Z\" start=\"2026-09-22T10:30:00Z\"" +
+                " stale=\"2026-09-23T10:30:00Z\">" + point +
+                "<detail><contact callsign=\"Rescue 2\"/></detail></event>"
+
+        assertTrue(CotPosition.isPosition(friendlyMarker))
+        assertNull("a marker is not a self-report", CotEvent.learnAtakUid(friendlyMarker))
+        assertEquals("ANDROID-7b97a84747a7a79d", CotEvent.learnAtakUid(selfReport))
+    }
 }

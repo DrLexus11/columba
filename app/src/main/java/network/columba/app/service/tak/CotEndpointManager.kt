@@ -189,6 +189,10 @@ class CotEndpointManager
 
         private var supervisor: Job? = null
 
+        /** The running session, for [reportOwnPosition]; null while stopped. */
+        @Volatile
+        private var live: Session? = null
+
         // Sockets rather than writers, so a client that has gone away can be
         // dropped by closing it. Guarded because the accept loop, each client
         // reader and the mesh listener all touch it.
@@ -309,18 +313,6 @@ class CotEndpointManager
         }
 
         /**
-         * A setup step that did not succeed, as the one exception
-         * [runEndpoint] retries on.
-         *
-         * Every step below fails for the same reason -- the backend is not
-         * ready yet -- and each has to say which step it was. One helper rather
-         * than a throw per step means the next step added is one line, and the
-         * retry contract stays stated in a single place.
-         */
-        private fun <T> Result<T>.orFail(step: String): T =
-            getOrElse { throw SetupFailure("$step: ${it.message}", it) }
-
-        /**
          * One session per run.
          *
          * The learned ATAK UID, the member list, the position cadence and the
@@ -341,6 +333,7 @@ class CotEndpointManager
             memberStore.load(registry, System.currentTimeMillis()).takeIf { it > 0 }?.let {
                 Log.i(TAG, "Restored $it team member(s) from before the restart")
             }
+            val remembered = settingsRepository.currentTakCallsign()
             return Session(
                 node = node,
                 keys = keys,
@@ -356,19 +349,9 @@ class CotEndpointManager
                         positionStaleMs = POSITION_STALE_MS,
                         chatStaleMs = CHAT_STALE_MS,
                     ),
-            )
+            ).also { it.rememberedCallsign = remembered }
         }
 
-        /**
-         * A setup step failed before the listener was ever offered the port.
-         *
-         * Distinct from an IOException out of bind() because the diagnosis is
-         * different and the cure is too: probing the port after a
-         * backend-not-ready error reports "still held from a previous run"
-         * about a port nothing has tried to take, and sends an operator looking
-         * for a second copy of the app that does not exist.
-         */
-        private class SetupFailure(message: String, cause: Throwable?) : IOException(message, cause)
 
         private suspend fun serve(keys: Keys) {
             // No group destination. Pivot 5: a group packet reaches only peers
@@ -404,6 +387,7 @@ class CotEndpointManager
                     )
                     publishState(session, clientsLock.withLock { clients.size })
                     session.versions.attach(this)
+                    live = session
 
                     val fromMesh = launch { pumpMeshToClients(session) }
                     // The same renderer the packet path uses: a chat line is
@@ -416,6 +400,11 @@ class CotEndpointManager
                         session.replay.hold(bytes, System.currentTimeMillis())
                         writeToClients(bytes, held = true)
                     }
+                    val files =
+                        TakFileTransfers.inDirectory(
+                            context.noBackupFilesDir, rnsCore, session.lxmf, session.registry, session.pipeline.ourUid, deliver,
+                        )
+                    val fileJobs = files.also { session.files = it; session.fragments.onOffer = it::onOffer }.start(this)
                     val fromLxmf =
                         launch {
                             session.lxmf.frames().collect { inbound ->
@@ -423,9 +412,11 @@ class CotEndpointManager
                                     TAG,
                                     "TAK frame arrived over LXMF, ${inbound.frame.size} bytes",
                                 )
+                                if (files.takeFile(inbound)) return@collect
+                                val toAtak = files.passing(inbound.sourceHash, deliver)
                                 session.fragments.deliver(
                                     inbound, session.reassembler, session.renderer,
-                                    session.freshness, session.pending, deliver,
+                                    session.freshness, session.pending, toAtak,
                                 )
                             }
                         }
@@ -453,6 +444,9 @@ class CotEndpointManager
                             launch { serveClient(connection, session) }
                         }
                     } finally {
+                        live = null
+                        session.files = null
+                        fileJobs.forEach { it.cancel() }
                         beacon.cancel()
                         fromProofs.cancel()
                         fromAnnounces.cancel()
@@ -486,7 +480,9 @@ class CotEndpointManager
             val payload = TakMembership.memberPayload(
                 session.keys.team,
                 session.keys.secret,
-                session.pipeline.atakCallsign ?: Keys.FALLBACK_CALLSIGN,
+                session.pipeline.atakCallsign
+                    ?: session.rememberedCallsign
+                    ?: Keys.FALLBACK_CALLSIGN,
             )
             rnsCore.announceDestination(session.node, payload)
                 .onFailure { Log.w(TAG, "Announce failed: ${it.message}") }
@@ -555,6 +551,7 @@ class CotEndpointManager
 
         private suspend fun serveClient(connection: Socket, session: Session) {
             TrafficStats.setThreadStatsTag(SOCKET_TAG)
+            session.atakCadence.connected()
             val stream = CotStream()
             val buffer = ByteArray(READ_BUFFER)
             publishState(session, clientsLock.withLock { clients.add(connection); clients.size })
@@ -639,12 +636,21 @@ class CotEndpointManager
                 // callsign does not work and stop trying.
                 Log.i(TAG, "This ATAK's operator is $callsign; re-announcing")
                 announce(session)
+                // Kept, so a restart with ATAK closed still announces this
+                // name. Otherwise the handset reporting its own position is
+                // drawn as COLUMBA -- the right track under the wrong name.
+                settingsRepository.saveTakCallsign(callsign)
             }
             // The typed codecs in order, each answering "was this mine?".
             // A new codec is a term in this expression rather than another
             // early return threaded through the routing.
             val typed =
-                CotPosition.isPosition(cotXml) && forwardPosition(cotXml, session) ||
+                // Only ATAK's own report -- the one carrying <takv> -- is this
+                // node's position. A friendly unit marker is position-shaped
+                // too, and taking it here moved the operator's track to
+                // wherever the marker was dropped; it is a marker.
+                CotPosition.isPosition(cotXml) && CotEvent.learnAtakUid(cotXml) != null &&
+                    forwardPosition(cotXml, session) ||
                     forwardChat(cotXml, session) ||
                     forwardMarker(cotXml, session)
             if (typed) return
@@ -656,15 +662,20 @@ class CotEndpointManager
             // event, and a version costs about 7.7 s of channel for a team of
             // seven. Latest wins; see CotCoalesce. A fragment goes over LXMF,
             // a single frame takes the cheap fan-out; see TakLxmfCarriage.
-            val frames = session.pipeline.frames(cotXml)
-            session.versions.submit(cotXml, frames) { version ->
-                if (version.size > 1) {
-                    session.fragments.send(
-                        version, session.registry, session.lxmf, System.currentTimeMillis(),
-                    )
-                } else {
-                    fanOut(version[0], session)
-                }
+            // Sent to the people ATAK named, not to the team, as markers are.
+            // A data package notice for one contact reached the whole team on
+            // the bench, 2026-09-22. Nobody on the team by that name is
+            // refused, not broadcast.
+            val recipients = MarkerAddressees.of(cotXml, session.registry, System.currentTimeMillis())
+            when {
+                recipients != null && recipients.isEmpty() ->
+                    Log.i(TAG, "Event addressed to nobody on this team; not sent, and not broadcast instead")
+                // A file notice goes as a compact offer, not as ATAK's CoT.
+                session.files?.offered(cotXml, recipients) == true -> Unit
+                else ->
+                    session.versions.submit(cotXml, session.pipeline.frames(cotXml), recipients) { version ->
+                        session.fragments.sendVersion(version, session.registry, session.lxmf, recipients) { fanOut(it, session) }
+                    }
             }
         }
 
@@ -680,9 +691,46 @@ class CotEndpointManager
                 // Shaped like a position and carrying none. Not ours to encode,
                 // so it falls through to tier 2 rather than being dropped.
                 ?: return false
+            // Before the gate: ATAK reporting at all is what lets this handset
+            // stand by, whether or not this particular report goes on the air.
+            session.atakCadence.reported()
             if (!session.gate.allows(fix, System.currentTimeMillis())) return true
             fanOut(PositionCodec.encode(fix), session)
             return true
+        }
+
+        /**
+         * Whether ATAK is connected and has reported its own position lately.
+         *
+         * Not merely connected. A Nexus 6P indoors kept ATAK connected for
+         * seven minutes and sent nothing: ATAK reports only with a GPS fix, and
+         * it had none, while the phone's network location was good. Standing
+         * by on "connected" left the operator off the map for exactly that
+         * long. ATAK gets the window [AtakCadence] learns -- from connecting,
+         * and from each report -- before this handset reports in its place.
+         */
+        val atakIsReporting: Boolean
+            get() {
+                val session = live ?: return false
+                val connected = (_state.value as? State.Listening)?.clients?.let { it > 0 } == true
+                return session.atakCadence.isReporting(connected)
+            }
+
+        /**
+         * This handset's own position, sent to the team while ATAK is closed.
+         *
+         * The same frame ATAK's reports become in [forwardPosition], under the
+         * same node, so a receiver draws it on the same track under the same
+         * callsign: one EUD whether or not ATAK is open. False when there is
+         * no session, when ATAK is connected -- it is reporting, and a second
+         * report of the same position would only cost airtime -- or when no
+         * member took the packet.
+         */
+        suspend fun reportOwnPosition(fix: PositionCodec.Fix): Boolean {
+            val session = live ?: return false
+            if (atakIsReporting) return false
+            val own = fix.copy(senderId = TakMembership.senderIdFor(session.node.hash))
+            return fanOut(PositionCodec.encode(own), session) > 0
         }
 
         /**
@@ -826,11 +874,9 @@ class CotEndpointManager
          * as CoT: a marker is an operator action and rare, a position report is
          * a beacon.
          */
-        private suspend fun fanOut(frame: ByteArray, session: Session) {
+        private suspend fun fanOut(frame: ByteArray, session: Session): Int {
             val now = System.currentTimeMillis()
-            for (memberHash in session.registry.members(now)) {
-                sendTo(memberHash, frame)
-            }
+            return session.registry.members(now).count { memberHash -> sendTo(memberHash, frame) }
         }
 
         /**
@@ -840,13 +886,13 @@ class CotEndpointManager
          * take the same path -- a second copy of this would be a second place
          * for the recall-and-request-path dance to be got wrong.
          */
-        private suspend fun sendTo(memberHash: ByteArray, frame: ByteArray) {
+        private suspend fun sendTo(memberHash: ByteArray, frame: ByteArray): Boolean {
             val identity = rnsCore.recallIdentity(memberHash)
             if (identity == null) {
                 // Heard the announce, lost the identity -- possible after a
                 // restart. Ask for the path; the next event will find it.
                 rnsCore.requestPath(memberHash)
-                return
+                return false
             }
             val destination =
                 rnsCore.createDestination(
@@ -855,10 +901,13 @@ class CotEndpointManager
                     DestinationType.SINGLE,
                     TakIdentity.NODE_APP,
                     TakIdentity.NODE_ASPECTS,
-                ).getOrNull() ?: return
+                ).getOrNull() ?: return false
             // One unreachable member must not cost the others their copy.
-            rnsCore.sendPacket(destination, frame)
+            // True only on a receipt the transport accepted: a call that did
+            // not throw is not a packet that went out.
+            return rnsCore.sendPacket(destination, frame)
                 .onFailure { Log.w(TAG, "Could not reach a member: ${it.message}") }
+                .getOrNull()?.delivered == true
         }
 
         // ---- mesh -> ATAK ----
@@ -1013,6 +1062,23 @@ class CotEndpointManager
             val team: String get() = keys.team
 
             /**
+             * The callsign ATAK last reported, from before this run.
+             *
+             * What this node announces until ATAK connects and says again, so a
+             * handset restarted with ATAK closed keeps its name on the team's
+             * map instead of reverting to the placeholder.
+             */
+            @Volatile
+            var rememberedCallsign: String? = null
+
+            /** Files offered to and by this ATAK, while the session serves. */
+            @Volatile
+            var files: TakFileTransfers? = null
+
+            /** When ATAK reports its own position, and how long a silence means it has stopped. */
+            val atakCadence = AtakCadence()
+
+            /**
              * Sent messages whose delivery proof will draw their tick.
              *
              * Properties rather than constructor parameters, here and below:
@@ -1108,3 +1174,29 @@ private fun writeToClient(client: Socket, payload: ByteArray) {
         }
     }
 }
+
+/**
+ * A setup step that did not succeed, as the one exception
+ * [CotEndpointManager]'s run loop retries on.
+ *
+ * Every setup step fails for the same reason -- the backend is not ready
+ * yet -- and each has to say which step it was. One helper rather than a
+ * throw per step means the next step added is one line, and the retry
+ * contract stays stated in a single place.
+ *
+ * Outside the class for the reason [writeToClient] is: it holds none of the
+ * endpoint's state, and the class is at detekt's function budget.
+ */
+private fun <T> Result<T>.orFail(step: String): T =
+    getOrElse { throw SetupFailure("$step: ${it.message}", it) }
+
+/**
+ * A setup step failed before the listener was ever offered the port.
+ *
+ * Distinct from an IOException out of bind() because the diagnosis is
+ * different and the cure is too: probing the port after a
+ * backend-not-ready error reports "still held from a previous run"
+ * about a port nothing has tried to take, and sends an operator looking
+ * for a second copy of the app that does not exist.
+ */
+private class SetupFailure(message: String, cause: Throwable?) : IOException(message, cause)

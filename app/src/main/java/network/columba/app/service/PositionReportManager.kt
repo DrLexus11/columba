@@ -11,19 +11,18 @@ import com.google.android.gms.tasks.CancellationTokenSource
 import dagger.hilt.android.qualifiers.ApplicationContext
 import network.columba.app.di.ApplicationScope
 import network.columba.app.repository.SettingsRepository
-import network.columba.app.rns.api.RnsCore
-import network.columba.app.rns.api.model.Destination
-import network.columba.app.rns.api.model.DestinationType
-import network.columba.app.rns.api.model.Direction
-import network.columba.app.rns.api.util.hexToBytes
-import network.columba.app.util.DestinationHashValidator
+import network.columba.app.service.tak.CotEndpointManager
 import network.columba.app.util.LocationPermissionManager
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
 import javax.inject.Inject
@@ -31,32 +30,32 @@ import javax.inject.Singleton
 import kotlin.coroutines.resume
 
 /**
- * Report this device's position to a gateway that speaks CoT.
+ * Keep this handset on the team's map while ATAK is closed.
  *
- * A responder already carries a GNSS receiver with a battery and a screen. The
- * nodes do not — wiring a module to every board was the original plan and is
- * now a feature of its own, because the phone is here today and the clock
- * argument that justified the module has already been answered by signed time
- * propagation.
+ * While ATAK is connected to the endpoint it reports its own position, at its
+ * own cadence, and this does nothing: a second report of the same position is
+ * airtime spent on nothing. When ATAK is closed -- the phone in a pocket, the
+ * screen locked, ATAK killed for memory -- this takes over at a lighter cadence
+ * the operator picks, so teammates still see where this person is.
  *
- * ATAK never speaks Reticulum. This sends twenty bytes to a fixed gateway, and
- * the gateway expands them into CoT XML and serves ordinary TAK clients over
- * the local network. No plugin, no fork, no client work.
+ * It replaces a first design that sent twenty bytes to a fixed gateway. That
+ * reported alongside ATAK rather than instead of it, so a teammate saw this
+ * person twice, and the gateway drew the second track under a uid built from
+ * four bytes of identity -- a different EUD from the one ATAK itself was on.
+ * Now the report goes out through the endpoint as the same frame ATAK's own
+ * reports become, from the same node, and a receiver draws it on the same
+ * track under the same callsign. One EUD, whether or not ATAK is open.
  *
- * Three things shape the design, and all three are about not being believed
- * more than we deserve:
+ * So it needs the endpoint running with a team: without one there is nobody
+ * to report to, and the switch says so rather than looking on and doing
+ * nothing. The rules that shaped the first design still stand:
  *
- *  - **Off by default, and inert without a gateway.** Position is the most
- *    sensitive thing this app can emit. It goes nowhere until someone turns it
- *    on *and* names where it should go.
- *  - **Never report a stale fix.** Android will hand back a last known location
- *    from hours ago without comment. A marker on a map is a claim about now,
- *    and repeating an old one is how a search team ends up somewhere the
- *    person used to be.
- *  - **Unicast to one destination.** Not a broadcast, not an announce.
- *    Reticulum learns paths from announces and they are deliberately
- *    expensive; announcing every minute to carry twenty bytes would spend more
- *    on routing than on the payload. See TAKCapability.md §3.
+ *  - **Off by default.** Position is the most sensitive thing this app emits.
+ *  - **Never report a stale fix.** Android hands back a last known location
+ *    from hours ago without comment, and a marker on a map is a claim about now.
+ *  - **Say when the next one is due.** The report states its interval, so a
+ *    receiver keeps the track current until then instead of greying it out
+ *    after the one-minute default.
  */
 @Singleton
 class PositionReportManager
@@ -64,28 +63,74 @@ class PositionReportManager
     constructor(
         @ApplicationContext private val context: Context,
         private val settingsRepository: SettingsRepository,
-        private val rnsCore: RnsCore,
-        private val rnsLxmf: network.columba.app.rns.api.RnsLxmf,
+        private val cotEndpointManager: CotEndpointManager,
         @ApplicationScope private val scope: CoroutineScope,
     ) {
         companion object {
             private const val TAG = "PositionReportManager"
 
-            /** rnstransport.position.report, matching PositionReport.h. */
-            private const val APP_NAME = "rnstransport"
-            private val ASPECTS = listOf("position", "report")
-
             /**
              * How old a fix may be and still be worth sending.
              *
              * Android's last known location can be hours stale, and it arrives
-             * looking exactly like a fresh one. Two minutes is a couple of
-             * missed reports at the cadence below, and matches
-             * NODE_POSITION_STALE_MS in the firmware so a report that survives
-             * this check is not thrown away at the other end.
+             * looking exactly like a fresh one. Two minutes matches
+             * NODE_POSITION_STALE_MS in the firmware.
              */
             internal const val MAX_FIX_AGE_MS = 120_000L
+
+            /**
+             * How soon to try again after a cycle that sent nothing.
+             *
+             * No fix yet, or no teammate reachable yet: both usually clear in
+             * seconds, and waiting out a five-minute interval would leave this
+             * person off the map for five minutes because of one bad moment.
+             */
+            internal const val RETRY_MS = 30_000L
+
+            /**
+             * How often to look again while ATAK is reporting. Cheap -- no fix
+             * is taken and nothing is sent -- and short, so a handset whose
+             * ATAK stops reporting is back on the map within half a minute of
+             * the endpoint's quiet window running out.
+             */
+            internal const val CHECK_MS = 30_000L
+
+            /** What reporting should be doing, from the switch and the endpoint. */
+            internal fun statusFor(
+                enabled: Boolean,
+                intervalMinutes: Int,
+                endpoint: CotEndpointManager.State,
+            ): Status =
+                when {
+                    !enabled -> Status.Off
+                    endpoint !is CotEndpointManager.State.Listening -> Status.NeedsEndpoint
+                    // Whether ATAK is actually reporting is judged each cycle,
+                    // not here: connected is not the same as reporting.
+                    else -> Status.Reporting(intervalMinutes)
+                }
         }
+
+        /** What reporting is doing, for the settings card. */
+        sealed interface Status {
+            /** Switched off. */
+            data object Off : Status
+
+            /** On, but the endpoint is not running with a team, so nobody to tell. */
+            data object NeedsEndpoint : Status
+
+            /** On, and ATAK is connected and reporting for itself. */
+            data object AtakReporting : Status
+
+            /**
+             * On, and this is reporting every [intervalMinutes]: ATAK is closed,
+             * or [atakSilent] -- connected but not reporting, usually for want
+             * of a GPS fix.
+             */
+            data class Reporting(val intervalMinutes: Int, val atakSilent: Boolean = false) : Status
+        }
+
+        private val _status = MutableStateFlow<Status>(Status.Off)
+        val status: StateFlow<Status> = _status.asStateFlow()
 
         // The same choice LocationSharingManager makes, and for the same reason.
         // LocationCompat exists for devices *without* Play Services -- custom
@@ -100,41 +145,32 @@ class PositionReportManager
 
         private var reportJob: Job? = null
 
-        // Kept rather than rebuilt, and rebuilt only when the gateway changes.
-        // The time authority next door learned this the hard way in the other
-        // direction: Reticulum refuses to register a destination it already
-        // holds. Here it is simply waste to re-derive a destination from an
-        // identity that has not changed.
-        private var cachedDestination: Destination? = null
-        private var cachedForGatewayHash: String? = null
-
-        /** Start observing settings and reporting position while enabled. */
+        /** Start following the switch and the endpoint, and report while due. */
         fun start() {
             Log.d(TAG, "Starting PositionReportManager")
+            reportJob?.cancel()
             reportJob =
                 scope.launch {
                     combine(
                         settingsRepository.positionReportEnabledFlow,
                         settingsRepository.positionReportIntervalMinutesFlow,
-                        settingsRepository.positionGatewayHashFlow,
-                    ) { enabled, intervalMinutes, gatewayHash ->
-                        Triple(enabled, intervalMinutes, gatewayHash)
-                    }
-                        // collectLatest, not collect: the loop below never
-                        // returns, so a plain collect would take the first
-                        // settings value and never see another. Turning the
-                        // feature off would leave it reporting.
-                        .collectLatest { (enabled, intervalMinutes, gatewayHash) ->
-                            when {
-                                !enabled ->
-                                    Log.d(TAG, "Position reporting disabled")
-                                gatewayHash.isNullOrBlank() ->
-                                    Log.i(
-                                        TAG,
-                                        "Position reporting is on but no gateway is set; " +
-                                            "nothing will be sent until one is",
-                                    )
-                                else -> runReportLoop(intervalMinutes, gatewayHash)
+                        cotEndpointManager.state,
+                        ::statusFor,
+                    )
+                        // The endpoint's state also carries member and client
+                        // counts, and neither may restart the loop -- a teammate
+                        // joining would otherwise send a report each time.
+                        .distinctUntilChanged()
+                        // collectLatest: the loop below never returns, and the
+                        // switch or the endpoint going off has to stop it.
+                        .collectLatest { status ->
+                            _status.value = status
+                            when (status) {
+                                is Status.Reporting -> runReportLoop(status.intervalMinutes)
+                                Status.AtakReporting -> Unit
+                                Status.NeedsEndpoint ->
+                                    Log.i(TAG, "Position reporting is on but the TAK endpoint is not running")
+                                Status.Off -> Log.d(TAG, "Position reporting off")
                             }
                         }
                 }
@@ -148,53 +184,59 @@ class PositionReportManager
         }
 
         /**
-         * Send one report now, regardless of the schedule.
+         * Send one report now, if reporting is what this handset should be doing.
          *
-         * The same reasoning as asserting time on arrival: walking into a
-         * situation and wanting the map to show where you are should not mean
-         * waiting out an interval.
+         * Arriving somewhere and wanting the map to show it should not mean
+         * waiting out an interval. Declined while ATAK is reporting for itself.
          */
         suspend fun reportNow(): Boolean {
-            val gatewayHash = settingsRepository.currentPositionGatewayHash()
-            if (gatewayHash.isNullOrBlank()) {
-                Log.w(TAG, "No gateway set; not reporting position")
+            val status = _status.value as? Status.Reporting ?: run {
+                Log.i(TAG, "Not reporting now: ${_status.value}")
                 return false
             }
-            return emitReport(gatewayHash)
+            return emitReport(status.intervalMinutes)
         }
 
-        private suspend fun runReportLoop(
-            intervalMinutes: Int,
-            gatewayHash: String,
-        ) {
-            Log.d(TAG, "Position reporting every ${intervalMinutes}min to ${gatewayHash.take(16)}")
+        private suspend fun runReportLoop(intervalMinutes: Int) {
             val intervalMillis = intervalMinutes.toLong() * 60L * 1000L
             while (true) {
-                emitReport(gatewayHash)
-                delay(intervalMillis)
+                if (cotEndpointManager.atakIsReporting) {
+                    if (_status.value != Status.AtakReporting) Log.d(TAG, "ATAK is reporting; standing by")
+                    _status.value = Status.AtakReporting
+                    delay(CHECK_MS)
+                    continue
+                }
+                val atakSilent =
+                    (cotEndpointManager.state.value as? CotEndpointManager.State.Listening)?.clients?.let { it > 0 } == true
+                val reporting = Status.Reporting(intervalMinutes, atakSilent)
+                if (_status.value != reporting) {
+                    Log.i(
+                        TAG,
+                        (if (atakSilent) "ATAK is connected but not reporting" else "ATAK is closed") +
+                            "; reporting this handset's position every ${intervalMinutes}min",
+                    )
+                }
+                _status.value = reporting
+                val sent = emitReport(intervalMinutes)
+                delay(if (sent) intervalMillis else minOf(intervalMillis, RETRY_MS))
             }
         }
 
-        private suspend fun emitReport(gatewayHash: String): Boolean =
+        private suspend fun emitReport(intervalMinutes: Int): Boolean =
             try {
                 when {
-                    // Fine, not coarse. hasPermission() accepts either, but
-                    // approximate location lands kilometres from the truth
-                    // (issue #855) -- and a marker kilometres out on a tactical
-                    // map is worse than an absent one, because somebody drives
-                    // to it. Refuse rather than report a position we know is
-                    // wrong at that scale.
+                    // Fine, not coarse. Approximate location lands kilometres
+                    // from the truth (issue #855), and a marker kilometres out
+                    // on a tactical map is worse than an absent one, because
+                    // somebody drives to it.
                     !LocationPermissionManager.hasFineLocationPermission(context) -> {
-                        // Say it plainly. A feature that is on, configured, and
-                        // silent because of a permission is the hardest kind of
-                        // fault for someone to find from the outside.
                         Log.w(TAG, "Precise location not granted; not reporting position")
                         false
                     }
-                    else -> sendFix(gatewayHash)
+                    else -> sendFix(intervalMinutes)
                 }
             } catch (e: CancellationException) {
-                // collectLatest cancels this loop on a settings change and that
+                // collectLatest cancels this loop when ATAK connects, and that
                 // arrives as a CancellationException from whatever call is in
                 // flight. Swallowing it would log a phantom failure.
                 throw e
@@ -203,53 +245,20 @@ class PositionReportManager
                 false
             }
 
-        private suspend fun sendFix(gatewayHash: String): Boolean {
+        private suspend fun sendFix(intervalMinutes: Int): Boolean {
             val location = freshLocation() ?: return false
-            val destination = readyDestination(gatewayHash) ?: return false
-            return deliver(destination,
-                PositionCodec.encode(PositionCodec.fromLocation(location, senderId())))
+            val fix = PositionCodec.fromLocation(location).copy(intervalMin = intervalMinutes)
+            val sent = cotEndpointManager.reportOwnPosition(fix)
+            if (sent) {
+                Log.d(TAG, "Reported this handset's position to the team")
+                settingsRepository.saveLastPositionReportTime(System.currentTimeMillis())
+            } else {
+                // No teammate took it: none known yet, none reachable, or ATAK
+                // connected in the moment between the check and the send.
+                Log.d(TAG, "No teammate took the position report")
+            }
+            return sent
         }
-
-        /**
-         * Put one report on the wire.
-         *
-         * A packet, not a link. A position report needs no session and no
-         * reply, and a packet to a SINGLE destination is already encrypted to
-         * the gateway's identity. On the constrained nodes the same choice
-         * saves about eight kilobytes of transient heap per report; here it
-         * simply saves a round trip that buys nothing.
-         */
-        private suspend fun deliver(
-            destination: Destination,
-            payload: ByteArray,
-        ): Boolean =
-            rnsCore.sendPacket(destination, payload).fold(
-                onSuccess = { receipt ->
-                    when {
-                        // A success only says the call did not throw. Whether
-                        // the packet reached the transport is the receipt's
-                        // business: Python RNS returns False from Packet.send()
-                        // when it could not send, and the Kotlin backend's
-                        // sendPacket is still a stub that sends nothing at all.
-                        // Recording either as a report would put a timestamp in
-                        // the settings UI for a position that never left the
-                        // phone -- the one lie this feature must not tell.
-                        !receipt.delivered -> {
-                            Log.w(TAG, "Transport did not accept the position report")
-                            false
-                        }
-                        else -> {
-                            Log.d(TAG, "Reported position, ${payload.size} bytes")
-                            settingsRepository.saveLastPositionReportTime(System.currentTimeMillis())
-                            true
-                        }
-                    }
-                },
-                onFailure = { error ->
-                    Log.e(TAG, "Position report failed: ${error.message}")
-                    false
-                },
-            )
 
         /**
          * A location we are willing to state is where we are now, or null.
@@ -270,104 +279,6 @@ class PositionReportManager
                 return null
             }
             return location
-        }
-
-        /**
-         * The gateway destination, if we can reach it and know who it is.
-         *
-         * Both failures here are ordinary and self-resolving: a path arrives
-         * after a request, and an identity arrives with the gateway's next
-         * announce.
-         */
-        private suspend fun readyDestination(gatewayHash: String): Destination? {
-            val gatewayBytes = decodeHash(gatewayHash)
-            if (gatewayBytes == null) {
-                Log.w(TAG, "Gateway hash is not valid hex; not reporting position")
-                return null
-            }
-            if (!rnsCore.hasPath(gatewayBytes)) {
-                rnsCore.requestPath(gatewayBytes)
-                Log.d(TAG, "No path to the gateway yet; requested one")
-                return null
-            }
-            return destinationFor(gatewayHash, gatewayBytes)
-        }
-
-        /**
-         * Four bytes of this device's LXMF identity, so the gateway can tell
-         * one reporter from another.
-         *
-         * The LXMF identity rather than any other: it is the one this device is
-         * already known by across the mesh, it is what the time authority signs
-         * with, and it is what an operator provisions onto a node. A second
-         * identifier here would be a second thing to keep in step.
-         *
-         * Zero when there is no identity yet, which the gateway renders as a
-         * track of its own rather than pretending to know who it is.
-         */
-        private suspend fun senderId(): Int {
-            val hash = rnsLxmf.getLxmfIdentity().getOrNull()?.hash ?: return 0
-            if (hash.size < 4) return 0
-            return ((hash[0].toInt() and 0xFF) shl 24) or
-                ((hash[1].toInt() and 0xFF) shl 16) or
-                ((hash[2].toInt() and 0xFF) shl 8) or
-                (hash[3].toInt() and 0xFF)
-        }
-
-        private suspend fun destinationFor(
-            gatewayHash: String,
-            gatewayBytes: ByteArray,
-        ): Destination? {
-            val cached = cachedDestination
-            if (cached != null && cachedForGatewayHash == gatewayHash) return cached
-            val created = createGatewayDestination(gatewayBytes)
-            if (created != null) {
-                cachedDestination = created
-                cachedForGatewayHash = gatewayHash
-            }
-            return created
-        }
-
-        private suspend fun createGatewayDestination(gatewayBytes: ByteArray): Destination? {
-            val identity = rnsCore.recallIdentity(gatewayBytes)
-            if (identity == null) {
-                // A path exists but the identity has not been learned yet,
-                // which happens between a path reply and the gateway's next
-                // announce. Ordinary, and it resolves itself.
-                Log.d(TAG, "No identity for the gateway yet")
-                return null
-            }
-            return rnsCore
-                .createDestination(identity, Direction.OUT, DestinationType.SINGLE, APP_NAME, ASPECTS)
-                .getOrElse { error ->
-                    Log.e(TAG, "Could not create the gateway destination", error)
-                    null
-                }
-        }
-
-        /**
-         * The gateway hash as bytes, or null if it is not a destination hash.
-         *
-         * Exactly 16 bytes, not merely an even number of them, and the same
-         * rule the rest of the app applies -- a short hash is not a near miss,
-         * it addresses nothing, so a report built on one is discarded somewhere
-         * further down where the reason is much harder to see. The card refuses
-         * these now, but this setting is also written directly by the debug
-         * harness and by anything restored from an older install.
-         */
-        private fun decodeHash(hash: String): ByteArray? {
-            // Reticulum writes destination hashes as <hex> in its own logs and
-            // people paste them back with the brackets attached.
-            val cleaned = hash.trim().removePrefix("<").removeSuffix(">")
-            return when (val result = DestinationHashValidator.validate(cleaned)) {
-                is DestinationHashValidator.ValidationResult.Error -> {
-                    Log.w(TAG, "Gateway hash rejected: ${result.message}")
-                    null
-                }
-                // Validated as 32 hex characters, so this cannot throw.
-                is DestinationHashValidator.ValidationResult.Valid ->
-                    result.normalizedHash.hexToBytes()
-            }
         }
 
         /**

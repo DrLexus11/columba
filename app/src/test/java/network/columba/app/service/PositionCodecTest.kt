@@ -22,11 +22,22 @@ class PositionCodecTest {
     fun `wire constants match the firmware`() {
         assertEquals(2, PositionCodec.WIRE_VERSION)
         assertEquals(19, PositionCodec.WIRE_BASE_LEN)
-        assertEquals(24, PositionCodec.WIRE_MAX_LEN)
+        assertEquals(25, PositionCodec.WIRE_MAX_LEN)
         assertEquals(0x01, PositionCodec.FLAG_ALT)
         assertEquals(0x02, PositionCodec.FLAG_COURSE)
         assertEquals(0x04, PositionCodec.FLAG_SPEED)
         assertEquals(0x08, PositionCodec.FLAG_SATS)
+        assertEquals(0x10, PositionCodec.FLAG_INTERVAL)
+    }
+
+    @Test
+    fun `a stated interval survives the round trip and costs one byte`() {
+        val plain = PositionCodec.Fix(latE7 = 411234567, lonE7 = 291234567)
+        val stated = plain.copy(intervalMin = 5)
+        val encoded = PositionCodec.encode(stated)
+        assertEquals(PositionCodec.WIRE_BASE_LEN + 1, encoded.size)
+        assertEquals(5, PositionCodec.decode(encoded)?.intervalMin)
+        assertEquals(0, PositionCodec.decode(PositionCodec.encode(plain))?.intervalMin)
     }
 
     @Test
@@ -45,7 +56,7 @@ class PositionCodecTest {
                 PositionCodec.Fix(
                     latE7 = 411234567, lonE7 = 291234567, fixUnixSeconds = 1788681206,
                     accuracyM = 12, altKnown = true, altM = 847, courseKnown = true,
-                    courseDdeg = 1800, speedCms = 500, sats = 9,
+                    courseDdeg = 1800, speedCms = 500, sats = 9, intervalMin = 5,
                 ),
             )
         assertEquals(PositionCodec.WIRE_MAX_LEN, encoded.size)

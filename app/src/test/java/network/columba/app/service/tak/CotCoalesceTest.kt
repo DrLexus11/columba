@@ -146,4 +146,27 @@ class CotCoalesceTest {
             CotVersions().submit(event("2026-09-21T07:00:00Z"), emptyList()) { sent = true }
             assertFalse(sent)
         }
+
+    /**
+     * Sharing one drawing with A and then with B inside the window is not a
+     * newer version of the first share. Keyed on uid alone, B's share was held
+     * as A's latest version -- and A would never have been sent B's copy, nor
+     * B anything until the window closed. Found with the addressing fix,
+     * 2026-09-22.
+     */
+    @Test
+    fun `one event shared with two people in turn goes to both at once`() =
+        runTest {
+            val versions = CotVersions(LatestWins(windowMs = 10_000), clock = { testScheduler.currentTime })
+            versions.attach(this)
+            val sent = mutableListOf<Int>()
+            val xml = event("2026-09-21T07:00:00Z")
+            val alpha = listOf(ByteArray(16) { 0x11 })
+            val bravo = listOf(ByteArray(16) { 0x22 })
+
+            versions.submit(xml, frames(1), alpha) { sent += it.single()[0].toInt() }
+            versions.submit(xml, frames(1), bravo) { sent += it.single()[0].toInt() }
+
+            assertEquals(listOf(1, 1), sent)
+        }
 }

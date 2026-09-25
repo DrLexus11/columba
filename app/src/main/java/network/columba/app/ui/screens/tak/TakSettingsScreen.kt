@@ -55,11 +55,14 @@ fun TakSettingsScreen(
     val state by viewModel.state.collectAsState()
     val endpointState by viewModel.endpointState.collectAsState()
     val taskState by taskViewModel.manager.state.collectAsState()
+    val positionStatus by viewModel.positionStatus.collectAsState()
+    val heldFiles by viewModel.heldFiles.collectAsState()
 
     var endpointExpanded by remember { mutableStateOf(true) }
     var positionExpanded by remember { mutableStateOf(false) }
     var authorityExpanded by remember { mutableStateOf(false) }
     var tasksExpanded by remember { mutableStateOf(false) }
+    var filesExpanded by remember { mutableStateOf(false) }
 
     Scaffold(
         topBar = {
@@ -114,13 +117,26 @@ fun TakSettingsScreen(
                 isExpanded = positionExpanded,
                 onExpandedChange = { positionExpanded = it },
                 enabled = state.positionEnabled,
+                // The same conditions the endpoint itself needs to start.
+                endpointReady = state.endpointEnabled && state.hasFleetSecret && !state.secretTooShort,
                 intervalMinutes = state.positionIntervalMinutes,
-                gatewayHash = state.positionGatewayHash,
+                status = positionStatus,
                 lastReportTime = state.lastPositionReportTime,
                 onToggle = viewModel::setPositionEnabled,
                 onIntervalChange = viewModel::setPositionInterval,
-                onGatewayChange = viewModel::setPositionGatewayHash,
                 onReportNow = viewModel::reportPositionNow,
+            )
+
+            HeldFilesCard(
+                isExpanded = filesExpanded,
+                onExpandedChange = { expanded ->
+                    filesExpanded = expanded
+                    if (expanded) viewModel.refreshHeldFiles()
+                },
+                held = heldFiles,
+                nowMs = System.currentTimeMillis(),
+                onDelete = viewModel::deleteHeldFile,
+                onDeleteAll = viewModel::deleteAllHeldFiles,
             )
 
             TaskAuthorityCard(

@@ -33,6 +33,7 @@ import java.nio.ByteOrder
  *     +1         course       uint8      2-degree units      FLAG_COURSE
  *     +1         speed        uint8      half-metre/s units  FLAG_SPEED
  *     +1         sats         uint8                          FLAG_SATS
+ *     +1         interval     uint8      minutes to the next FLAG_INTERVAL
  *
  * Fixed width and no msgpack. Msgpack is the right answer for the time
  * assertion next door, where the payload is structured and a few key bytes cost
@@ -43,12 +44,22 @@ import java.nio.ByteOrder
 object PositionCodec {
     const val WIRE_VERSION = 2
     const val WIRE_BASE_LEN = 19
-    const val WIRE_MAX_LEN = 24
+    const val WIRE_MAX_LEN = 25
 
     const val FLAG_ALT = 0x01
     const val FLAG_COURSE = 0x02
     const val FLAG_SPEED = 0x04
     const val FLAG_SATS = 0x08
+
+    /**
+     * The sender saying when it reports next, so a receiver keeps the track
+     * current that long. Set when this handset reports for itself while ATAK
+     * is closed -- every few minutes, deliberately -- and absent from ATAK's own
+     * reports, which go at the one-minute floor a receiver assumes. Last in the
+     * frame because decoders that predate it stop at the fields they know.
+     */
+    const val FLAG_INTERVAL = 0x10
+    private const val MAX_INTERVAL_MIN = 255
 
     /** Above this the receiver is told "worse than 254 m" rather than a wrapped value. */
     private const val ACCURACY_OVER = 255
@@ -87,6 +98,8 @@ object PositionCodec {
         val courseDdeg: Int = 0,
         val speedCms: Int = 0,
         val sats: Int = 0,
+        /** Minutes until this sender reports again; 0 = not stated. */
+        val intervalMin: Int = 0,
     )
 
     /**
@@ -126,12 +139,14 @@ object PositionCodec {
         if (fix.courseKnown) flags = flags or FLAG_COURSE
         if (fix.speedCms > 0) flags = flags or FLAG_SPEED
         if (fix.sats > 0) flags = flags or FLAG_SATS
+        if (fix.intervalMin > 0) flags = flags or FLAG_INTERVAL
 
         val optionalBytes =
             (if (flags and FLAG_ALT != 0) 2 else 0) +
                 (if (flags and FLAG_COURSE != 0) 1 else 0) +
                 (if (flags and FLAG_SPEED != 0) 1 else 0) +
-                (if (flags and FLAG_SATS != 0) 1 else 0)
+                (if (flags and FLAG_SATS != 0) 1 else 0) +
+                (if (flags and FLAG_INTERVAL != 0) 1 else 0)
 
         val buffer =
             ByteBuffer
@@ -156,6 +171,7 @@ object PositionCodec {
             buffer.put(minOf(fix.speedCms / 50, 255).toByte())
         }
         if (flags and FLAG_SATS != 0) buffer.put(fix.sats.toByte())
+        if (flags and FLAG_INTERVAL != 0) buffer.put(minOf(fix.intervalMin, MAX_INTERVAL_MIN).toByte())
         return buffer.array()
     }
 
@@ -182,7 +198,8 @@ object PositionCodec {
             (if (flags and FLAG_ALT != 0) 2 else 0) +
             (if (flags and FLAG_COURSE != 0) 1 else 0) +
             (if (flags and FLAG_SPEED != 0) 1 else 0) +
-            (if (flags and FLAG_SATS != 0) 1 else 0)
+            (if (flags and FLAG_SATS != 0) 1 else 0) +
+            (if (flags and FLAG_INTERVAL != 0) 1 else 0)
 
     /**
      * Unpack a report. Returns null for anything unrecognised rather than
@@ -211,6 +228,7 @@ object PositionCodec {
         val speedCms =
             if (flags and FLAG_SPEED != 0) (buffer.get().toInt() and 0xFF) * 50 else 0
         val sats = if (flags and FLAG_SATS != 0) buffer.get().toInt() and 0xFF else 0
+        val intervalMin = if (flags and FLAG_INTERVAL != 0) buffer.get().toInt() and 0xFF else 0
 
         return Fix(
             latE7 = latE7,
@@ -224,6 +242,7 @@ object PositionCodec {
             courseDdeg = courseDdeg,
             speedCms = speedCms,
             sats = sats,
+            intervalMin = intervalMin,
         )
     }
 }

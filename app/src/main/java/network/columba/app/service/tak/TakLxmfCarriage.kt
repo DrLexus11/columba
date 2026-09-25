@@ -21,12 +21,19 @@ import network.columba.app.rns.api.RnsCore
  * incomplete against, and the airtime costing assumed that.
  */
 class TakLxmfCarriage(private val rnsCore: RnsCore) {
+    /**
+     * Where a whole file offer goes once reassembled: it is not CoT, so it is
+     * not drawn. Set by the session that owns the file transfers.
+     */
+    @Volatile var onOffer: (suspend (ByteArray, ByteArray) -> Unit)? = null
+
     companion object {
         private const val TAG = "TakLxmfCarriage"
     }
 
     /**
-     * Send every fragment of one event to every member, over LXMF.
+     * Send every fragment of one event to every member, or to [recipients],
+     * over LXMF.
      *
      * A peer the carrier will not take is logged, not quietly downgraded to a
      * packet: sending unreliably while the caller believes otherwise is worse
@@ -37,15 +44,41 @@ class TakLxmfCarriage(private val rnsCore: RnsCore) {
         registry: TakMembership.Registry,
         lxmf: TakLxmf.Carrier,
         now: Long,
+        recipients: List<ByteArray>? = null,
     ) {
         Log.i(TAG, "event too large for one packet; sending ${frames.size} fragments")
-        val members = registry.members(now)
+        val members = recipients ?: registry.members(now)
         for (frame in frames) {
             for (memberHash in members) {
                 if (lxmf.send(memberHash, frame, "") == null) {
                     Log.w(TAG, "LXMF would not take a fragment for a member")
                 }
             }
+        }
+    }
+
+    /**
+     * Send one version of an event: fragments over LXMF, a single frame to the
+     * team by the cheap fan-out, or a single frame to [recipients] over LXMF.
+     *
+     * Addressed goes over LXMF even when it fits one packet: a bare packet
+     * names no sender, and a file notice sent that way reached ATAK with
+     * nobody to fetch the file from -- on the bench, 2026-09-22.
+     */
+    suspend fun sendVersion(
+        version: List<ByteArray>,
+        registry: TakMembership.Registry,
+        lxmf: TakLxmf.Carrier,
+        recipients: List<ByteArray>?,
+        fanOut: suspend (ByteArray) -> Unit,
+    ) {
+        when {
+            version.size > 1 -> send(version, registry, lxmf, System.currentTimeMillis(), recipients)
+            recipients == null -> fanOut(version[0])
+            else ->
+                recipients.forEach {
+                    if (lxmf.send(it, version[0], "") == null) Log.w(TAG, "LXMF would not take an event for a member")
+                }
         }
     }
 
@@ -76,8 +109,10 @@ class TakLxmfCarriage(private val rnsCore: RnsCore) {
         deliver: suspend (ByteArray) -> Unit,
     ) {
         val signedBy = TakLxmf.memberForLxmf(rnsCore, inbound.sourceHash)
-        if (TakPayload.kindOf(inbound.frame) == TakPayload.FRAGMENT_V1) {
-            // Membership first, before a byte is held. Chat and markers check
+        val kind = TakPayload.kindOf(inbound.frame)
+        if (kind == TakPayload.FRAGMENT_V1 || kind == TakPayload.COT_TIER2) {
+            // A fragment, or an event addressed to this node that fitted in
+            // one frame. Membership first, before a byte is held. Chat and markers check
             // their sender against the one LXMF proved; a fragment carries no
             // sender id of its own, and the event it reassembles into is drawn
             // through the tier-2 fallback with no check at all. So any LXMF
@@ -86,7 +121,7 @@ class TakLxmfCarriage(private val rnsCore: RnsCore) {
             // that is the reassembler's key -- so gating each fragment is what
             // carries the check through to the reassembled event.
             if (!renderer.isCurrentMember(signedBy, System.currentTimeMillis())) {
-                Log.w(TAG, "fragment from a sender not on this team, refused")
+                Log.w(TAG, "event from a sender not on this team, refused")
                 return
             }
             // Keyed on the LXMF source hash, not on the member it resolves to.
@@ -95,10 +130,18 @@ class TakLxmfCarriage(private val rnsCore: RnsCore) {
             // across two keys and it never completed. The source hash is the
             // same for every message one sender sends.
             val whole =
-                reassembler.feed(inbound.sourceHash, inbound.frame, System.currentTimeMillis())
-                    ?: return
-            Log.i(TAG, "reassembled ${whole.size} bytes over LXMF")
-            draw(whole, renderer, freshness, deliver)
+                if (kind == TakPayload.COT_TIER2) {
+                    inbound.frame
+                } else {
+                    reassembler.feed(inbound.sourceHash, inbound.frame, System.currentTimeMillis())
+                        ?.also { Log.i(TAG, "reassembled ${it.size} bytes over LXMF") }
+                }
+            val offers = onOffer
+            when {
+                whole == null -> Unit
+                offers != null && TakPayload.kindOf(whole) == TakPayload.FILE_OFFER_V1 -> offers(whole, inbound.sourceHash)
+                else -> draw(whole, renderer, freshness, deliver)
+            }
             return
         }
         when (val rendered = renderer.render(inbound, System.currentTimeMillis(), signedBy)) {

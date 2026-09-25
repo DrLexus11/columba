@@ -39,6 +39,12 @@ class PythonRnsRuntime(
     private val stampGenerator: StampGenerator = StampGenerator(),
 ) {
     private companion object {
+        /**
+         * Largest inbound LXMF transfer, in LXMF's kilobytes. Holds the TAK
+         * file cap (16 MB, TakFiles.MAX_FILE_BYTES) plus frame and envelope.
+         */
+        const val LXMF_DELIVERY_LIMIT_KB = 17_000
+
         const val TAG = "PythonRnsRuntime"
     }
 
@@ -303,7 +309,16 @@ class PythonRnsRuntime(
 
         // LXMF router + delivery destination.
         val lxmfStorage = File(config.storagePath, "lxmf").apply { mkdirs() }
-        val router = lxmfModule.callAttr("LXMRouter", identity, lxmfStorage.absolutePath)
+        // LXMF refuses an inbound transfer over 1,000 KB by default, and a TAK
+        // file is one message: a QuickPic measured 3,008,206 bytes on the
+        // bench (2026-09-22). 17,000 KB holds the 16 MB file cap and envelope.
+        val router =
+            lxmfModule.callAttr(
+                "LXMRouter",
+                identity,
+                lxmfStorage.absolutePath,
+                com.chaquo.python.Kwarg("delivery_limit", LXMF_DELIVERY_LIMIT_KB),
+            )
         lxmRouter = router
         localDestination = router.callAttr(
             "register_delivery_identity",
