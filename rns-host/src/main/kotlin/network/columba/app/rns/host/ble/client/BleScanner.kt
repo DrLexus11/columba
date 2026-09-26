@@ -308,6 +308,12 @@ class BleScanner(
     /**
      * Handle a scan result (device discovered or updated).
      */
+    /** The identity tag a Columba advertiser carries in its scan response, as hex. */
+    private fun identityTagOf(result: ScanResult): String? =
+        result.scanRecord?.getServiceData(ParcelUuid(BleConstants.SERVICE_UUID))
+            ?.takeIf { it.isNotEmpty() }
+            ?.joinToString("") { "%02x".format(it) }
+
     private suspend fun handleScanResult(result: ScanResult) {
         val device = result.device
         val rssi = result.rssi
@@ -335,6 +341,7 @@ class BleScanner(
                         rssi = rssi,
                         serviceUuids = serviceUuids,
                         identityHash = null, // Identity read from GATT characteristic, not device name
+                        identityTag = identityTagOf(result),
                     )
                 devices[address] = bleDevice
                 newDevicesInLastScan++
@@ -347,6 +354,8 @@ class BleScanner(
                     existingDevice.copy(
                         rssi = rssi,
                         lastSeen = System.currentTimeMillis(),
+                        // The scan response can arrive in a later result than the advertisement.
+                        identityTag = identityTagOf(result) ?: existingDevice.identityTag,
                     )
                 devices[address] = updated
 

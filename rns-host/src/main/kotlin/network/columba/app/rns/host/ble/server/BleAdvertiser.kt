@@ -52,6 +52,14 @@ class BleAdvertiser(
         private const val RETRY_BACKOFF_MS = 2000L // 2 seconds
     }
 
+    /**
+     * The first bytes of this phone's identity, carried in the scan response
+     * so a scanner can tell which phone this is under a rotated address. See
+     * `initiateDecision` in KotlinBLEBridge. Null until the identity is known.
+     */
+    @Volatile
+    var identityTag: ByteArray? = null
+
     // Power-tunable advertising refresh interval
     @Volatile
     var advertisingRefreshIntervalMs: Long = 60_000L
@@ -216,6 +224,7 @@ class BleAdvertiser(
                     AdvertiseData
                         .Builder()
                         .setIncludeDeviceName(false)
+                        .apply { identityTag?.let { addServiceData(ParcelUuid(BleConstants.SERVICE_UUID), it) } }
                         .build()
 
                 // Start advertising

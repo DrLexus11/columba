@@ -54,6 +54,52 @@ internal fun preferredBleRole(
         else -> PreferredBleRole.PERIPHERAL
     }
 
+/** Bytes of the local identity a phone advertises, so a scanner can tell who it is. */
+internal const val IDENTITY_TAG_BYTES = 8
+
+/**
+ * After this long seeing a tagged peer that has not connected to us, connect to
+ * it ourselves anyway -- the radio path may work in one direction only.
+ */
+internal const val TAG_DEFER_MS = 60_000L
+
+/** Why a central connection to a scanned address is or is not started. */
+internal enum class InitiateDecision {
+    CONNECT,
+    ALREADY_LINKED,
+    PEER_INITIATES,
+}
+
+/**
+ * Whether to connect out to an advertiser carrying identity [peerTag].
+ *
+ * Two phones each scan and advertise, so each connected to the other: two
+ * links to one peer, reconciled by closing one. With Android's random
+ * addresses the second attempt was often to the same phone under a new
+ * address, and closing that attempt tore down the shared radio link --
+ * measured 2026-09-26, a working phone-to-phone link dropped about every
+ * minute, in step with the advertiser's refresh. The advertisement now
+ * carries the first [IDENTITY_TAG_BYTES] of the identity, so a scanner does
+ * not connect to a phone it is already linked to, and of two phones only the
+ * lower identity connects out -- the same identity order the dual-connection
+ * rule ([preferredBleRole]) falls back to. Untagged advertisers (boards, iOS,
+ * older Columba) are connected as before.
+ */
+internal fun initiateDecision(
+    localIdentity: String?,
+    peerTag: String?,
+    linkedIdentities: Collection<String>,
+    tagFirstSeenMs: Long,
+    nowMs: Long,
+): InitiateDecision =
+    when {
+        peerTag == null || localIdentity == null -> InitiateDecision.CONNECT
+        linkedIdentities.any { it.startsWith(peerTag) } -> InitiateDecision.ALREADY_LINKED
+        localIdentity.take(peerTag.length) < peerTag -> InitiateDecision.CONNECT
+        nowMs - tagFirstSeenMs >= TAG_DEFER_MS -> InitiateDecision.CONNECT
+        else -> InitiateDecision.PEER_INITIATES
+    }
+
 /**
  * Kotlin BLE Bridge.
  *
@@ -938,6 +984,7 @@ class KotlinBLEBridge(
     fun setIdentity(identityBytes: ByteArray) {
         require(identityBytes.size == 16) { "Identity must be 16 bytes" }
         transportIdentityHash = identityBytes
+        advertiser?.identityTag = identityBytes.copyOf(IDENTITY_TAG_BYTES)
 
         // Update all BLE components (if available)
         gattClient?.setTransportIdentity(identityBytes)
@@ -1158,8 +1205,12 @@ class KotlinBLEBridge(
             val alreadyCentral = connectedPeers[address]?.isCentral == true
             val centralCount = connectedPeers.count { it.value.isCentral }
             val client = gattClient
+            val initiate = initiateFor(address)
 
             when {
+                initiate != InitiateDecision.CONNECT -> {
+                    Log.d(TAG, "Not connecting to $address: $initiate")
+                }
                 alreadyCentral -> {
                     Log.w(TAG, "Already connected to $address as central")
                 }
@@ -1190,6 +1241,17 @@ class KotlinBLEBridge(
             pendingCentralConnections.remove(address)
             Log.e(TAG, "Failed to connect to $address", e)
         }
+    }
+
+    /** First time each advertised identity tag was seen, across address rotations. */
+    private val tagFirstSeen = ConcurrentHashMap<String, Long>()
+
+    private fun initiateFor(address: String): InitiateDecision {
+        val tag = scanner?.getDevicesSnapshot()?.get(address)?.identityTag
+        val now = System.currentTimeMillis()
+        val firstSeen = tag?.let { tagFirstSeen.getOrPut(it) { now } } ?: now
+        val linked = connectedPeers.values.mapNotNull { it.identityHash }
+        return initiateDecision(transportIdentityHash?.toHex(), tag, linked, firstSeen, now)
     }
 
     fun disconnectAsync(address: String) {
