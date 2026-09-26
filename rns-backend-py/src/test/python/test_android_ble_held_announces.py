@@ -40,14 +40,27 @@ class FakeBLEInterface:
         self.driver = None
         self.handed_off = []
         self.next_peer = FakePeer()
+        self.identity_of = {}
+        self._pending_detach_grace_period = 2.0
+        self._identity_cache_ttl = 60
+        self._pending_detach = {}
 
     def process_outgoing(self, data):
         self.handed_off.append(data)
 
     def _spawn_peer_interface(self, address, name, peer_identity, **kwargs):
         with self.peer_lock:
-            self.spawned_interfaces[address] = self.next_peer
+            existing = self.spawned_interfaces.get(peer_identity)
+            if existing is not None:
+                existing.online = True      # the parent reuses and revives it
+                self._pending_detach.pop(peer_identity, None)
+                return existing
+            self.spawned_interfaces[peer_identity] = self.next_peer
         return self.next_peer
+
+    def _device_disconnected_callback(self, address):
+        # The parent schedules the detach, keyed by identity; the interface stays.
+        self._pending_detach[self.identity_of[address]] = 0.0
 
 
 def load():
@@ -155,6 +168,41 @@ class InterfaceTests(unittest.TestCase):
         packet = announce(b"\x11" * 16)
         self.interface.process_outgoing(packet)
         self.assertEqual(self.interface.handed_off, [packet])
+
+
+
+class PeerGraceTests(unittest.TestCase):
+    """A peer's interface, and so its paths, outlives a reconnect.
+
+    Measured phone to phone 2026-09-24: the link dropped at the radio, the
+    interface went two seconds later, and the peer came back 39 s after the
+    drop to a new interface with no paths.
+    """
+
+    def setUp(self):
+        self.interface = MODULE.AndroidBLEInterface(owner=None)
+
+    def test_the_grace_covers_a_reconnect(self):
+        self.assertGreaterEqual(self.interface._pending_detach_grace_period, 60)
+        self.assertGreaterEqual(self.interface._identity_cache_ttl,
+                                self.interface._pending_detach_grace_period)
+
+    def test_a_dropped_peer_is_offline_but_kept(self):
+        peer = self.interface._spawn_peer_interface("AA", "phone", "ident")
+        self.interface.identity_of["AA"] = "ident"
+        self.interface._device_disconnected_callback("AA")
+        self.assertIs(self.interface.spawned_interfaces["ident"], peer)
+        self.assertFalse(peer.online)
+
+    def test_an_announce_while_the_peer_is_away_reaches_it_when_it_is_back(self):
+        peer = self.interface._spawn_peer_interface("AA", "phone", "ident")
+        self.interface.identity_of["AA"] = "ident"
+        self.interface._device_disconnected_callback("AA")
+        self.interface.process_outgoing(announce(b"\x11" * 16))
+        back = self.interface._spawn_peer_interface("BB", "phone", "ident")
+        self.assertIs(back, peer, "the same interface, with its paths")
+        self.assertTrue(back.online)
+        self.assertEqual(len(back.sent), 1)
 
 
 if __name__ == "__main__":

@@ -49,6 +49,20 @@ import time
 HELD_ANNOUNCE_SECONDS = 120
 MAX_HELD_ANNOUNCES = 16
 
+# How long a peer's interface outlives its BLE link.
+#
+# The interface is what Reticulum's paths hang on: tear it down and every path
+# learned through that peer goes with it, and nothing is known again until the
+# peer announces. The parent keeps it for two seconds. Measured phone to phone
+# on the bench 2026-09-24: the link dropped at the radio (HCI reason 0x08), the
+# interface went two seconds later, and the peer was back under a new address
+# 39 s after the drop -- to a new interface with no paths, so a file offer to
+# its inbox found no path and exhausted its tries. Android rotates BLE
+# addresses; a reconnect is a scan, a GATT connect and an identity handshake.
+# Two minutes covers that with retries, and a peer that is really gone costs
+# only an offline interface for that long.
+PEER_GRACE_SECONDS = 120
+
 _PACKET_TYPE_MASK = 0x03
 _ANNOUNCE = 0x01
 _HEADER_2 = 0x40
@@ -142,6 +156,12 @@ class AndroidBLEInterface(BLEInterface):
         # Call parent constructor - it will use our driver_class
         super().__init__(owner, config)
 
+        # Keep a peer's interface, and so its paths, across a reconnect. The
+        # identity cache must last at least as long, or a peer returning late
+        # in the grace is not recognised as the one that left.
+        self._pending_detach_grace_period = PEER_GRACE_SECONDS
+        self._identity_cache_ttl = max(getattr(self, "_identity_cache_ttl", 0), PEER_GRACE_SECONDS)
+
         # Configure BLE power settings from config.
         # Safe to call after super().__init__(): the bridge (and its scanner/advertiser)
         # is created in KotlinBLEBridge's constructor, so the objects already exist
@@ -178,6 +198,21 @@ class AndroidBLEInterface(BLEInterface):
                 RNS.log(f"{self} no BLE peer yet; holding an announce until one connects",
                         RNS.LOG_DEBUG)
         super().process_outgoing(data)
+
+    def _device_disconnected_callback(self, address):
+        """As the parent does, then mark a peer awaiting detach offline.
+
+        While the grace runs the interface stays -- that is the point -- but
+        nothing can be delivered through it. Offline, an announce sent in the
+        meantime is held and replayed when the peer is back, instead of being
+        handed to a link that is not there.
+        """
+        super()._device_disconnected_callback(address)
+        with self.peer_lock:
+            for identity_hash in list(getattr(self, "_pending_detach", {})):
+                peer_if = self.spawned_interfaces.get(identity_hash)
+                if peer_if is not None:
+                    peer_if.online = False
 
     def _any_peer_online(self):
         with self.peer_lock:
