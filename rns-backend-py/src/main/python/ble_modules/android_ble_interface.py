@@ -214,6 +214,43 @@ class AndroidBLEInterface(BLEInterface):
                 if peer_if is not None:
                     peer_if.online = False
 
+    def _check_duplicate_identity(self, address, peer_identity):
+        """Decide a second link to the same peer the way the peer decides it.
+
+        Two phones each run central and peripheral, so each connects to the
+        other while accepting the other's connection: two links, one peer. The
+        parent keeps whichever was first and refuses the second -- and the two
+        phones do not agree which was first. Each closed a different link, each
+        saw its survivor dropped by the other, and they reconnected for ever.
+        Measured 2026-09-26: handshakes every few seconds, and no TAK traffic
+        crossing at all -- markers failed, each phone showed the other offline.
+
+        So the link kept is the one where the phone with the lower identity is
+        the central. Both phones compute that from the two identities they have
+        just exchanged, so both keep the same link. The parent's own checks run
+        first and still decide a dead, departing or zombie old link.
+        """
+        duplicate = super()._check_duplicate_identity(address, peer_identity)
+        if not duplicate:
+            return False
+        local = getattr(getattr(self, "driver", None), "_transport_identity", None)
+        identity_hash = self._compute_identity_hash(peer_identity)
+        existing = self.identity_to_address.get(identity_hash)
+        existing_role = self.driver.get_peer_role(existing) if existing else None
+        if not local or len(local) != 16 or existing_role not in ("central", "peripheral"):
+            return duplicate
+        wanted = "central" if bytes(local) < bytes(peer_identity) else "peripheral"
+        if existing_role == wanted:
+            return True            # the right link is already up; refuse this one
+        RNS.log(f"{self} keeping the link from {address} for {identity_hash[:8]} and closing "
+                f"{existing}: the lower identity is the central on both phones", RNS.LOG_INFO)
+        self._cleanup_stale_address(identity_hash, existing)
+        try:
+            self.driver.disconnect(existing)
+        except Exception as error:          # the old link may already be gone
+            RNS.log(f"{self} could not close {existing}: {error}", RNS.LOG_DEBUG)
+        return False
+
     def _any_peer_online(self):
         with self.peer_lock:
             return any(peer.online for peer in self.spawned_interfaces.values())

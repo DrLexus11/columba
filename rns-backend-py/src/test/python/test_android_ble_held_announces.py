@@ -41,6 +41,8 @@ class FakeBLEInterface:
         self.handed_off = []
         self.next_peer = FakePeer()
         self.identity_of = {}
+        self.identity_to_address = {}
+        self.cleaned = []
         self._pending_detach_grace_period = 2.0
         self._identity_cache_ttl = 60
         self._pending_detach = {}
@@ -61,6 +63,19 @@ class FakeBLEInterface:
     def _device_disconnected_callback(self, address):
         # The parent schedules the detach, keyed by identity; the interface stays.
         self._pending_detach[self.identity_of[address]] = 0.0
+
+    # --- enough of the duplicate-identity machinery for the tie-break ---
+
+    def _compute_identity_hash(self, identity):
+        return bytes(identity).hex()
+
+    def _check_duplicate_identity(self, address, peer_identity):
+        existing = self.identity_to_address.get(self._compute_identity_hash(peer_identity))
+        return existing is not None and existing != address   # "alive and healthy"
+
+    def _cleanup_stale_address(self, identity_hash, old_address):
+        self.cleaned.append(old_address)
+        self.identity_to_address.pop(identity_hash, None)
 
 
 def load():
@@ -203,6 +218,61 @@ class PeerGraceTests(unittest.TestCase):
         self.assertIs(back, peer, "the same interface, with its paths")
         self.assertTrue(back.online)
         self.assertEqual(len(back.sent), 1)
+
+
+
+class FakeDriver:
+    def __init__(self, local, roles):
+        self._transport_identity = local
+        self.roles = roles
+        self.disconnected = []
+
+    def get_peer_role(self, address):
+        return self.roles.get(address)
+
+    def disconnect(self, address):
+        self.disconnected.append(address)
+
+
+class LinkTieBreakTests(unittest.TestCase):
+    """Two phones, two links to each other: both keep the same one.
+
+    Measured 2026-09-26: each phone kept whichever link came first and closed
+    the other, the two disagreed, and they reconnected every few seconds with
+    no TAK traffic crossing.
+    """
+
+    LOW = bytes([0x11] * 16)
+    HIGH = bytes([0x99] * 16)
+
+    def phone(self, local, peer, existing_role):
+        interface = MODULE.AndroidBLEInterface(owner=None)
+        interface.driver = FakeDriver(local, {"OLD": existing_role})
+        interface.identity_to_address[peer.hex()] = "OLD"
+        return interface
+
+    def test_the_lower_identity_keeps_its_central_link(self):
+        low = self.phone(self.LOW, self.HIGH, "central")     # low is central on OLD
+        self.assertTrue(low._check_duplicate_identity("NEW", self.HIGH))
+        self.assertEqual(low.driver.disconnected, [])
+
+    def test_the_higher_identity_keeps_the_same_link(self):
+        high = self.phone(self.HIGH, self.LOW, "peripheral")  # the same link, seen from high
+        self.assertTrue(high._check_duplicate_identity("NEW", self.LOW))
+        self.assertEqual(high.driver.disconnected, [])
+
+    def test_the_wrong_way_round_link_gives_way_to_the_new_one(self):
+        low = self.phone(self.LOW, self.HIGH, "peripheral")   # low is peripheral on OLD
+        self.assertFalse(low._check_duplicate_identity("NEW", self.HIGH))
+        self.assertEqual(low.driver.disconnected, ["OLD"])
+        high = self.phone(self.HIGH, self.LOW, "central")    # and high agrees
+        self.assertFalse(high._check_duplicate_identity("NEW", self.LOW))
+        self.assertEqual(high.driver.disconnected, ["OLD"])
+
+    def test_without_a_known_role_the_parent_decides(self):
+        low = self.phone(self.LOW, self.HIGH, None)
+        self.assertTrue(low._check_duplicate_identity("NEW", self.HIGH))
+        self.assertEqual(low.driver.disconnected, [])
 
 
 if __name__ == "__main__":
