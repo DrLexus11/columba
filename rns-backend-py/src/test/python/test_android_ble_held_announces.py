@@ -101,7 +101,8 @@ class FakeBLEInterface:
 def load():
     rns = types.ModuleType("RNS")
     rns.log = lambda *args, **kwargs: None
-    rns.LOG_DEBUG = rns.LOG_INFO = 0
+    rns.LOG_DEBUG = rns.LOG_INFO = rns.LOG_WARNING = 0
+    rns.Transport = types.SimpleNamespace(destinations_map={})
     base = types.ModuleType("BLEInterface")
     base.BLEInterface = FakeBLEInterface
     drivers = types.ModuleType("drivers")
@@ -333,3 +334,63 @@ class LinkTieBreakTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def real_announce(destination, app_data, header_2=False, ratchet=False):
+    """An announce shaped as Reticulum packs one, context byte and all."""
+    flags = 0x01 | (0x40 if header_2 else 0) | (0x20 if ratchet else 0)
+    transport = bytes([0xEE] * 16) if header_2 else b""
+    body = bytes(64 + 10 + 10) + (bytes(32) if ratchet else b"") + bytes(64)
+    return bytes([flags, 0]) + transport + destination + b"\x00" + body + app_data
+
+
+class FakeDestination:
+    def __init__(self):
+        self.announced = []
+
+    def announce(self, app_data=None, attached_interface=None):
+        self.announced.append((app_data, attached_interface))
+
+
+class AnnounceOnMeetingTests(unittest.TestCase):
+    """Two phones meeting over BLE learn each other at once, nobody pressing
+    Announce. Operator, 2026-09-26: a message went through only after both
+    sides had announced by hand."""
+
+    INBOX = b"\x42" * 16
+
+    def setUp(self):
+        self.interface = MODULE.AndroidBLEInterface(owner=None)
+        self.inbox = FakeDestination()
+        MODULE.RNS.Transport.destinations_map = {self.INBOX: self.inbox}
+        # The app announced its inbox earlier, while no peer was up.
+        self.interface.process_outgoing(real_announce(self.INBOX, b"LEXUS"))
+        self.interface._held_announces.release()
+
+    def test_the_app_data_is_read_whatever_the_header(self):
+        for header_2 in (False, True):
+            for ratchet in (False, True):
+                frame = real_announce(self.INBOX, b"LEXUS", header_2, ratchet)
+                self.assertEqual(MODULE.announce_app_data(frame), b"LEXUS", (header_2, ratchet))
+        self.assertIsNone(MODULE.announce_app_data(data_packet(self.INBOX)))
+
+    def test_a_newly_met_peer_is_sent_a_fresh_announce_on_its_link_alone(self):
+        peer = self.interface._spawn_peer_interface("AA", "phone", "ident")
+        self.assertEqual(self.inbox.announced, [(b"LEXUS", peer)])
+
+    def test_a_peer_back_within_the_grace_is_not_announced_to_again(self):
+        self.interface._spawn_peer_interface("AA", "phone", "ident")
+        self.interface._spawn_peer_interface("BB", "phone", "ident")     # reused
+        self.assertEqual(len(self.inbox.announced), 1)
+
+    def test_a_peer_met_again_within_a_minute_is_not_announced_to_again(self):
+        self.interface._spawn_peer_interface("AA", "phone", "ident")
+        del self.interface.spawned_interfaces["ident"]                    # detached
+        self.interface.next_peer = FakePeer()
+        self.interface._spawn_peer_interface("BB", "phone", "ident")
+        self.assertEqual(len(self.inbox.announced), 1)
+
+    def test_a_destination_no_longer_registered_is_not_revived(self):
+        MODULE.RNS.Transport.destinations_map = {}
+        self.interface._spawn_peer_interface("AA", "phone", "ident")
+        self.assertEqual(self.inbox.announced, [])

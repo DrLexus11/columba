@@ -63,10 +63,25 @@ MAX_HELD_ANNOUNCES = 16
 # only an offline interface for that long.
 PEER_GRACE_SECONDS = 120
 
+# A peer met over BLE is told who this node is, on that link alone, at most
+# this often. Nothing else announced when two phones met: each learned the
+# other only at its next scheduled announce -- up to half an hour -- or when
+# both operators pressed Announce (operator, 2026-09-26: a message went
+# through only once *both* sides had announced by hand).
+PEER_ANNOUNCE_MIN_SECONDS = 60
+# Only destinations this node announced within this long are said again: one
+# the app stopped announcing is not revived by a BLE connection.
+OWN_ANNOUNCE_MAX_AGE_SECONDS = 6 * 60 * 60
+
 _PACKET_TYPE_MASK = 0x03
 _ANNOUNCE = 0x01
 _HEADER_2 = 0x40
+_CONTEXT_FLAG = 0x20
 _DESTINATION_BYTES = 16
+# An announce's data: public key, name hash, random blob, a ratchet when the
+# context flag is set, the signature -- then the application's own data.
+_ANNOUNCE_FIXED_BYTES = 64 + 10 + 10 + 64
+_RATCHET_BYTES = 32
 
 
 def announce_destination(data):
@@ -85,6 +100,46 @@ def announce_destination(data):
     if len(data) < start + _DESTINATION_BYTES:
         return None
     return bytes(data[start:start + _DESTINATION_BYTES])
+
+
+def announce_app_data(data):
+    """The application data an announce carries, or None if `data` is not one."""
+    if announce_destination(data) is None:
+        return None
+    flags = data[0]
+    start = 2 + (_DESTINATION_BYTES if flags & _HEADER_2 else 0) + _DESTINATION_BYTES + 1
+    start += _ANNOUNCE_FIXED_BYTES + (_RATCHET_BYTES if flags & _CONTEXT_FLAG else 0)
+    if len(data) < start:
+        return None
+    return bytes(data[start:])
+
+
+class OwnAnnounces:
+    """What this node last announced for each destination, and when.
+
+    Kept so a newly met BLE peer can be sent a *fresh* announce with the same
+    application data. Replaying the old packet would not do: a peer that heard
+    it before over LoRa drops it as a duplicate and keeps the LoRa path.
+    """
+
+    def __init__(self, clock=time.monotonic):
+        self.clock = clock
+        self._lock = threading.Lock()
+        self._latest = {}   # destination -> (when, app data)
+
+    def note(self, data):
+        destination = announce_destination(data)
+        if destination is None:
+            return
+        app_data = announce_app_data(data)
+        with self._lock:
+            self._latest[destination] = (self.clock(), app_data)
+
+    def current(self, max_age=OWN_ANNOUNCE_MAX_AGE_SECONDS):
+        now = self.clock()
+        with self._lock:
+            return [(destination, app_data) for destination, (when, app_data) in self._latest.items()
+                    if now - when <= max_age]
 
 
 class HeldAnnounces:
@@ -152,6 +207,8 @@ class AndroidBLEInterface(BLEInterface):
         # Before the parent constructor: it can start the driver, and anything
         # sent from then on may need holding.
         self._held_announces = HeldAnnounces()
+        self._own_announces = OwnAnnounces()
+        self._announced_to = {}     # peer identity hash -> when last told who we are
 
         # Call parent constructor - it will use our driver_class
         super().__init__(owner, config)
@@ -193,6 +250,7 @@ class AndroidBLEInterface(BLEInterface):
         With no peer connected the parent hands the packet to nobody and it is
         gone. An announce is kept so the first peer to connect still hears it.
         """
+        self._own_announces.note(data)
         if self.online and not self._any_peer_online():
             if self._held_announces.hold(data):
                 RNS.log(f"{self} no BLE peer yet; holding an announce until one connects",
@@ -320,6 +378,10 @@ class AndroidBLEInterface(BLEInterface):
         Flushed after the parent returns, so the peer lock is not held across
         the sends -- the parent documents the deadlock that would cause.
         """
+        peer_identity = args[2] if len(args) > 2 else kwargs.get("peer_identity")
+        identity_hash = self._compute_identity_hash(peer_identity) if peer_identity else None
+        with self.peer_lock:
+            met = identity_hash is not None and identity_hash not in self.spawned_interfaces
         peer_if = super()._spawn_peer_interface(*args, **kwargs)
         held = self._held_announces.release()
         if held:
@@ -327,7 +389,41 @@ class AndroidBLEInterface(BLEInterface):
                     RNS.LOG_INFO)
             for data in held:
                 peer_if.process_outgoing(data)
+        if met:
+            self._announce_to(peer_if, identity_hash)
         return peer_if
+
+    def _announce_to(self, peer_if, identity_hash):
+        """Tell a newly met peer who this node is -- on its link and nowhere else.
+
+        A fresh announce of each destination this node has been announcing,
+        with the same application data, sent only on the peer's interface: no
+        airtime anywhere else. Being newer than anything the peer holds, it
+        replaces a path the peer learned another way -- over LoRa, or through
+        a board -- which a replayed old announce would not.
+
+        Only for a peer interface just created. One kept through the grace
+        still has its paths, and announces sent while it was away are replayed
+        by the hold.
+        """
+        now = time.monotonic()
+        last = self._announced_to.get(identity_hash)
+        if last is not None and now - last < PEER_ANNOUNCE_MIN_SECONDS:
+            return
+        self._announced_to[identity_hash] = now
+        sent = 0
+        for destination_hash, app_data in self._own_announces.current():
+            destination = RNS.Transport.destinations_map.get(destination_hash)
+            if destination is None:
+                continue
+            try:
+                destination.announce(app_data=app_data, attached_interface=peer_if)
+                sent += 1
+            except Exception as error:      # one destination must not stop the rest
+                RNS.log(f"{self} could not announce {destination_hash.hex()[:8]} to {peer_if}: {error}",
+                        RNS.LOG_WARNING)
+        if sent:
+            RNS.log(f"{self} met {peer_if}; announced {sent} destination(s) to it alone", RNS.LOG_INFO)
 
     def get_rssi(self):
         """Get the RSSI of the most recently received message.
