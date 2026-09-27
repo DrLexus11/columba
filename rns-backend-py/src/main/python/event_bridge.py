@@ -1221,6 +1221,10 @@ def register_callbacks(
 
     if lxmf_router is not None:
         lxmf_router.register_delivery_callback(_lxmf_delivery_callback)
+        # LXMF's outbound pass skips the message behind a just-delivered one;
+        # see lxmf_outbound.
+        from lxmf_outbound import process_outbound_twice
+        process_outbound_twice(lxmf_router)
 
     RNS.log("event_bridge: callbacks registered", RNS.LOG_DEBUG)
 
