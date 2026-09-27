@@ -413,6 +413,12 @@ class TakFileTransfers(
             waitForFastPath(entry, tooSlow(left))
             return@withLock
         }
+        // Not measured on this route yet: the sample decides, and over LoRa it
+        // takes minutes (86 s for 12 KB at the deck, 2026-09-27). The preview
+        // is local and free, so it goes up now. A route measured fast brings
+        // the whole file within the budget; a preview then would be a second
+        // notice a moment before the first.
+        if (rate == null) preview(entry)
         entry.route = route
         entry.partsThisAttempt = 0
         entry.judged = false

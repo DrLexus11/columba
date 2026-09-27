@@ -162,13 +162,15 @@ class TakFileOfferTest {
     }
 
     @Test
-    fun `over a fast path the full file is asked for`() =
+    fun `on a route not yet measured the file is asked for and the preview goes up meanwhile`() =
         runTest {
             val (frame, hash) = offerFrame()
             transfers(fast = true).onOffer(frame, inboxOfDeck)
             val size = quickpic().size
             assertEquals(listOf(TakFileParts.encodeRequest(hash, 0, size).hex()), requests.map { it.hex() })
-            assertTrue(toAtak.isEmpty())
+            val notices = toAtak.filter { "b-f-t-r" in it }
+            assertEquals("the preview, while the sample decides", 1, notices.size)
+            assertTrue(TakFiles.parseNotice(notices.single())!!.filename.endsWith("_preview.zip"))
         }
 
     @Test
