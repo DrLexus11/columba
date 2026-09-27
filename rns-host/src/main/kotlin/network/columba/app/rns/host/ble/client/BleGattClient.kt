@@ -69,6 +69,8 @@ class BleGattClient(
         private const val MAX_CONNECTION_RETRIES = 3
         private const val CONNECTION_TIMEOUT_MS = BleConstants.CONNECTION_TIMEOUT_MS
         private val CCCD_UUID = BleConstants.CCCD_UUID
+        private const val DISCOVERY_ATTEMPTS = 4
+        private const val DISCOVERY_RETRY_MS = 500L
     }
 
     /**
@@ -204,6 +206,58 @@ class BleGattClient(
             status: Int,
             value: ByteArray,
         ) {
+            scope.launch {
+                handleDescriptorRead(address, descriptor, status, value)
+            }
+        }
+
+        // Android 12 and older call only these forms; the value forms above
+        // arrived in Android 13 and are never called below it. Without them a
+        // phone on Android 8 as the connecting side never completed a read --
+        // every identity read timed out -- and never received a notification,
+        // which is how the other side sends it data: a link that could send and
+        // not receive. Which phone connects follows the identity tie-break, so
+        // the Nexus 6P's link to the A54 worked or half-worked from one restart
+        // to the next (2026-09-27). The value is copied at once: these forms
+        // hand over the characteristic's shared buffer, which the next event
+        // overwrites.
+
+        @Deprecated("Called by Android 12 and older")
+        @Suppress("DEPRECATION")
+        override fun onCharacteristicRead(
+            gatt: BluetoothGatt,
+            characteristic: BluetoothGattCharacteristic,
+            status: Int,
+        ) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) return
+            val value = characteristic.value?.copyOf() ?: ByteArray(0)
+            scope.launch {
+                handleCharacteristicRead(address, characteristic, value, status)
+            }
+        }
+
+        @Deprecated("Called by Android 12 and older")
+        @Suppress("DEPRECATION")
+        override fun onCharacteristicChanged(
+            gatt: BluetoothGatt,
+            characteristic: BluetoothGattCharacteristic,
+        ) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) return
+            val value = characteristic.value?.copyOf() ?: return
+            scope.launch {
+                handleCharacteristicChanged(address, characteristic, value)
+            }
+        }
+
+        @Deprecated("Called by Android 12 and older")
+        @Suppress("DEPRECATION")
+        override fun onDescriptorRead(
+            gatt: BluetoothGatt,
+            descriptor: BluetoothGattDescriptor,
+            status: Int,
+        ) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) return
+            val value = descriptor.value?.copyOf() ?: ByteArray(0)
             scope.launch {
                 handleDescriptorRead(address, descriptor, status, value)
             }
@@ -478,7 +532,7 @@ class BleGattClient(
                 // Discover services (post to main thread for older Android versions)
                 withContext(Dispatchers.Main) {
                     Handler(Looper.getMainLooper()).post {
-                        gatt.discoverServices()
+                        discoverServicesOrRetry(address, gatt, 1)
                     }
                 }
             }
@@ -645,6 +699,32 @@ class BleGattClient(
             // Continue without identity
             requestMtuAndContinue(address, gatt)
         }
+    }
+
+    /**
+     * Ask for service discovery, and ask again if Android refuses.
+     *
+     * Android 8 can report a connection before its Bluetooth service has it:
+     * discoverServices() is then refused ("No connection for ..."), nothing
+     * happens, and the link sat idle until the peer gave up 45 s later (Nexus
+     * 6P to the Rev 2 hub, 2026-09-27). The refusal was never looked at.
+     */
+    private fun discoverServicesOrRetry(
+        address: String,
+        gatt: BluetoothGatt,
+        attempt: Int,
+    ) {
+        if (gatt.discoverServices()) return
+        if (attempt >= DISCOVERY_ATTEMPTS) {
+            Log.w(TAG, "Service discovery refused $attempt times for $address")
+            scope.launch { abandonConnection(address, "service discovery refused") }
+            return
+        }
+        Log.d(TAG, "Service discovery refused for $address; asking again (attempt ${attempt + 1})")
+        Handler(Looper.getMainLooper()).postDelayed(
+            { discoverServicesOrRetry(address, gatt, attempt + 1) },
+            DISCOVERY_RETRY_MS * attempt,
+        )
     }
 
     /** Read the peer's identity again. True if it was read; its handler then carries the handshake on. */

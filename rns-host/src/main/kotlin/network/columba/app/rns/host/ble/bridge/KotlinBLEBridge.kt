@@ -1997,6 +1997,14 @@ class KotlinBLEBridge(
         isCentral: Boolean,
     ) {
         peersMutex.withLock {
+            // Before anything else: a central attempt that ends, however it
+            // ends, is no longer pending. Android reports a shared link's two
+            // roles separately; when the peripheral callback removed the peer
+            // first, the central one returned below as "unknown" with the
+            // attempt still marked pending -- and every later attempt to that
+            // address was refused as "already pending", for good (Nexus 6P to
+            // the Rev 2 hub, 2026-09-27).
+            if (isCentral) pendingCentralConnections.remove(address)
             val peer = connectedPeers[address]
             if (peer == null) {
                 Log.w(TAG, "Disconnect notification for unknown peer: $address")
