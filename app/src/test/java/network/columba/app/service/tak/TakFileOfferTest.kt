@@ -253,4 +253,46 @@ class TakFileOfferTest {
             assertTrue(requests.isEmpty())
             assertTrue(toAtak.isEmpty())
         }
+
+    // ---- the A54's encoder writes a colour profile into every WebP ----
+
+    private fun chunk(kind: String, body: ByteArray): ByteArray {
+        val head = java.nio.ByteBuffer.allocate(8).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+        head.put(kind.toByteArray(Charsets.ISO_8859_1)).putInt(body.size)
+        return head.array() + body + if (body.size % 2 == 1) byteArrayOf(0) else byteArrayOf()
+    }
+
+    private fun riff(vararg chunks: ByteArray): ByteArray {
+        val body = chunks.fold(ByteArray(0)) { all, c -> all + c }
+        val head = java.nio.ByteBuffer.allocate(12).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+        head.put("RIFF".toByteArray()).putInt(4 + body.size).put("WEBP".toByteArray())
+        return head.array() + body
+    }
+
+    private val vp8x = ByteArray(10).also { it[0] = 0x20 }          // ICC flag set
+    private val image = ByteArray(201) { 7 }                          // odd: padded
+
+    @Test
+    fun `the profile is dropped and the simple layout written`() {
+        val stripped = TakFileOffer.withoutIccProfile(riff(chunk("VP8X", vp8x), chunk("ICCP", ByteArray(600)), chunk("VP8 ", image)))
+        assertArrayEquals(riff(chunk("VP8 ", image)), stripped)
+    }
+
+    @Test
+    fun `with alpha the extended header stays and its ICC flag is cleared`() {
+        val alpha = ByteArray(40) { 3 }
+        val stripped =
+            TakFileOffer.withoutIccProfile(
+                riff(chunk("VP8X", ByteArray(10).also { it[0] = 0x30 }), chunk("ICCP", ByteArray(600)), chunk("ALPH", alpha), chunk("VP8 ", image)),
+            )
+        assertArrayEquals(riff(chunk("VP8X", ByteArray(10).also { it[0] = 0x10 }), chunk("ALPH", alpha), chunk("VP8 ", image)), stripped)
+    }
+
+    @Test
+    fun `a WebP without a profile, or not a WebP, is left alone`() {
+        val plain = riff(chunk("VP8 ", image))
+        assertArrayEquals(plain, TakFileOffer.withoutIccProfile(plain))
+        val jpeg = byteArrayOf(0xFF.toByte(), 0xD8.toByte(), 1, 2, 3)
+        assertArrayEquals(jpeg, TakFileOffer.withoutIccProfile(jpeg))
+    }
 }
