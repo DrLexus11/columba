@@ -250,7 +250,7 @@ class BleGattClient(
                 val connectionJob =
                     scope.launch {
                         delay(CONNECTION_TIMEOUT_MS)
-                        handleConnectionTimeout(address)
+                        handleConnectionTimeout(address, coroutineContext[Job])
                     }
 
                 // Connect to GATT server
@@ -624,10 +624,19 @@ class BleGattClient(
                 // If we reach here, read succeeded and handleCharacteristicRead() already
                 // called requestMtuAndContinue(), so we're done
             } catch (e: Exception) {
-                Log.w(TAG, "Failed to read identity characteristic from $address (non-fatal)", e)
-                Log.i(TAG, ">>> HANDSHAKE: Skipping identity (Protocol v1 fallback)")
-                // Continue without identity - will request MTU after timeout
-                requestMtuAndContinue(address, gatt)
+                // The peer has an identity and it could not be read. Going on
+                // without it made a one-sided link: this side never learned who
+                // the peer was and built no interface, while the peer, which got
+                // our identity in step 4, counted the link as up and refused
+                // every reconnect as already linked (A54 and Nexus 6P,
+                // 2026-09-27: a 5 s read timeout, then neither phone reached the
+                // other). Every peer we have serves an identity, so read it again
+                // once; failing that, close the connection and let it be made
+                // afresh.
+                Log.w(TAG, "Failed to read identity characteristic from $address; trying once more", e)
+                if (!readIdentityOnceMore(gatt, identityChar)) {
+                    abandonConnection(address, "identity could not be read")
+                }
             }
         } else {
             Log.w(TAG, ">>> HANDSHAKE: Identity characteristic not found on $address")
@@ -636,6 +645,36 @@ class BleGattClient(
             // Continue without identity
             requestMtuAndContinue(address, gatt)
         }
+    }
+
+    /** Read the peer's identity again. True if it was read; its handler then carries the handshake on. */
+    private suspend fun readIdentityOnceMore(
+        gatt: BluetoothGatt,
+        identityChar: BluetoothGattCharacteristic,
+    ): Boolean =
+        try {
+            operationQueue.enqueue(BleOperationQueue.BleOperation.ReadCharacteristic(gatt = gatt, characteristic = identityChar))
+            true
+        } catch (e: Exception) {
+            Log.w(TAG, "Identity read failed again", e)
+            false
+        }
+
+    /** Close a connection whose handshake cannot complete, and say so, so it is made again from scratch. */
+    private suspend fun abandonConnection(
+        address: String,
+        reason: String,
+    ) {
+        Log.w(TAG, "Abandoning the connection to $address: $reason")
+        val connData = connectionsMutex.withLock { connections.remove(address) }
+        connData?.connectionJob?.cancel()
+        if (connData != null) {
+            withContext(Dispatchers.Main) {
+                connData.gatt.disconnect()
+                connData.gatt.close()
+            }
+        }
+        onConnectionFailed?.invoke(address, reason)
     }
 
     private suspend fun requestMtuAndContinue(
@@ -1058,7 +1097,13 @@ class BleGattClient(
             return
         }
 
-        // Close the connection
+        // Close the connection, and its timeout with it: left running, it fired
+        // thirty seconds later against whatever connection then held this
+        // address -- the retry that had succeeded -- and closed it. The A54's
+        // link to the Nexus 6P died that way 24 s after forming (2026-09-27),
+        // and the bridge, never told, kept the peer as linked and refused to
+        // reconnect.
+        connData.connectionJob?.cancel()
         gatt.close()
 
         // Check retry count
@@ -1101,17 +1146,26 @@ class BleGattClient(
         }
     }
 
-    private suspend fun handleConnectionTimeout(address: String) {
-        Log.e(TAG, "Connection timeout for $address")
-
-        val connData = connectionsMutex.withLock { connections.remove(address) }
-        if (connData != null) {
-            withContext(Dispatchers.Main) {
-                connData.gatt.disconnect()
-                connData.gatt.close()
+    private suspend fun handleConnectionTimeout(
+        address: String,
+        attempt: Job?,
+    ) {
+        // Only the attempt this timeout was started for. A later attempt to the
+        // same address -- a retry, a reconnect -- has its own.
+        val connData =
+            connectionsMutex.withLock {
+                connections[address]?.takeIf { it.connectionJob === attempt }?.also { connections.remove(address) }
             }
-            onConnectionFailed?.invoke(address, "Connection timeout")
+        if (connData == null) {
+            Log.d(TAG, "Stale connection timeout for $address ignored; a newer attempt holds it")
+            return
         }
+        Log.e(TAG, "Connection timeout for $address")
+        withContext(Dispatchers.Main) {
+            connData.gatt.disconnect()
+            connData.gatt.close()
+        }
+        onConnectionFailed?.invoke(address, "Connection timeout")
     }
 
     /**
