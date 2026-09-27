@@ -71,4 +71,33 @@ class AtakCadenceTest {
         cadence.reported()
         assertFalse(cadence.isReporting(false))
     }
+
+    // A receiver draws an unstated report as current for two minutes; ATAK with
+    // no fix reports every several, and NEXUS went grey between them
+    // (2026-09-27).
+
+    @Test
+    fun `an atak reporting every few minutes has that cadence stated`() {
+        cadence.reported()
+        now += 4 * minute + 10_000
+        cadence.reported()
+        assertEquals(5, cadence.statedIntervalMinutes())
+    }
+
+    @Test
+    fun `an atak reporting at least once a minute states nothing`() {
+        assertEquals("nothing known yet", 0, cadence.statedIntervalMinutes())
+        cadence.reported()
+        now += 20_000
+        cadence.reported()
+        assertEquals(0, cadence.statedIntervalMinutes())
+    }
+
+    @Test
+    fun `the stated interval never exceeds the quiet window`() {
+        cadence.reported()
+        now += 40 * minute
+        cadence.reported()
+        assertEquals(10, cadence.statedIntervalMinutes())
+    }
 }
