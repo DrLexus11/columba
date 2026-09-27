@@ -9,18 +9,17 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import network.columba.app.rns.api.RnsCore
-import network.columba.app.rns.api.model.LinkSpeedProbeResult
 import java.util.concurrent.ConcurrentHashMap
 
 /**
  * Files offered to this handset: fetched over a fast path, deferred over LoRa.
  *
  * A `b-f-t-r` notice arrives from a teammate's ATAK. The file is fetched only
- * when the path to its sender is **measured** to be fast -- a Reticulum link
- * handshake, round trip under [FAST_RTT_S]. The first hop is not trusted for
- * this: from a handset on TCP to the deck, and from the deck to a board, the
- * first hop is fast even when LoRa lies further on. On a slow path the request
- * waits and is tried again with backoff, for up to [HOLD_MS].
+ * while the path to its sender is **measured** to bring it within
+ * [TakFileParts.FETCH_BUDGET_MS] -- by timing the parts themselves, a setup
+ * part and then a sample; see [TakFileParts]. On a slow path the request waits
+ * and is tried again with backoff, for up to [HOLD_MS], without sampling a
+ * route already measured slow.
  *
  * Only once the file is here, and is the file the notice named, does ATAK see
  * the notice -- rewritten to fetch from [TakFileServer] on this handset. ATAK
@@ -54,33 +53,30 @@ class TakFileTransfers(
     companion object {
         private const val TAG = "TakFileTransfers"
 
-        /**
-         * A link handshake faster than this is a fast path. LoRa at SF7/BW250
-         * spends about 0.26 s on the air for a request and its proof alone,
-         * before any BLE hop or channel wait; TCP and Wi-Fi measure tens of
-         * milliseconds. The probe's figures are logged for every file, so
-         * this is revisited on data rather than guessed at twice.
-         */
-        const val FAST_RTT_S = 0.5
-        private const val PROBE_TIMEOUT_S = 10f
         private const val TICK_MS = 15_000L
         const val FIRST_RETRY_MS = 60_000L
+
+        /** How long an offer may wait for a path to its sender before anyone is told. */
+        const val PATH_GRACE_MS = 60_000L
         const val MAX_RETRY_MS = 15L * 60 * 1000
         private const val REQUEST_WAIT_MS = 2L * 60 * 1000
         const val HOLD_MS = 24L * 60 * 60 * 1000
 
-        /**
-         * One measurement per sender serves every file waiting on them for this
-         * long. Each probe is a link handshake, over LoRa when the path is slow,
-         * and three files from one sender were three handshakes on the bench.
-         */
-        const val PROBE_REUSE_MS = 30_000L
-
         /** How long an offered file may go unfetched before the sender is told. */
         const val UNFETCHED_MS = 60_000L
 
-        fun isFast(probe: LinkSpeedProbeResult): Boolean =
-            probe.isSuccess && (probe.rttSeconds ?: Double.MAX_VALUE) < FAST_RTT_S
+        /** Where the path table says [inbox] is now, or null -- a path asked for -- if nowhere. */
+        private suspend fun routeTo(rnsCore: RnsCore, inbox: ByteArray?): TakFileParts.Route? {
+            if (inbox == null) return null
+            if (!rnsCore.hasPath(inbox)) {
+                rnsCore.requestPath(inbox)
+                return null
+            }
+            return TakFileParts.Route(rnsCore.getHopCount(inbox) ?: -1, rnsCore.getNextHopInterfaceName(inbox) ?: "unknown")
+        }
+
+        private fun tooSlow(leftMs: Long) =
+            "at the rate this path is giving, the rest would take about ${maxOf(1, leftMs / 60_000)} min"
 
         /** Transfers for one endpoint session, keeping files under [parent]/tak_files. */
         fun inDirectory(
@@ -130,6 +126,13 @@ class TakFileTransfers(
 
         @Volatile var askedLength = 0
 
+        /** The route this attempt samples, how many parts it has had, and whether one was judged. */
+        @Volatile var route: TakFileParts.Route? = null
+
+        @Volatile var partsThisAttempt = 0
+
+        @Volatile var judged = false
+
         /**
          * Whether [part] is the one asked for and still waited for: a request
          * is in flight, and the part matches it on offset, length and the
@@ -160,7 +163,7 @@ class TakFileTransfers(
     private val pending = ConcurrentHashMap<String, Pending>()
     /** What this ATAK offered, and the parts teammates ask for. */
     private val sending = TakFileSender(store, rnsCore, lxmf, team, clock, thumbnailer) { status(it) }
-    private val probes = ConcurrentHashMap<String, Pair<Long, LinkSpeedProbeResult?>>()
+    private val rates = TakFileParts.PathRates()
 
     /** Files offered and not yet here. */
     fun waiting(): Int = pending.size
@@ -283,26 +286,47 @@ class TakFileTransfers(
                 !store.appendPartial(part.hash, part.offset, part.data) -> Unit
                 store.partialSize(part.hash) >= part.total ->
                     store.takePartial(part.hash)?.let { complete(entry, it, entry.notice.filename) }
-                else -> {
-                    val have = store.partialSize(part.hash)
-                    val took = clock() - entry.askedAt
-                    val left = TakFileParts.msLeft(part.total - have, part.data.size, took)
-                    entry.askedAt = 0
-                    Log.i(TAG, "${entry.notice.filename}: $have of ${part.total} bytes, last part in ${took}ms; the rest ~${left / 1000}s")
-                    if (left <= TakFileParts.FETCH_BUDGET_MS) {
-                        requestPart(entry)
-                    } else {
-                        waitForFastPath(entry, "at the rate this path is giving, the rest would take about ${maxOf(1, left / 60_000)} min")
-                    }
-                }
+                else -> judge(entry, part)
+            }
         }
+    }
+
+    /**
+     * A part kept and the file not yet whole: ask for the next, or pause. The
+     * first part of an attempt carries the link and transfer setup and is not
+     * judged -- measured 2026-09-26, 64 KB in 16.4 s over one BLE hop, setup
+     * included, read as ~32 kbit/s and the file deferred.
+     */
+    private suspend fun judge(entry: Pending, part: TakFileParts.Part) {
+        val have = store.partialSize(part.hash)
+        val took = clock() - entry.askedAt
+        entry.askedAt = 0
+        entry.partsThisAttempt++
+        if (entry.partsThisAttempt == 1) {
+            Log.i(TAG, "${entry.notice.filename}: $have of ${part.total} bytes; setup part in ${took}ms, not judged")
+            requestPart(entry)
+            return
+        }
+        val left = TakFileParts.msLeft(part.total - have, part.data.size, took)
+        val bytesPerSecond = part.data.size * 1000.0 / maxOf(took, 1L)
+        rates.record(entry.sender.toHex(), entry.route, bytesPerSecond, clock())
+        Log.i(
+            TAG,
+            "${entry.notice.filename}: $have of ${part.total} bytes, last part in ${took}ms " +
+                "(${(bytesPerSecond * 8).toLong()} bit/s); the rest ~${left / 1000}s",
+        )
+        if (left <= TakFileParts.FETCH_BUDGET_MS) {
+            entry.judged = true
+            requestPart(entry)
+        } else {
+            waitForFastPath(entry, tooSlow(left))
         }
     }
 
     /** Ask the sender for the next part. False if it cannot be asked now. */
     private suspend fun requestPart(entry: Pending): Boolean {
         val offset = store.partialSize(entry.notice.hash)
-        val length = TakFileParts.nextPartLength(offset, entry.notice.size)
+        val length = TakFileParts.partLength(offset, entry.notice.size, entry.partsThisAttempt, entry.judged)
         val request = TakFileParts.encodeRequest(entry.notice.hash, offset, length)
         if (lxmf.send(entry.sender, request, "", propagate = false) == null) return false
         entry.askedAt = clock()
@@ -361,19 +385,39 @@ class TakFileTransfers(
         // asked for the next part, moving nextTryAt on; attempting anyway is
         // the duplicate request this lock exists to prevent.
         if (now < entry.nextTryAt) return@withLock
-        // Claimed before the probe, which takes seconds over LoRa: the retry
-        // tick must not start a second probe of the same path meanwhile.
         entry.nextTryAt = now + REQUEST_WAIT_MS
-        val probe = probe(entry.sender, now)
+        val route = routeTo(rnsCore, lxmf.inboxFor(entry.sender))
+        if (route == null && now - entry.since < PATH_GRACE_MS) {
+            // An offer arrives before its sender's inbox is known more often
+            // than not; the path request just sent is usually answered in
+            // seconds. Look again on the next tick and tell nobody yet -- but
+            // a QuickPic's preview costs nothing on air, so it is shown now.
+            entry.nextTryAt = now + TICK_MS
+            Log.i(TAG, "no path to the sender of ${entry.notice.filename} yet; asked, looking again shortly")
+            preview(entry)
+            return@withLock
+        }
+        if (route == null) {
+            waitForFastPath(entry, "no path to its sender yet")
+            return@withLock
+        }
+        val rate = rates.known(entry.sender.toHex(), route, now)
         Log.i(
             TAG,
-            "path to the sender of ${entry.notice.filename}: ${probe?.status ?: "no inbox"}, " +
-                "rtt=${probe?.rttSeconds}s, handshake=${probe?.establishmentRateBps}bps, " +
-                "hops=${probe?.hops}, first hop=${probe?.nextHopBitrateBps}bps",
+            "route to the sender of ${entry.notice.filename}: ${route.hops} hop(s) via ${route.via}; " +
+                (rate?.let { "${(it * 8).toLong()} bit/s measured" } ?: "not measured lately"),
         )
-        // Round trip is the cheap pre-filter: LoRa in the path never pays for
-        // a sample. Whether the file arrives in time is measured by the parts.
-        if (!(probe != null && isFast(probe) && requestPart(entry))) waitForFastPath(entry, null)
+        val remaining = entry.notice.size - store.partialSize(entry.notice.hash)
+        val left = rate?.let { (remaining * 1000 / it).toLong() }
+        if (left != null && left > TakFileParts.FETCH_BUDGET_MS) {
+            // Measured slow on this very route: nothing spent on air.
+            waitForFastPath(entry, tooSlow(left))
+            return@withLock
+        }
+        entry.route = route
+        entry.partsThisAttempt = 0
+        entry.judged = false
+        if (!requestPart(entry)) waitForFastPath(entry, null)
     }
 
     /** Hold the file, show a preview if there is one, and try again later. */
@@ -382,7 +426,7 @@ class TakFileTransfers(
         Log.i(TAG, "${reason ?: "Slow or no path"}; ${entry.notice.filename} waits, next try in ${entry.backoffMs / 1000}s")
         entry.nextTryAt = clock() + entry.backoffMs
         entry.backoffMs = minOf(entry.backoffMs * 2, MAX_RETRY_MS)
-        val previewed = preview(entry)
+        val previewed = preview(entry) || entry.previewHash != null
         if (!entry.told) {
             entry.told = true
             status(
@@ -391,15 +435,6 @@ class TakFileTransfers(
                     "It arrives when a fast path appears." + if (previewed) " A preview is on the map." else "",
             )
         }
-    }
-
-    /** The path to [sender], measured at most once per [PROBE_REUSE_MS] for all its files. */
-    private suspend fun probe(sender: ByteArray, now: Long): LinkSpeedProbeResult? {
-        val key = sender.toHex()
-        probes[key]?.takeIf { now - it.first < PROBE_REUSE_MS }?.let { return it.second }
-        val measured = lxmf.inboxFor(sender)?.let { rnsCore.probeLinkSpeed(it, PROBE_TIMEOUT_S, "direct") }
-        probes[key] = now to measured
-        return measured
     }
 
     private suspend fun status(text: String) {

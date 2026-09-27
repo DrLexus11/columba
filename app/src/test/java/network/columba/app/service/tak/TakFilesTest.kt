@@ -9,7 +9,6 @@ import network.columba.app.rns.api.model.Destination
 import network.columba.app.rns.api.model.DestinationType
 import network.columba.app.rns.api.model.Direction
 import network.columba.app.rns.api.model.Identity
-import network.columba.app.rns.api.model.LinkSpeedProbeResult
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -100,11 +99,10 @@ class TakFilesTest {
             sentFiles += firstArg<ByteArray>() to secondArg<ByteArray>()
             "sent"
         }
-        coEvery { rnsCore.probeLinkSpeed(any(), any(), any()) } returns
-            LinkSpeedProbeResult(
-                status = "success", establishmentRateBps = 40_000, expectedRateBps = null,
-                rttSeconds = if (fastPath) 0.04 else 1.8, hops = 2, linkReused = false,
-            )
+        coEvery { rnsCore.hasPath(any()) } returns fastPath
+        coEvery { rnsCore.requestPath(any()) } returns Result.success(Unit)
+        coEvery { rnsCore.getHopCount(any()) } returns 1
+        coEvery { rnsCore.getNextHopInterfaceName(any()) } returns "BLEPeerInterface[DECK]"
         store = TakFileStore(folder.newFolder())
         return TakFileTransfers(
             store, TakFileServer(store), rnsCore, carrier, { toAtak += String(it, Charsets.UTF_8) },
@@ -361,8 +359,22 @@ class TakFilesTest {
             assertTrue("from Columba, not in the teammate's name", line.contains(TakFiles.STATUS_UID))
         }
 
+    /** An offer usually arrives before its sender's inbox is known; the path is seconds away. */
     @Test
-    fun `files waiting on one sender share one probe`() =
+    fun `with no path yet nobody is told, and the file is asked for once one appears`() =
+        runTest {
+            val files = transfers(fastPath = false, ourUid = ours)
+            files.intercept(notice().toByteArray(), sourceHash = inboxOfDeck)
+            assertTrue("a path is usually seconds away", toAtak.isEmpty())
+
+            coEvery { rnsCore.hasPath(any()) } returns true
+            now += 15_000
+            files.retryDue()
+            coVerify { carrier.send(deck, TakFileParts.encodeRequest(hash, 0, data.size), "", propagate = false) }
+        }
+
+    @Test
+    fun `files waiting for a path ask for no part`() =
         runTest {
             val files = transfers(fastPath = false)
             files.intercept(notice().toByteArray(), sourceHash = inboxOfDeck)
@@ -370,7 +382,7 @@ class TakFilesTest {
             files.intercept(notice(other).toByteArray(), sourceHash = inboxOfDeck)
 
             assertEquals(2, files.waiting())
-            coVerify(exactly = 1) { rnsCore.probeLinkSpeed(any(), any(), any()) }
+            coVerify(exactly = 0) { carrier.send(any(), any(), any(), any(), any()) }
         }
 
     @Test

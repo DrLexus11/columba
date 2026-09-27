@@ -8,7 +8,6 @@ import network.columba.app.rns.api.model.Destination
 import network.columba.app.rns.api.model.DestinationType
 import network.columba.app.rns.api.model.Direction
 import network.columba.app.rns.api.model.Identity
-import network.columba.app.rns.api.model.LinkSpeedProbeResult
 import org.json.JSONObject
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
@@ -132,11 +131,9 @@ class TakFileOfferTest {
     /** Moved on by hand, so a test can outlast a retry backoff without sleeping. */
     private var now = 1_790_000_000_000L
 
-    private fun fastProbe() =
-        coEvery { rnsCore.probeLinkSpeed(any(), any(), any()) } returns
-            LinkSpeedProbeResult("success", 40_000, null, 0.04, 2, false)
+    private fun pathAppears() = coEvery { rnsCore.hasPath(any()) } returns true
 
-    private fun transfers(rtt: Double): TakFileTransfers {
+    private fun transfers(fast: Boolean): TakFileTransfers {
         val identity = Identity(ByteArray(16) { 0x01 }, ByteArray(64) { 0x02 }, null)
         coEvery { rnsCore.recallIdentity(any()) } returns identity
         coEvery { rnsCore.createDestination(any(), any(), any(), any(), any()) } returns
@@ -146,8 +143,10 @@ class TakFileOfferTest {
             requests += secondArg<ByteArray>()
             "sent"
         }
-        coEvery { rnsCore.probeLinkSpeed(any(), any(), any()) } returns
-            LinkSpeedProbeResult("success", 40_000, null, rtt, 2, false)
+        coEvery { rnsCore.hasPath(any()) } returns fast
+        coEvery { rnsCore.requestPath(any()) } returns Result.success(Unit)
+        coEvery { rnsCore.getHopCount(any()) } returns 1
+        coEvery { rnsCore.getNextHopInterfaceName(any()) } returns "BLEPeerInterface[DECK]"
         store = TakFileStore(folder.newFolder())
         return TakFileTransfers(
             store, TakFileServer(store), rnsCore, carrier, { toAtak += String(it, Charsets.UTF_8) },
@@ -166,7 +165,7 @@ class TakFileOfferTest {
     fun `over a fast path the full file is asked for`() =
         runTest {
             val (frame, hash) = offerFrame()
-            transfers(rtt = 0.04).onOffer(frame, inboxOfDeck)
+            transfers(fast = true).onOffer(frame, inboxOfDeck)
             val size = quickpic().size
             assertEquals(listOf(TakFileParts.encodeRequest(hash, 0, size).hex()), requests.map { it.hex() })
             assertTrue(toAtak.isEmpty())
@@ -175,11 +174,16 @@ class TakFileOfferTest {
     @Test
     fun `over a slow path a quickpic is previewed on the map`() =
         runTest {
-            transfers(rtt = 1.8).onOffer(offerFrame().first, inboxOfDeck)
+            val files = transfers(fast = false)
+            files.onOffer(offerFrame().first, inboxOfDeck)
             assertTrue(requests.isEmpty())
             val notices = toAtak.filter { "b-f-t-r" in it }
             assertEquals(1, notices.size)
             assertTrue(TakFiles.parseNotice(notices.single())!!.filename.endsWith("_preview.zip"))
+
+            // Still no path once the grace is over: the wait is told, preview and all.
+            now += TakFileTransfers.PATH_GRACE_MS + 1
+            files.retryDue()
             assertTrue(toAtak.any { "A preview is on the map" in it })
         }
 
@@ -203,13 +207,13 @@ class TakFileOfferTest {
     fun `the preview is deleted when the full file arrives`() =
         runTest {
             val pkg = quickpic()
-            val files = transfers(rtt = 1.8)
+            val files = transfers(fast = false)
             val (frame, hash) = offerFrameFor(pkg)
             files.onOffer(frame, inboxOfDeck)
             val preview = TakFiles.parseNotice(toAtak.first { "b-f-t-r" in it })!!.hash
             assertTrue(store.has(preview))
 
-            fastProbe()
+            pathAppears()
             now += TakFileTransfers.MAX_RETRY_MS
             requests.clear()
             files.retryDue()
@@ -230,7 +234,7 @@ class TakFileOfferTest {
     fun `a picture pushed whole over the slow path is refused and the preview stays`() =
         runTest {
             val pkg = quickpic()
-            val files = transfers(rtt = 1.8)
+            val files = transfers(fast = false)
             val (frame, hash) = offerFrameFor(pkg)
             files.onOffer(frame, inboxOfDeck)
             val preview = TakFiles.parseNotice(toAtak.first { "b-f-t-r" in it })!!.hash
@@ -245,7 +249,7 @@ class TakFileOfferTest {
     @Test
     fun `an offer claiming someone else is refused`() =
         runTest {
-            transfers(rtt = 0.04).onOffer(offerFrame(senderId = 0x0BADF00D).first, inboxOfDeck)
+            transfers(fast = true).onOffer(offerFrame(senderId = 0x0BADF00D).first, inboxOfDeck)
             assertTrue(requests.isEmpty())
             assertTrue(toAtak.isEmpty())
         }
