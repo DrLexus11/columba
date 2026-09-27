@@ -225,6 +225,25 @@ class AndroidBLEInterface(BLEInterface):
     def _process_pending_detaches(self):
         super()._process_pending_detaches()
         self._revive_reconnected()
+        self._log_peers()
+
+    def _log_peers(self):
+        """Every kept peer and whether it carries traffic, once per cleanup tick.
+
+        The only other view of this is the Interfaces screen, and only while it
+        is open. tools/ble_link_soak.py in the firmware repo reads these lines
+        to measure how much of the time each peer was actually usable.
+        """
+        now = time.time()
+        with self.peer_lock:
+            parts = []
+            for identity_hash, peer_if in self.spawned_interfaces.items():
+                state = "online" if peer_if.online else "offline"
+                if identity_hash in self._pending_detach:
+                    left = PEER_GRACE_SECONDS - (now - self._pending_detach[identity_hash])
+                    state += f" detach-in={max(0, int(left))}s"
+                parts.append(f"{identity_hash[:8]}[{getattr(peer_if, 'peer_name', '?')}]={state}")
+        RNS.log(f"{self} peers: {', '.join(parts) or 'none'}", RNS.LOG_INFO)
 
     def _revive_reconnected(self):
         """Bring back online a peer that returned within the grace.

@@ -262,6 +262,13 @@ class PeerGraceTests(unittest.TestCase):
         self.interface._process_pending_detaches()
         self.assertTrue(peer.online)
 
+    def test_the_peer_heartbeat_names_each_peer_and_its_state(self):
+        lines = []
+        MODULE.RNS.log = lambda text, *args, **kwargs: lines.append(text)
+        self.away()
+        self.interface._process_pending_detaches()
+        self.assertTrue(any("peers: ident[?]=offline detach-in=" in line for line in lines), lines)
+
     def test_a_peer_still_away_stays_offline(self):
         peer = self.away()
         self.interface._device_connected_callback("CC", "other")
