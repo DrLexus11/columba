@@ -46,28 +46,48 @@ class FakeBLEInterface:
         self._pending_detach_grace_period = 2.0
         self._identity_cache_ttl = 60
         self._pending_detach = {}
+        self.address_to_identity = {}
 
     def process_outgoing(self, data):
         self.handed_off.append(data)
 
     def _spawn_peer_interface(self, address, name, peer_identity, **kwargs):
+        identity_hash = self._compute_identity_hash(peer_identity)
         with self.peer_lock:
-            existing = self.spawned_interfaces.get(peer_identity)
+            self.address_to_identity[address] = peer_identity
+            existing = self.spawned_interfaces.get(identity_hash)
             if existing is not None:
                 existing.online = True      # the parent reuses and revives it
-                self._pending_detach.pop(peer_identity, None)
+                self._pending_detach.pop(identity_hash, None)
                 return existing
-            self.spawned_interfaces[peer_identity] = self.next_peer
+            self.spawned_interfaces[identity_hash] = self.next_peer
         return self.next_peer
 
     def _device_disconnected_callback(self, address):
         # The parent schedules the detach, keyed by identity; the interface stays.
         self._pending_detach[self.identity_of[address]] = 0.0
+        self.address_to_identity.pop(address, None)
+
+    def _device_connected_callback(self, address, peer_identity):
+        # The parent cancels the detach and records the address -- and does
+        # not set the kept interface online.
+        self._pending_detach.pop(self._compute_identity_hash(peer_identity), None)
+        self.address_to_identity[address] = peer_identity
+
+    def _mtu_negotiated_callback(self, address, mtu):
+        pass                                # an existing interface: address only
+
+    def _process_pending_detaches(self):
+        # The parent's other cancel: an address came back during the grace.
+        connected = {self._compute_identity_hash(i) for i in self.address_to_identity.values()}
+        for identity_hash in list(self._pending_detach):
+            if identity_hash in connected:
+                del self._pending_detach[identity_hash]
 
     # --- enough of the duplicate-identity machinery for the tie-break ---
 
     def _compute_identity_hash(self, identity):
-        return bytes(identity).hex()
+        return identity if isinstance(identity, str) else bytes(identity).hex()
 
     def _check_duplicate_identity(self, address, peer_identity):
         existing = self.identity_to_address.get(self._compute_identity_hash(peer_identity))
@@ -218,6 +238,35 @@ class PeerGraceTests(unittest.TestCase):
         self.assertIs(back, peer, "the same interface, with its paths")
         self.assertTrue(back.online)
         self.assertEqual(len(back.sent), 1)
+
+    # Measured 2026-09-26: Rev 1 dropped for under a second, reconnected as
+    # central, and its kept interface stayed offline -- no route to the deck.
+
+    def away(self):
+        peer = self.interface._spawn_peer_interface("AA", "board", "ident")
+        self.interface.identity_of["AA"] = "ident"
+        self.interface._device_disconnected_callback("AA")
+        self.assertFalse(peer.online)
+        return peer
+
+    def test_a_board_back_as_central_is_online_again(self):
+        peer = self.away()
+        self.interface.process_outgoing(announce(b"\x11" * 16))
+        self.interface._device_connected_callback("AA", "ident")
+        self.assertTrue(peer.online)
+        self.assertEqual(len(peer.sent), 1, "the announce held while it was away")
+
+    def test_a_board_back_at_the_grace_tick_is_online_again(self):
+        peer = self.away()
+        self.interface.address_to_identity["BB"] = "ident"
+        self.interface._process_pending_detaches()
+        self.assertTrue(peer.online)
+
+    def test_a_peer_still_away_stays_offline(self):
+        peer = self.away()
+        self.interface._device_connected_callback("CC", "other")
+        self.interface._mtu_negotiated_callback("CC", 509)
+        self.assertFalse(peer.online)
 
 
 

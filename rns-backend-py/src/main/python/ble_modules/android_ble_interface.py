@@ -214,6 +214,46 @@ class AndroidBLEInterface(BLEInterface):
                 if peer_if is not None:
                     peer_if.online = False
 
+    def _device_connected_callback(self, address, peer_identity):
+        super()._device_connected_callback(address, peer_identity)
+        self._revive_reconnected()
+
+    def _mtu_negotiated_callback(self, address, mtu):
+        super()._mtu_negotiated_callback(address, mtu)
+        self._revive_reconnected()
+
+    def _process_pending_detaches(self):
+        super()._process_pending_detaches()
+        self._revive_reconnected()
+
+    def _revive_reconnected(self):
+        """Bring back online a peer that returned within the grace.
+
+        The parent cancels a pending detach in several places, and only its
+        reuse in _spawn_peer_interface sets the interface online again. A board
+        that reconnects as central takes another path: the detach is cancelled,
+        the interface is kept -- and stays offline, so Transport routes nothing
+        through it while its packets still arrive. Measured 2026-09-26: Rev 1
+        dropped for under a second and the A54 carried nothing to the deck for
+        the next seven minutes.
+
+        So: a kept interface with a connected address and no detach pending is
+        online, whichever path brought it back.
+        """
+        revived = []
+        with self.peer_lock:
+            connected = {self._compute_identity_hash(identity)
+                         for identity in self.address_to_identity.values() if identity}
+            for identity_hash, peer_if in self.spawned_interfaces.items():
+                if (not peer_if.online and identity_hash in connected
+                        and identity_hash not in self._pending_detach):
+                    peer_if.online = True
+                    revived.append(peer_if)
+        for peer_if in revived:
+            RNS.log(f"{self} {peer_if} is back within the grace; online again", RNS.LOG_INFO)
+            for data in self._held_announces.release():
+                peer_if.process_outgoing(data)
+
     def _check_duplicate_identity(self, address, peer_identity):
         """Decide a second link to the same peer the way the peer decides it.
 
