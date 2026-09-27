@@ -355,7 +355,7 @@ class TakFilesTest {
 
             assertEquals("one line, not one per retry", 1, toAtak.size)
             val line = toAtak.single()
-            assertTrue(line.contains("Recon1.zip") && line.contains("from DECK is waiting"))
+            assertTrue(line.contains("HELD Recon1.zip") && line.contains("fr DECK - "))
             assertTrue("from Columba, not in the teammate's name", line.contains(TakFiles.STATUS_UID))
         }
 
@@ -398,7 +398,7 @@ class TakFilesTest {
             files.retryDue()
             files.retryDue()
             assertEquals(1, toAtak.size)
-            assertTrue(toAtak.single().contains("not fetched yet by LEXUS"))
+            assertTrue(toAtak.single().contains("NOT FETCHED") && toAtak.single().contains("by LEXUS"))
         }
 
     @Test

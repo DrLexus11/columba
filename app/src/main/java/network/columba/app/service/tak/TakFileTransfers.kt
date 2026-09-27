@@ -75,8 +75,7 @@ class TakFileTransfers(
             return TakFileParts.Route(rnsCore.getHopCount(inbox) ?: -1, rnsCore.getNextHopInterfaceName(inbox) ?: "unknown")
         }
 
-        private fun tooSlow(leftMs: Long) =
-            "at the rate this path is giving, the rest would take about ${maxOf(1, leftMs / 60_000)} min"
+        private fun tooSlow(leftMs: Long) = TakStatusLines.slowReason(leftMs / 1000)
 
         /** Transfers for one endpoint session, keeping files under [parent]/tak_files. */
         fun inDirectory(
@@ -398,7 +397,7 @@ class TakFileTransfers(
             return@withLock
         }
         if (route == null) {
-            waitForFastPath(entry, "no path to its sender yet")
+            waitForFastPath(entry, TakStatusLines.REASON_NO_PATH)
             return@withLock
         }
         val rate = rates.known(entry.sender.toHex(), route, now)
@@ -423,16 +422,16 @@ class TakFileTransfers(
     /** Hold the file, show a preview if there is one, and try again later. */
     private suspend fun waitForFastPath(entry: Pending, reason: String?) {
         entry.askedAt = 0
-        Log.i(TAG, "${reason ?: "Slow or no path"}; ${entry.notice.filename} waits, next try in ${entry.backoffMs / 1000}s")
+        Log.i(TAG, "${reason ?: TakStatusLines.REASON_SLOW}; ${entry.notice.filename} waits, next try in ${entry.backoffMs / 1000}s")
         entry.nextTryAt = clock() + entry.backoffMs
         entry.backoffMs = minOf(entry.backoffMs * 2, MAX_RETRY_MS)
         val previewed = preview(entry) || entry.previewHash != null
         if (!entry.told) {
             entry.told = true
             status(
-                "${entry.notice.filename} (${TakFiles.sizeText(entry.notice.size)}) from " +
-                    "${nameOf(entry.sender)} is waiting: ${reason ?: "the path is too slow to bring it now"}. " +
-                    "It arrives when a fast path appears." + if (previewed) " A preview is on the map." else "",
+                TakStatusLines.heldLine(
+                    entry.notice.filename, entry.notice.size, nameOf(entry.sender), reason ?: TakStatusLines.REASON_SLOW, previewed,
+                ),
             )
         }
     }

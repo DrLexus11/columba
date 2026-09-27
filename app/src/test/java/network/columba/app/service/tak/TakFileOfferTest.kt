@@ -184,7 +184,7 @@ class TakFileOfferTest {
             // Still no path once the grace is over: the wait is told, preview and all.
             now += TakFileTransfers.PATH_GRACE_MS + 1
             files.retryDue()
-            assertTrue(toAtak.any { "A preview is on the map" in it })
+            assertTrue(toAtak.any { "Preview on map" in it })
         }
 
     /** An offer built from [pkg] itself, so the bytes fetched are the bytes offered. */

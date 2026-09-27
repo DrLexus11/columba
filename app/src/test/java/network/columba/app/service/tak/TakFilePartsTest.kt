@@ -58,6 +58,25 @@ class TakFilePartsTest {
         assertArrayEquals(hex(part.getString("data")), back.data)
     }
 
+    @Test
+    fun `status lines match the deck word for word`() {
+        val cases = v.getJSONArray("status_lines")
+        for (i in 0 until cases.length()) {
+            val case = cases.getJSONObject(i)
+            val line =
+                when (case.getString("kind")) {
+                    "held" ->
+                        TakStatusLines.heldLine(
+                            case.getString("filename"), case.getLong("size"), case.getString("from"),
+                            case.getString("reason"), case.getBoolean("preview"),
+                        )
+                    "slow_reason" -> TakStatusLines.slowReason(case.getLong("seconds_left"))
+                    else -> TakStatusLines.unfetchedLine(case.getString("filename"), case.getLong("size"), case.getString("by"))
+                }
+            assertEquals(case.getString("line"), line)
+        }
+    }
+
     // ---- fetching ----
 
     private val big = ByteArray(1024 * 1024) { (it % 251).toByte() }
@@ -150,7 +169,7 @@ class TakFilePartsTest {
             sampled(files, 20_000)
             assertEquals("no part after the sample", 2, requests.size)
             assertEquals(sampledBytes, store.partialSize(bigHash))
-            assertTrue(toAtak.any { "would take about" in it })
+            assertTrue(toAtak.any { "slow path ~" in it })
         }
 
     @Test
