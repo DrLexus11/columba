@@ -2,7 +2,9 @@ package network.columba.app.service.tak
 
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.ColorSpace
 import android.os.Build
+import android.util.Log
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import java.nio.ByteBuffer
@@ -163,16 +165,33 @@ object TakFileOffer {
         if (bounds.outWidth <= 0) return null
         var sample = 1
         while (maxOf(bounds.outWidth, bounds.outHeight) / (sample * 2) >= 256) sample *= 2
-        val source =
-            BitmapFactory.decodeByteArray(image, 0, image.size, BitmapFactory.Options().apply { inSampleSize = sample })
-                ?: return null
+        val options =
+            BitmapFactory.Options().apply {
+                inSampleSize = sample
+                // A Samsung photo is Display P3, and the WebP encoder embeds
+                // that profile: ~500 B of a 655 B budget, so no step fitted
+                // (A54, 2026-09-26: 714 B at 48 px). Decoded as sRGB, none is
+                // written -- as on the deck, where Pillow drops it.
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    inPreferredColorSpace = ColorSpace.get(ColorSpace.Named.SRGB)
+                }
+            }
+        val source = BitmapFactory.decodeByteArray(image, 0, image.size, options) ?: return null
         @Suppress("DEPRECATION")
         val format = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) Bitmap.CompressFormat.WEBP_LOSSY else Bitmap.CompressFormat.WEBP
-        return THUMB_STEPS.firstNotNullOfOrNull { (side, quality) ->
-            val scale = side.toFloat() / maxOf(source.width, source.height)
-            val small = Bitmap.createScaledBitmap(source, maxOf(1, (source.width * scale).toInt()), maxOf(1, (source.height * scale).toInt()), true)
-            ByteArrayOutputStream().also { small.compress(format, quality, it) }.toByteArray().takeIf { it.size <= budget }
-        }
+        val tried = mutableListOf<String>()
+        val thumb =
+            THUMB_STEPS.firstNotNullOfOrNull { (side, quality) ->
+                val scale = side.toFloat() / maxOf(source.width, source.height)
+                val small = Bitmap.createScaledBitmap(source, maxOf(1, (source.width * scale).toInt()), maxOf(1, (source.height * scale).toInt()), true)
+                val bytes = ByteArrayOutputStream().also { small.compress(format, quality, it) }.toByteArray()
+                tried += "${side}px q$quality=${bytes.size}B"
+                bytes.takeIf { it.size <= budget }
+            }
+        // The deck fits the same image in a few hundred bytes; say what this
+        // handset's encoder made when it cannot.
+        Log.i("TakFileOffer", "thumbnail ${thumb?.size ?: "none"} of $budget B budget from ${source.width}x${source.height}: $tried")
+        return thumb
     }
 
     /** ATAK's `b-f-t-r`, rebuilt here. The URL is filled in when the file is. */
