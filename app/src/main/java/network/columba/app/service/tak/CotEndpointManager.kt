@@ -695,7 +695,7 @@ class CotEndpointManager
             // stand by, whether or not this particular report goes on the air.
             session.atakCadence.reported()
             if (!session.gate.allows(fix, System.currentTimeMillis())) return true
-            fanOut(PositionCodec.encode(fix), session)
+            fanOut(PositionCodec.encode(fix.copy(intervalMin = session.atakCadence.statedIntervalMinutes())), session)
             return true
         }
 

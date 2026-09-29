@@ -2,7 +2,9 @@ package network.columba.app.service.tak
 
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.ColorSpace
 import android.os.Build
+import android.util.Log
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import java.nio.ByteBuffer
@@ -163,17 +165,88 @@ object TakFileOffer {
         if (bounds.outWidth <= 0) return null
         var sample = 1
         while (maxOf(bounds.outWidth, bounds.outHeight) / (sample * 2) >= 256) sample *= 2
-        val source =
-            BitmapFactory.decodeByteArray(image, 0, image.size, BitmapFactory.Options().apply { inSampleSize = sample })
-                ?: return null
+        val options =
+            BitmapFactory.Options().apply {
+                inSampleSize = sample
+                // A Samsung photo is Display P3, and the WebP encoder embeds
+                // that profile: ~500 B of a 655 B budget, so no step fitted
+                // (A54, 2026-09-26: 714 B at 48 px). Decoded as sRGB, none is
+                // written -- as on the deck, where Pillow drops it.
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    inPreferredColorSpace = ColorSpace.get(ColorSpace.Named.SRGB)
+                }
+            }
+        val source = BitmapFactory.decodeByteArray(image, 0, image.size, options) ?: return null
         @Suppress("DEPRECATION")
         val format = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) Bitmap.CompressFormat.WEBP_LOSSY else Bitmap.CompressFormat.WEBP
-        return THUMB_STEPS.firstNotNullOfOrNull { (side, quality) ->
-            val scale = side.toFloat() / maxOf(source.width, source.height)
-            val small = Bitmap.createScaledBitmap(source, maxOf(1, (source.width * scale).toInt()), maxOf(1, (source.height * scale).toInt()), true)
-            ByteArrayOutputStream().also { small.compress(format, quality, it) }.toByteArray().takeIf { it.size <= budget }
-        }
+        val tried = mutableListOf<String>()
+        val thumb =
+            THUMB_STEPS.firstNotNullOfOrNull { (side, quality) ->
+                val scale = side.toFloat() / maxOf(source.width, source.height)
+                val small = Bitmap.createScaledBitmap(source, maxOf(1, (source.width * scale).toInt()), maxOf(1, (source.height * scale).toInt()), true)
+                val encoded = ByteArrayOutputStream().also { small.compress(format, quality, it) }.toByteArray()
+                val bytes = withoutIccProfile(encoded)
+                tried += "${side}px q$quality=${bytes.size}B" + if (bytes.size != encoded.size) " (${encoded.size}B with icc)" else ""
+                bytes.takeIf { it.size <= budget }
+            }
+        // The deck fits the same image in a few hundred bytes; say what this
+        // handset's encoder made when it cannot.
+        Log.i(
+            "TakFileOffer",
+            "thumbnail ${thumb?.size ?: "none"} of $budget B budget from ${source.width}x${source.height} " +
+                "(${colorSpaceName(source)}): $tried",
+        )
+        return thumb
     }
+
+    /**
+     * [webp] without its colour profile.
+     *
+     * The A54's encoder writes an ICCP chunk into every WebP -- sRGB source or
+     * not, whatever it is asked -- ~600 B of a 655 B budget, so no thumbnail
+     * step fitted (2026-09-27: 820 B at 48 px, where the deck makes 200 B).
+     * The chunk is dropped; if only the image remains, the simple layout is
+     * written, otherwise VP8X's ICC flag is cleared. Anything not a WebP is
+     * returned as it was.
+     */
+    internal fun withoutIccProfile(webp: ByteArray): ByteArray {
+        val chunks = riffChunks(webp)
+        if (chunks == null || chunks.none { it.first == "ICCP" }) return webp
+        var kept = chunks.filter { it.first != "ICCP" }
+        if (kept.all { it.first == "VP8X" || it.first == "VP8 " || it.first == "VP8L" }) {
+            kept = kept.filter { it.first != "VP8X" }
+        } else {
+            kept = kept.map { (kind, bytes) -> kind to if (kind == "VP8X") bytes.copyOf().also { it[8] = (it[8].toInt() and 0x20.inv()).toByte() } else bytes }
+        }
+        val body = kept.fold(ByteArray(0)) { all, chunk -> all + chunk.second }
+        val header = ByteBuffer.allocate(12).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+        header.put("RIFF".toByteArray(Charsets.ISO_8859_1)).putInt(4 + body.size).put("WEBP".toByteArray(Charsets.ISO_8859_1))
+        return header.array() + body
+    }
+
+    /** A WebP's chunks, each with its header and padding; null if [webp] is not a well-formed one. */
+    private fun riffChunks(webp: ByteArray): List<Pair<String, ByteArray>>? {
+        if (webp.size < 12 || String(webp, 0, 4, Charsets.ISO_8859_1) != "RIFF" ||
+            String(webp, 8, 4, Charsets.ISO_8859_1) != "WEBP"
+        ) {
+            return null
+        }
+        val chunks = mutableListOf<Pair<String, ByteArray>>()
+        var at = 12
+        var wellFormed = true
+        while (wellFormed && at + 8 <= webp.size) {
+            val length = ByteBuffer.wrap(webp, at + 4, 4).order(java.nio.ByteOrder.LITTLE_ENDIAN).int
+            val end = at + 8 + length + (length and 1)
+            wellFormed = length >= 0 && end <= webp.size
+            if (wellFormed) chunks += String(webp, at, 4, Charsets.ISO_8859_1) to webp.copyOfRange(at, end)
+            at = end
+        }
+        return chunks.takeIf { wellFormed }
+    }
+
+    private fun colorSpaceName(bitmap: Bitmap): String =
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) bitmap.colorSpace?.name ?: "none" else "n/a"
+
 
     /** ATAK's `b-f-t-r`, rebuilt here. The URL is filled in when the file is. */
     fun notice(offer: Offer, senderUid: String, senderCallsign: String, nowMs: Long): String {

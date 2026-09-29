@@ -8,7 +8,6 @@ import network.columba.app.rns.api.model.Destination
 import network.columba.app.rns.api.model.DestinationType
 import network.columba.app.rns.api.model.Direction
 import network.columba.app.rns.api.model.Identity
-import network.columba.app.rns.api.model.LinkSpeedProbeResult
 import org.json.JSONObject
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
@@ -132,11 +131,9 @@ class TakFileOfferTest {
     /** Moved on by hand, so a test can outlast a retry backoff without sleeping. */
     private var now = 1_790_000_000_000L
 
-    private fun fastProbe() =
-        coEvery { rnsCore.probeLinkSpeed(any(), any(), any()) } returns
-            LinkSpeedProbeResult("success", 40_000, null, 0.04, 2, false)
+    private fun pathAppears() = coEvery { rnsCore.hasPath(any()) } returns true
 
-    private fun transfers(rtt: Double): TakFileTransfers {
+    private fun transfers(fast: Boolean): TakFileTransfers {
         val identity = Identity(ByteArray(16) { 0x01 }, ByteArray(64) { 0x02 }, null)
         coEvery { rnsCore.recallIdentity(any()) } returns identity
         coEvery { rnsCore.createDestination(any(), any(), any(), any(), any()) } returns
@@ -146,8 +143,10 @@ class TakFileOfferTest {
             requests += secondArg<ByteArray>()
             "sent"
         }
-        coEvery { rnsCore.probeLinkSpeed(any(), any(), any()) } returns
-            LinkSpeedProbeResult("success", 40_000, null, rtt, 2, false)
+        coEvery { rnsCore.hasPath(any()) } returns fast
+        coEvery { rnsCore.requestPath(any()) } returns Result.success(Unit)
+        coEvery { rnsCore.getHopCount(any()) } returns 1
+        coEvery { rnsCore.getNextHopInterfaceName(any()) } returns "BLEPeerInterface[DECK]"
         store = TakFileStore(folder.newFolder())
         return TakFileTransfers(
             store, TakFileServer(store), rnsCore, carrier, { toAtak += String(it, Charsets.UTF_8) },
@@ -163,24 +162,31 @@ class TakFileOfferTest {
     }
 
     @Test
-    fun `over a fast path the full file is asked for`() =
+    fun `on a route not yet measured the file is asked for and the preview goes up meanwhile`() =
         runTest {
             val (frame, hash) = offerFrame()
-            transfers(rtt = 0.04).onOffer(frame, inboxOfDeck)
+            transfers(fast = true).onOffer(frame, inboxOfDeck)
             val size = quickpic().size
             assertEquals(listOf(TakFileParts.encodeRequest(hash, 0, size).hex()), requests.map { it.hex() })
-            assertTrue(toAtak.isEmpty())
+            val notices = toAtak.filter { "b-f-t-r" in it }
+            assertEquals("the preview, while the sample decides", 1, notices.size)
+            assertTrue(TakFiles.parseNotice(notices.single())!!.filename.endsWith("_preview.zip"))
         }
 
     @Test
     fun `over a slow path a quickpic is previewed on the map`() =
         runTest {
-            transfers(rtt = 1.8).onOffer(offerFrame().first, inboxOfDeck)
+            val files = transfers(fast = false)
+            files.onOffer(offerFrame().first, inboxOfDeck)
             assertTrue(requests.isEmpty())
             val notices = toAtak.filter { "b-f-t-r" in it }
             assertEquals(1, notices.size)
             assertTrue(TakFiles.parseNotice(notices.single())!!.filename.endsWith("_preview.zip"))
-            assertTrue(toAtak.any { "A preview is on the map" in it })
+
+            // Still no path once the grace is over: the wait is told, preview and all.
+            now += TakFileTransfers.PATH_GRACE_MS + 1
+            files.retryDue()
+            assertTrue(toAtak.any { "Preview on map" in it })
         }
 
     /** An offer built from [pkg] itself, so the bytes fetched are the bytes offered. */
@@ -203,13 +209,13 @@ class TakFileOfferTest {
     fun `the preview is deleted when the full file arrives`() =
         runTest {
             val pkg = quickpic()
-            val files = transfers(rtt = 1.8)
+            val files = transfers(fast = false)
             val (frame, hash) = offerFrameFor(pkg)
             files.onOffer(frame, inboxOfDeck)
             val preview = TakFiles.parseNotice(toAtak.first { "b-f-t-r" in it })!!.hash
             assertTrue(store.has(preview))
 
-            fastProbe()
+            pathAppears()
             now += TakFileTransfers.MAX_RETRY_MS
             requests.clear()
             files.retryDue()
@@ -230,7 +236,7 @@ class TakFileOfferTest {
     fun `a picture pushed whole over the slow path is refused and the preview stays`() =
         runTest {
             val pkg = quickpic()
-            val files = transfers(rtt = 1.8)
+            val files = transfers(fast = false)
             val (frame, hash) = offerFrameFor(pkg)
             files.onOffer(frame, inboxOfDeck)
             val preview = TakFiles.parseNotice(toAtak.first { "b-f-t-r" in it })!!.hash
@@ -245,8 +251,50 @@ class TakFileOfferTest {
     @Test
     fun `an offer claiming someone else is refused`() =
         runTest {
-            transfers(rtt = 0.04).onOffer(offerFrame(senderId = 0x0BADF00D).first, inboxOfDeck)
+            transfers(fast = true).onOffer(offerFrame(senderId = 0x0BADF00D).first, inboxOfDeck)
             assertTrue(requests.isEmpty())
             assertTrue(toAtak.isEmpty())
         }
+
+    // ---- the A54's encoder writes a colour profile into every WebP ----
+
+    private fun chunk(kind: String, body: ByteArray): ByteArray {
+        val head = java.nio.ByteBuffer.allocate(8).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+        head.put(kind.toByteArray(Charsets.ISO_8859_1)).putInt(body.size)
+        return head.array() + body + if (body.size % 2 == 1) byteArrayOf(0) else byteArrayOf()
+    }
+
+    private fun riff(vararg chunks: ByteArray): ByteArray {
+        val body = chunks.fold(ByteArray(0)) { all, c -> all + c }
+        val head = java.nio.ByteBuffer.allocate(12).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+        head.put("RIFF".toByteArray()).putInt(4 + body.size).put("WEBP".toByteArray())
+        return head.array() + body
+    }
+
+    private val vp8x = ByteArray(10).also { it[0] = 0x20 }          // ICC flag set
+    private val image = ByteArray(201) { 7 }                          // odd: padded
+
+    @Test
+    fun `the profile is dropped and the simple layout written`() {
+        val stripped = TakFileOffer.withoutIccProfile(riff(chunk("VP8X", vp8x), chunk("ICCP", ByteArray(600)), chunk("VP8 ", image)))
+        assertArrayEquals(riff(chunk("VP8 ", image)), stripped)
+    }
+
+    @Test
+    fun `with alpha the extended header stays and its ICC flag is cleared`() {
+        val alpha = ByteArray(40) { 3 }
+        val stripped =
+            TakFileOffer.withoutIccProfile(
+                riff(chunk("VP8X", ByteArray(10).also { it[0] = 0x30 }), chunk("ICCP", ByteArray(600)), chunk("ALPH", alpha), chunk("VP8 ", image)),
+            )
+        assertArrayEquals(riff(chunk("VP8X", ByteArray(10).also { it[0] = 0x10 }), chunk("ALPH", alpha), chunk("VP8 ", image)), stripped)
+    }
+
+    @Test
+    fun `a WebP without a profile, or not a WebP, is left alone`() {
+        val plain = riff(chunk("VP8 ", image))
+        assertArrayEquals(plain, TakFileOffer.withoutIccProfile(plain))
+        val jpeg = byteArrayOf(0xFF.toByte(), 0xD8.toByte(), 1, 2, 3)
+        assertArrayEquals(jpeg, TakFileOffer.withoutIccProfile(jpeg))
+    }
 }

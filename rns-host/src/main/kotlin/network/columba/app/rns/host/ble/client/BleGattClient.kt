@@ -69,6 +69,8 @@ class BleGattClient(
         private const val MAX_CONNECTION_RETRIES = 3
         private const val CONNECTION_TIMEOUT_MS = BleConstants.CONNECTION_TIMEOUT_MS
         private val CCCD_UUID = BleConstants.CCCD_UUID
+        private const val DISCOVERY_ATTEMPTS = 4
+        private const val DISCOVERY_RETRY_MS = 500L
     }
 
     /**
@@ -208,6 +210,58 @@ class BleGattClient(
                 handleDescriptorRead(address, descriptor, status, value)
             }
         }
+
+        // Android 12 and older call only these forms; the value forms above
+        // arrived in Android 13 and are never called below it. Without them a
+        // phone on Android 8 as the connecting side never completed a read --
+        // every identity read timed out -- and never received a notification,
+        // which is how the other side sends it data: a link that could send and
+        // not receive. Which phone connects follows the identity tie-break, so
+        // the Nexus 6P's link to the A54 worked or half-worked from one restart
+        // to the next (2026-09-27). The value is copied at once: these forms
+        // hand over the characteristic's shared buffer, which the next event
+        // overwrites.
+
+        @Deprecated("Called by Android 12 and older")
+        @Suppress("DEPRECATION")
+        override fun onCharacteristicRead(
+            gatt: BluetoothGatt,
+            characteristic: BluetoothGattCharacteristic,
+            status: Int,
+        ) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) return
+            val value = characteristic.value?.copyOf() ?: ByteArray(0)
+            scope.launch {
+                handleCharacteristicRead(address, characteristic, value, status)
+            }
+        }
+
+        @Deprecated("Called by Android 12 and older")
+        @Suppress("DEPRECATION")
+        override fun onCharacteristicChanged(
+            gatt: BluetoothGatt,
+            characteristic: BluetoothGattCharacteristic,
+        ) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) return
+            val value = characteristic.value?.copyOf() ?: return
+            scope.launch {
+                handleCharacteristicChanged(address, characteristic, value)
+            }
+        }
+
+        @Deprecated("Called by Android 12 and older")
+        @Suppress("DEPRECATION")
+        override fun onDescriptorRead(
+            gatt: BluetoothGatt,
+            descriptor: BluetoothGattDescriptor,
+            status: Int,
+        ) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) return
+            val value = descriptor.value?.copyOf() ?: ByteArray(0)
+            scope.launch {
+                handleDescriptorRead(address, descriptor, status, value)
+            }
+        }
     }
 
     /**
@@ -250,7 +304,7 @@ class BleGattClient(
                 val connectionJob =
                     scope.launch {
                         delay(CONNECTION_TIMEOUT_MS)
-                        handleConnectionTimeout(address)
+                        handleConnectionTimeout(address, coroutineContext[Job])
                     }
 
                 // Connect to GATT server
@@ -478,7 +532,7 @@ class BleGattClient(
                 // Discover services (post to main thread for older Android versions)
                 withContext(Dispatchers.Main) {
                     Handler(Looper.getMainLooper()).post {
-                        gatt.discoverServices()
+                        discoverServicesOrRetry(address, gatt, 1)
                     }
                 }
             }
@@ -624,10 +678,19 @@ class BleGattClient(
                 // If we reach here, read succeeded and handleCharacteristicRead() already
                 // called requestMtuAndContinue(), so we're done
             } catch (e: Exception) {
-                Log.w(TAG, "Failed to read identity characteristic from $address (non-fatal)", e)
-                Log.i(TAG, ">>> HANDSHAKE: Skipping identity (Protocol v1 fallback)")
-                // Continue without identity - will request MTU after timeout
-                requestMtuAndContinue(address, gatt)
+                // The peer has an identity and it could not be read. Going on
+                // without it made a one-sided link: this side never learned who
+                // the peer was and built no interface, while the peer, which got
+                // our identity in step 4, counted the link as up and refused
+                // every reconnect as already linked (A54 and Nexus 6P,
+                // 2026-09-27: a 5 s read timeout, then neither phone reached the
+                // other). Every peer we have serves an identity, so read it again
+                // once; failing that, close the connection and let it be made
+                // afresh.
+                Log.w(TAG, "Failed to read identity characteristic from $address; trying once more", e)
+                if (!readIdentityOnceMore(gatt, identityChar)) {
+                    abandonConnection(address, "identity could not be read", gatt)
+                }
             }
         } else {
             Log.w(TAG, ">>> HANDSHAKE: Identity characteristic not found on $address")
@@ -636,6 +699,100 @@ class BleGattClient(
             // Continue without identity
             requestMtuAndContinue(address, gatt)
         }
+    }
+
+    /**
+     * Ask for service discovery, and ask again if Android refuses.
+     *
+     * Android 8 can report a connection before its Bluetooth service has it:
+     * discoverServices() is then refused ("No connection for ..."), nothing
+     * happens, and the link sat idle until the peer gave up 45 s later (Nexus
+     * 6P to the Rev 2 hub, 2026-09-27). The refusal was never looked at.
+     */
+    private fun discoverServicesOrRetry(
+        address: String,
+        gatt: BluetoothGatt,
+        attempt: Int,
+    ) {
+        if (gatt.discoverServices()) return
+        if (attempt >= DISCOVERY_ATTEMPTS) {
+            Log.w(TAG, "Service discovery refused $attempt times for $address")
+            scope.launch { abandonConnection(address, "service discovery refused", gatt) }
+            return
+        }
+        Log.d(TAG, "Service discovery refused for $address; asking again (attempt ${attempt + 1})")
+        // The retry outlives this attempt. If the address has since reconnected
+        // on another BluetoothGatt, this one is finished: leave the new one be.
+        Handler(Looper.getMainLooper()).postDelayed(
+            {
+                scope.launch {
+                    if (ownsConnection(address, gatt)) {
+                        withContext(Dispatchers.Main) { discoverServicesOrRetry(address, gatt, attempt + 1) }
+                    } else {
+                        Log.d(TAG, "Discovery retry for $address dropped; a newer connection holds it")
+                    }
+                }
+            },
+            DISCOVERY_RETRY_MS * attempt,
+        )
+    }
+
+    /** Read the peer's identity again. True if it was read; its handler then carries the handshake on. */
+    private suspend fun readIdentityOnceMore(
+        gatt: BluetoothGatt,
+        identityChar: BluetoothGattCharacteristic,
+    ): Boolean =
+        try {
+            operationQueue.enqueue(BleOperationQueue.BleOperation.ReadCharacteristic(gatt = gatt, characteristic = identityChar))
+            true
+        } catch (e: Exception) {
+            Log.w(TAG, "Identity read failed again", e)
+            false
+        }
+
+    /** Whether [gatt] is still the connection held for [address]. */
+    private suspend fun ownsConnection(
+        address: String,
+        gatt: BluetoothGatt,
+    ): Boolean = connectionsMutex.withLock { connections[address]?.gatt === gatt }
+
+    /**
+     * Close a connection whose handshake cannot complete, and say so, so it is made again from scratch.
+     *
+     * [gatt] is the connection the failure belongs to. Retries and reads outlive their attempt, and
+     * the same address may have reconnected on a new BluetoothGatt meanwhile: that one is not
+     * abandoned for the old one's failure.
+     */
+    private suspend fun abandonConnection(
+        address: String,
+        reason: String,
+        gatt: BluetoothGatt,
+    ) {
+        var stale = false
+        val connData =
+            connectionsMutex.withLock {
+                val current = connections[address]
+                if (current != null && current.gatt !== gatt) {
+                    stale = true
+                    null
+                } else {
+                    connections.remove(address)
+                }
+            }
+        if (stale) {
+            Log.d(TAG, "Not abandoning $address for an older attempt ($reason); a newer connection holds it")
+            withContext(Dispatchers.Main) { gatt.close() }
+            return
+        }
+        Log.w(TAG, "Abandoning the connection to $address: $reason")
+        connData?.connectionJob?.cancel()
+        if (connData != null) {
+            withContext(Dispatchers.Main) {
+                connData.gatt.disconnect()
+                connData.gatt.close()
+            }
+        }
+        onConnectionFailed?.invoke(address, reason)
     }
 
     private suspend fun requestMtuAndContinue(
@@ -1052,13 +1209,21 @@ class BleGattClient(
     ) {
         Log.e(TAG, "GATT error 133 for $address")
 
-        val connData = connectionsMutex.withLock { connections[address] }
+        // Only the connection this callback belongs to. A late 133 from an older
+        // BluetoothGatt must not cancel or remove the attempt now holding the address.
+        val connData = connectionsMutex.withLock { connections[address]?.takeIf { it.gatt === gatt } }
         if (connData == null) {
             gatt.close()
             return
         }
 
-        // Close the connection
+        // Close the connection, and its timeout with it: left running, it fired
+        // thirty seconds later against whatever connection then held this
+        // address -- the retry that had succeeded -- and closed it. The A54's
+        // link to the Nexus 6P died that way 24 s after forming (2026-09-27),
+        // and the bridge, never told, kept the peer as linked and refused to
+        // reconnect.
+        connData.connectionJob?.cancel()
         gatt.close()
 
         // Check retry count
@@ -1078,7 +1243,7 @@ class BleGattClient(
             Log.d(TAG, "Retrying connection to $address (attempt $retryCount/$MAX_CONNECTION_RETRIES) in ${backoffMs}ms")
 
             connectionsMutex.withLock {
-                connections.remove(address)
+                if (connections[address]?.gatt === gatt) connections.remove(address)
                 pendingRetries[address] = retryCount
             }
 
@@ -1094,24 +1259,33 @@ class BleGattClient(
             // Max retries exceeded
             Log.e(TAG, "Max connection retries exceeded for $address")
             connectionsMutex.withLock {
-                connections.remove(address)
+                if (connections[address]?.gatt === gatt) connections.remove(address)
                 pendingRetries.remove(address)
             }
             onConnectionFailed?.invoke(address, "GATT error 133: max retries exceeded")
         }
     }
 
-    private suspend fun handleConnectionTimeout(address: String) {
-        Log.e(TAG, "Connection timeout for $address")
-
-        val connData = connectionsMutex.withLock { connections.remove(address) }
-        if (connData != null) {
-            withContext(Dispatchers.Main) {
-                connData.gatt.disconnect()
-                connData.gatt.close()
+    private suspend fun handleConnectionTimeout(
+        address: String,
+        attempt: Job?,
+    ) {
+        // Only the attempt this timeout was started for. A later attempt to the
+        // same address -- a retry, a reconnect -- has its own.
+        val connData =
+            connectionsMutex.withLock {
+                connections[address]?.takeIf { it.connectionJob === attempt }?.also { connections.remove(address) }
             }
-            onConnectionFailed?.invoke(address, "Connection timeout")
+        if (connData == null) {
+            Log.d(TAG, "Stale connection timeout for $address ignored; a newer attempt holds it")
+            return
         }
+        Log.e(TAG, "Connection timeout for $address")
+        withContext(Dispatchers.Main) {
+            connData.gatt.disconnect()
+            connData.gatt.close()
+        }
+        onConnectionFailed?.invoke(address, "Connection timeout")
     }
 
     /**

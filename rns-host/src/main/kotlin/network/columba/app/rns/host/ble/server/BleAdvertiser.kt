@@ -52,6 +52,14 @@ class BleAdvertiser(
         private const val RETRY_BACKOFF_MS = 2000L // 2 seconds
     }
 
+    /**
+     * The first bytes of this phone's identity, carried in the scan response
+     * so a scanner can tell which phone this is under a rotated address. See
+     * `initiateDecision` in KotlinBLEBridge. Null until the identity is known.
+     */
+    @Volatile
+    var identityTag: ByteArray? = null
+
     // Power-tunable advertising refresh interval
     @Volatile
     var advertisingRefreshIntervalMs: Long = 60_000L
@@ -212,11 +220,7 @@ class BleAdvertiser(
                 // Build scan response data (sent when central requests more info)
                 // Do not include device name to avoid changing the phone's Bluetooth name.
                 // Devices discover us via the service UUID in the advertise data.
-                val scanResponseData =
-                    AdvertiseData
-                        .Builder()
-                        .setIncludeDeviceName(false)
-                        .build()
+                val scanResponseData = scanResponse()
 
                 // Start advertising
                 bluetoothLeAdvertiser.startAdvertising(
@@ -393,6 +397,22 @@ class BleAdvertiser(
      * Used by refresh to restart advertising.
      */
     @SuppressLint("MissingPermission")
+    /**
+     * The scan response: this phone's identity tag, when it is known.
+     *
+     * Built in one place for the first start and for every refresh. The refresh
+     * used to build its own without the tag, so a phone advertised it for its
+     * first minute only; after that its peer saw no tag, connected out to the
+     * next rotated address anyway, and the duplicate links tore each other down
+     * (A54 and Nexus 6P, 2026-09-27).
+     */
+    private fun scanResponse(): AdvertiseData =
+        AdvertiseData
+            .Builder()
+            .setIncludeDeviceName(false)
+            .apply { identityTag?.let { addServiceData(ParcelUuid(BleConstants.SERVICE_UUID), it) } }
+            .build()
+
     private fun startAdvertisingInternal() {
         if (bluetoothLeAdvertiser == null) {
             Log.e(TAG, "Cannot start advertising - advertiser not available")
@@ -416,11 +436,7 @@ class BleAdvertiser(
                 .addServiceUuid(ParcelUuid(BleConstants.SERVICE_UUID))
                 .build()
 
-        val scanResponseData =
-            AdvertiseData
-                .Builder()
-                .setIncludeDeviceName(false)
-                .build()
+        val scanResponseData = scanResponse()
 
         bluetoothLeAdvertiser.startAdvertising(
             settings,

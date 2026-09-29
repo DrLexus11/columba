@@ -25,6 +25,11 @@ data class BleDevice(
     val rssi: Int,
     val serviceUuids: List<String>? = null,
     val identityHash: String? = null,
+    /**
+     * The first bytes of the advertiser's identity, as hex, from its scan
+     * response; null for an advertiser that does not carry one.
+     */
+    val identityTag: String? = null,
     val firstSeen: Long = System.currentTimeMillis(),
     var lastSeen: Long = System.currentTimeMillis(),
     var connectionAttempts: Int = 0,

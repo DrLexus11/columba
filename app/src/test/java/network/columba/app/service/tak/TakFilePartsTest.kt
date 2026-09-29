@@ -11,7 +11,6 @@ import network.columba.app.rns.api.model.Destination
 import network.columba.app.rns.api.model.DestinationType
 import network.columba.app.rns.api.model.Direction
 import network.columba.app.rns.api.model.Identity
-import network.columba.app.rns.api.model.LinkSpeedProbeResult
 import org.json.JSONObject
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
@@ -21,9 +20,8 @@ import org.junit.Test
 import org.junit.rules.TemporaryFolder
 
 /**
- * A file fetched a part at a time, each timed. Round-trip time says LoRa is
- * not in the path; it does not say a file will arrive in reasonable time --
- * BLE is short and slow. The Kotlin half of `PartsTests` in
+ * A file fetched a part at a time, each timed: a setup part, then a sample
+ * that is judged. The Kotlin half of `PartsTests` in
  * `tests/test_tak_files.py`, with frames from `tak_native_v1.json`.
  */
 class TakFilePartsTest {
@@ -43,7 +41,8 @@ class TakFilePartsTest {
         assertEquals(TakPayload.FILE_PART_REQUEST_V1, v.getInt("part_request_kind"))
         assertEquals(TakPayload.FILE_PART_V1, v.getInt("part_kind"))
         assertEquals(TakFileParts.FETCH_BUDGET_MS / 1000, v.getLong("fetch_budget_seconds"))
-        assertEquals(TakFileParts.FIRST_PART_BYTES, v.getInt("first_part_bytes"))
+        assertEquals(TakFileParts.SETUP_PART_BYTES, v.getInt("setup_part_bytes"))
+        assertEquals(TakFileParts.SAMPLE_PART_BYTES, v.getInt("sample_part_bytes"))
         assertEquals(TakFileParts.PART_BYTES, v.getInt("part_bytes"))
         val hash = v.getString("hash")
         val request = v.getJSONObject("part_request")
@@ -57,6 +56,25 @@ class TakFilePartsTest {
         val back = TakFileParts.decodePart(frame)!!
         assertEquals(part.getLong("offset"), back.offset)
         assertArrayEquals(hex(part.getString("data")), back.data)
+    }
+
+    @Test
+    fun `status lines match the deck word for word`() {
+        val cases = v.getJSONArray("status_lines")
+        for (i in 0 until cases.length()) {
+            val case = cases.getJSONObject(i)
+            val line =
+                when (case.getString("kind")) {
+                    "held" ->
+                        TakStatusLines.heldLine(
+                            case.getString("filename"), case.getLong("size"), case.getString("from"),
+                            case.getString("reason"), case.getBoolean("preview"),
+                        )
+                    "slow_reason" -> TakStatusLines.slowReason(case.getLong("seconds_left"))
+                    else -> TakStatusLines.unfetchedLine(case.getString("filename"), case.getLong("size"), case.getString("by"))
+                }
+            assertEquals(case.getString("line"), line)
+        }
     }
 
     // ---- fetching ----
@@ -82,7 +100,10 @@ class TakFilePartsTest {
             TakFileParts.decodeRequest(secondArg())?.let { requests += it }
             "sent"
         }
-        coEvery { rnsCore.probeLinkSpeed(any(), any(), any()) } returns LinkSpeedProbeResult("success", 40_000, null, 0.02, 1, false)
+        coEvery { rnsCore.hasPath(any()) } returns true
+        coEvery { rnsCore.requestPath(any()) } returns Result.success(Unit)
+        coEvery { rnsCore.getHopCount(any()) } returns 1
+        coEvery { rnsCore.getNextHopInterfaceName(any()) } returns "BLEPeerInterface[DECK]"
         store = TakFileStore(folder.newFolder())
         return TakFileTransfers(
             store, TakFileServer(store), rnsCore, carrier, { toAtak += String(it, Charsets.UTF_8) },
@@ -111,33 +132,79 @@ class TakFilePartsTest {
         runTest {
             val files = transfers()
             offered(files)
-            assertEquals(TakFileParts.FIRST_PART_BYTES, requests.single().length)
+            assertEquals(TakFileParts.SETUP_PART_BYTES, requests.single().length)
+            partArrives(files, 100)
+            assertEquals(TakFileParts.SAMPLE_PART_BYTES, requests.last().length)
             while (files.waiting() > 0) partArrives(files, 300)
             assertArrayEquals(big, store.read(bigHash))
             assertEquals(0L, store.partialSize(bigHash))
             assertTrue(toAtak.any { "b-f-t-r" in it })
         }
 
+    /**
+     * Measured 2026-09-26: 64 KB in 16.4 s over one BLE hop, link setup
+     * included, read as ~32 kbit/s and the file deferred.
+     */
     @Test
-    fun `a short slow path pauses after the sample and says why`() =
+    fun `the setup part is not judged`() =
         runTest {
             val files = transfers()
             offered(files)
-            partArrives(files, 20_000)
-            assertEquals("no second part asked for", 1, requests.size)
-            assertEquals(TakFileParts.FIRST_PART_BYTES.toLong(), store.partialSize(bigHash))
-            assertTrue(toAtak.any { "would take about" in it })
+            partArrives(files, 30_000)
+            assertEquals("the sample is asked for regardless", 2, requests.size)
+        }
+
+    private suspend fun sampled(files: TakFileTransfers, sampleMs: Long) {
+        partArrives(files, 3_000)
+        partArrives(files, sampleMs)
+    }
+
+    private val sampledBytes = (TakFileParts.SETUP_PART_BYTES + TakFileParts.SAMPLE_PART_BYTES).toLong()
+
+    @Test
+    fun `a slow sample pauses and says why`() =
+        runTest {
+            val files = transfers()
+            offered(files)
+            sampled(files, 20_000)
+            assertEquals("no part after the sample", 2, requests.size)
+            assertEquals(sampledBytes, store.partialSize(bigHash))
+            assertTrue(toAtak.any { "slow path ~" in it })
         }
 
     @Test
-    fun `a paused transfer resumes where it stopped`() =
+    fun `a route measured slow is not sampled again`() =
         runTest {
             val files = transfers()
             offered(files)
-            partArrives(files, 20_000)
+            sampled(files, 20_000)
             now += TakFileParts.FETCH_BUDGET_MS + TakFileTransfers.MAX_RETRY_MS
             files.retryDue()
-            assertEquals(TakFileParts.FIRST_PART_BYTES.toLong(), requests.last().offset)
+            assertEquals("nothing spent on air", 2, requests.size)
+        }
+
+    @Test
+    fun `a changed route is sampled and resumes where it stopped`() =
+        runTest {
+            val files = transfers()
+            offered(files)
+            sampled(files, 20_000)
+            coEvery { rnsCore.getNextHopInterfaceName(any()) } returns "TCPInterface[Columba LAN]"
+            now += TakFileParts.FETCH_BUDGET_MS + TakFileTransfers.MAX_RETRY_MS
+            files.retryDue()
+            assertEquals(sampledBytes, requests.last().offset)
+            assertEquals(TakFileParts.SETUP_PART_BYTES, requests.last().length)
+        }
+
+    @Test
+    fun `the same route is sampled again after a while`() =
+        runTest {
+            val files = transfers()
+            offered(files)
+            sampled(files, 20_000)
+            now += TakFileParts.RESAMPLE_MS + 1
+            files.retryDue()
+            assertEquals(3, requests.size)
         }
 
     @Test
@@ -164,7 +231,7 @@ class TakFilePartsTest {
             files.onPart(
                 TakLxmf.Inbound(
                     inbox,
-                    TakFileParts.encodePart(bigHash, 0, big.size * 4L, big.copyOfRange(0, TakFileParts.FIRST_PART_BYTES)),
+                    TakFileParts.encodePart(bigHash, 0, big.size * 4L, big.copyOfRange(0, TakFileParts.SETUP_PART_BYTES)),
                 ),
             )
             assertEquals(0L, store.partialSize(bigHash))
@@ -175,13 +242,12 @@ class TakFilePartsTest {
         runTest {
             val files = transfers()
             offered(files)
-            partArrives(files, 20_000)
+            sampled(files, 20_000)
             val had = store.partialSize(bigHash)
-            val late = TakFileParts.FIRST_PART_BYTES.toLong()
             files.onPart(
                 TakLxmf.Inbound(
                     inbox,
-                    TakFileParts.encodePart(bigHash, late, big.size.toLong(), big.copyOfRange(late.toInt(), late.toInt() + TakFileParts.PART_BYTES)),
+                    TakFileParts.encodePart(bigHash, had, big.size.toLong(), big.copyOfRange(had.toInt(), had.toInt() + TakFileParts.PART_BYTES)),
                 ),
             )
             assertEquals("paused: nothing outstanding to accept", had, store.partialSize(bigHash))
@@ -233,7 +299,7 @@ class TakFilePartsTest {
             assertEquals(
                 "the same part was asked for twice",
                 1,
-                requests.count { it.offset == TakFileParts.FIRST_PART_BYTES.toLong() },
+                requests.count { it.offset == TakFileParts.SETUP_PART_BYTES.toLong() },
             )
         }
 }

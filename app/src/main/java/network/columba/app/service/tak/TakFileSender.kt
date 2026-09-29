@@ -117,11 +117,7 @@ class TakFileSender(
                 now - offer.since > TakFileTransfers.HOLD_MS -> offers.remove(key)
                 !offer.told && now - offer.since > TakFileTransfers.UNFETCHED_MS -> {
                     offer.told = true
-                    status(
-                        "${offer.filename} (${TakFiles.sizeText(offer.size)}) not fetched yet by " +
-                            "${team.nameOf(offer.member)}. Over a slow path a file waits for a fast one; " +
-                            "ATAK may report this send as failed while it waits.",
-                    )
+                    status(TakStatusLines.unfetchedLine(offer.filename, offer.size, team.nameOf(offer.member)))
                 }
             }
         }

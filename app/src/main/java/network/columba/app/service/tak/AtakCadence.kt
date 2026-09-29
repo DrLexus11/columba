@@ -24,6 +24,8 @@ class AtakCadence(private val clock: () -> Long = System::currentTimeMillis) {
 
         /** However slow ATAK has been, this long silent is not reporting. */
         const val MAX_QUIET_MS = 10L * 60 * 1000
+
+        private const val MINUTE_MS = 60_000L
     }
 
     @Volatile private var connectedAt = 0L
@@ -43,6 +45,25 @@ class AtakCadence(private val clock: () -> Long = System::currentTimeMillis) {
         if (lastReport > 0) lastGap = now - lastReport
         lastReport = now
     }
+
+    /**
+     * The interval to state in a report ATAK made, in whole minutes; 0 for the
+     * receiver's default.
+     *
+     * ATAK with no GPS fix reports every several minutes, and a receiver draws
+     * an unstated report as current for two minutes: NEXUS went grey on the
+     * deck between every pair of its own reports (2026-09-27). Stating the gap
+     * ATAK actually leaves keeps the track current for two of them, as a
+     * Columba-made report already does. Unstated while ATAK reports at least
+     * once a minute, and never more than [MAX_QUIET_MS], after which this
+     * handset reports in ATAK's place anyway.
+     */
+    fun statedIntervalMinutes(): Int =
+        if (lastGap <= CotPosition.DEFAULT_INTERVAL_MS) {
+            0
+        } else {
+            ((minOf(lastGap, MAX_QUIET_MS) + MINUTE_MS - 1) / MINUTE_MS).toInt()
+        }
 
     /** How long a silence may last now before it means ATAK is not reporting. */
     fun quietWindowMs(): Long = (lastGap * 3 / 2).coerceIn(MIN_QUIET_MS, MAX_QUIET_MS)
