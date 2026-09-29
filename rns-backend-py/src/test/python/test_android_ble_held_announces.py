@@ -257,6 +257,26 @@ class PeerGraceTests(unittest.TestCase):
         self.assertTrue(peer.online)
         self.assertEqual(len(peer.sent), 1, "the announce held while it was away")
 
+    def test_a_peer_back_while_another_stayed_up_is_announced_to_afresh(self):
+        # The hold only fills while no peer is online, so a peer away while
+        # another stayed up would otherwise miss what was announced meanwhile.
+        announced = []
+        destination = types.SimpleNamespace(
+            announce=lambda app_data=None, attached_interface=None: announced.append(attached_interface))
+        MODULE.RNS.Transport.destinations_map[b"\x11" * 16] = destination
+        self.addCleanup(MODULE.RNS.Transport.destinations_map.clear)
+        self.interface.next_peer = FakePeer()
+        other = self.interface._spawn_peer_interface("ZZ", "phone", "other")
+        self.interface.next_peer = FakePeer()
+        peer = self.away()
+        self.assertTrue(other.online)
+        self.interface.process_outgoing(announce(b"\x11" * 16))
+        self.assertEqual(peer.sent, [], "not held: another peer was online")
+        self.interface._announced_to.clear()      # met long enough ago
+        self.interface._device_connected_callback("AA", "ident")
+        self.assertTrue(peer.online)
+        self.assertIn(peer, announced)
+
     def test_a_board_back_at_the_grace_tick_is_online_again(self):
         peer = self.away()
         self.interface.address_to_identity["BB"] = "ident"

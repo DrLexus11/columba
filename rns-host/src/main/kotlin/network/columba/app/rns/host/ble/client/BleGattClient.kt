@@ -689,7 +689,7 @@ class BleGattClient(
                 // afresh.
                 Log.w(TAG, "Failed to read identity characteristic from $address; trying once more", e)
                 if (!readIdentityOnceMore(gatt, identityChar)) {
-                    abandonConnection(address, "identity could not be read")
+                    abandonConnection(address, "identity could not be read", gatt)
                 }
             }
         } else {
@@ -717,12 +717,22 @@ class BleGattClient(
         if (gatt.discoverServices()) return
         if (attempt >= DISCOVERY_ATTEMPTS) {
             Log.w(TAG, "Service discovery refused $attempt times for $address")
-            scope.launch { abandonConnection(address, "service discovery refused") }
+            scope.launch { abandonConnection(address, "service discovery refused", gatt) }
             return
         }
         Log.d(TAG, "Service discovery refused for $address; asking again (attempt ${attempt + 1})")
+        // The retry outlives this attempt. If the address has since reconnected
+        // on another BluetoothGatt, this one is finished: leave the new one be.
         Handler(Looper.getMainLooper()).postDelayed(
-            { discoverServicesOrRetry(address, gatt, attempt + 1) },
+            {
+                scope.launch {
+                    if (ownsConnection(address, gatt)) {
+                        withContext(Dispatchers.Main) { discoverServicesOrRetry(address, gatt, attempt + 1) }
+                    } else {
+                        Log.d(TAG, "Discovery retry for $address dropped; a newer connection holds it")
+                    }
+                }
+            },
             DISCOVERY_RETRY_MS * attempt,
         )
     }
@@ -740,13 +750,41 @@ class BleGattClient(
             false
         }
 
-    /** Close a connection whose handshake cannot complete, and say so, so it is made again from scratch. */
+    /** Whether [gatt] is still the connection held for [address]. */
+    private suspend fun ownsConnection(
+        address: String,
+        gatt: BluetoothGatt,
+    ): Boolean = connectionsMutex.withLock { connections[address]?.gatt === gatt }
+
+    /**
+     * Close a connection whose handshake cannot complete, and say so, so it is made again from scratch.
+     *
+     * [gatt] is the connection the failure belongs to. Retries and reads outlive their attempt, and
+     * the same address may have reconnected on a new BluetoothGatt meanwhile: that one is not
+     * abandoned for the old one's failure.
+     */
     private suspend fun abandonConnection(
         address: String,
         reason: String,
+        gatt: BluetoothGatt,
     ) {
+        var stale = false
+        val connData =
+            connectionsMutex.withLock {
+                val current = connections[address]
+                if (current != null && current.gatt !== gatt) {
+                    stale = true
+                    null
+                } else {
+                    connections.remove(address)
+                }
+            }
+        if (stale) {
+            Log.d(TAG, "Not abandoning $address for an older attempt ($reason); a newer connection holds it")
+            withContext(Dispatchers.Main) { gatt.close() }
+            return
+        }
         Log.w(TAG, "Abandoning the connection to $address: $reason")
-        val connData = connectionsMutex.withLock { connections.remove(address) }
         connData?.connectionJob?.cancel()
         if (connData != null) {
             withContext(Dispatchers.Main) {
@@ -1171,7 +1209,9 @@ class BleGattClient(
     ) {
         Log.e(TAG, "GATT error 133 for $address")
 
-        val connData = connectionsMutex.withLock { connections[address] }
+        // Only the connection this callback belongs to. A late 133 from an older
+        // BluetoothGatt must not cancel or remove the attempt now holding the address.
+        val connData = connectionsMutex.withLock { connections[address]?.takeIf { it.gatt === gatt } }
         if (connData == null) {
             gatt.close()
             return
@@ -1203,7 +1243,7 @@ class BleGattClient(
             Log.d(TAG, "Retrying connection to $address (attempt $retryCount/$MAX_CONNECTION_RETRIES) in ${backoffMs}ms")
 
             connectionsMutex.withLock {
-                connections.remove(address)
+                if (connections[address]?.gatt === gatt) connections.remove(address)
                 pendingRetries[address] = retryCount
             }
 
@@ -1219,7 +1259,7 @@ class BleGattClient(
             // Max retries exceeded
             Log.e(TAG, "Max connection retries exceeded for $address")
             connectionsMutex.withLock {
-                connections.remove(address)
+                if (connections[address]?.gatt === gatt) connections.remove(address)
                 pendingRetries.remove(address)
             }
             onConnectionFailed?.invoke(address, "GATT error 133: max retries exceeded")

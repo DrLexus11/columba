@@ -325,11 +325,15 @@ class AndroidBLEInterface(BLEInterface):
                 if (not peer_if.online and identity_hash in connected
                         and identity_hash not in self._pending_detach):
                     peer_if.online = True
-                    revived.append(peer_if)
-        for peer_if in revived:
+                    revived.append((identity_hash, peer_if))
+        for identity_hash, peer_if in revived:
             RNS.log(f"{self} {peer_if} is back within the grace; online again", RNS.LOG_INFO)
             for data in self._held_announces.release():
                 peer_if.process_outgoing(data)
+            # The hold only fills while no peer at all is online, and the first
+            # peer back takes all of it. A peer away while another stayed up, or
+            # back second, missed what went out meanwhile: tell it afresh.
+            self._announce_to(peer_if, identity_hash)
 
     def _check_duplicate_identity(self, address, peer_identity):
         """Decide a second link to the same peer the way the peer decides it.
@@ -402,9 +406,10 @@ class AndroidBLEInterface(BLEInterface):
         replaces a path the peer learned another way -- over LoRa, or through
         a board -- which a replayed old announce would not.
 
-        Only for a peer interface just created. One kept through the grace
-        still has its paths, and announces sent while it was away are replayed
-        by the hold.
+        For a peer interface just created, and for one kept through the grace
+        and back: that one still has its paths, but the hold replays what it
+        missed only if no other peer was online meanwhile and it is the first
+        back. Rate-limited per peer, so a flapping link is not flooded.
         """
         now = time.monotonic()
         last = self._announced_to.get(identity_hash)

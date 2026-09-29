@@ -100,6 +100,27 @@ internal fun initiateDecision(
         else -> InitiateDecision.PEER_INITIATES
     }
 
+/** When a tagged advertiser was first seen in its current run of sightings, and last seen. */
+internal data class TagSighting(
+    val firstMs: Long,
+    val lastMs: Long,
+)
+
+/**
+ * The sighting after one at [nowMs]. The [TAG_DEFER_MS] defer counts a continuous run: a peer
+ * unseen for longer than the defer starts a fresh one, so a phone met again an hour later is
+ * given its turn to connect first instead of being raced by both sides at once.
+ */
+internal fun nextSighting(
+    previous: TagSighting?,
+    nowMs: Long,
+): TagSighting =
+    if (previous == null || nowMs - previous.lastMs > TAG_DEFER_MS) {
+        TagSighting(nowMs, nowMs)
+    } else {
+        previous.copy(lastMs = nowMs)
+    }
+
 /**
  * Kotlin BLE Bridge.
  *
@@ -1243,14 +1264,16 @@ class KotlinBLEBridge(
         }
     }
 
-    /** First time each advertised identity tag was seen, across address rotations. */
-    private val tagFirstSeen = ConcurrentHashMap<String, Long>()
+    /** Each advertised identity tag's current run of sightings, across address rotations. */
+    private val tagSightings = ConcurrentHashMap<String, TagSighting>()
 
     private fun initiateFor(address: String): InitiateDecision {
         val tag = scanner?.getDevicesSnapshot()?.get(address)?.identityTag
         val now = System.currentTimeMillis()
-        val firstSeen = tag?.let { tagFirstSeen.getOrPut(it) { now } } ?: now
         val linked = connectedPeers.values.mapNotNull { it.identityHash }
+        // A linked peer's defer is spent; after it disconnects, its next sighting starts afresh.
+        tagSightings.keys.removeIf { t -> linked.any { it.startsWith(t) } }
+        val firstSeen = tag?.let { t -> tagSightings.compute(t) { _, s -> nextSighting(s, now) }!!.firstMs } ?: now
         return initiateDecision(transportIdentityHash?.toHex(), tag, linked, firstSeen, now)
     }
 
