@@ -265,6 +265,9 @@ class ReticulumService : Service() {
         managers.settingsAccessor.getLastNetworkStatus()?.let { status ->
             managers.state.networkStatus.set(status)
         }
+        // And the rooms line, which lives in the app process and would otherwise
+        // be missing until the rooms state next changed.
+        managers.notificationManager.updateRoomsStatus(managers.settingsAccessor.getLastRoomsStatus())
 
         // CRITICAL: Start foreground immediately in onCreate to prevent being killed
         // before onStartCommand or onBind are called. This is the earliest safe point.

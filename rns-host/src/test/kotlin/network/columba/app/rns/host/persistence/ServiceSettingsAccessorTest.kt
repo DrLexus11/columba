@@ -9,6 +9,7 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Before
+import org.junit.Assert.assertNull
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
@@ -215,5 +216,17 @@ class ServiceSettingsAccessorTest {
         assertEquals(networkTime, prefs.getLong(ServiceSettingsAccessor.KEY_NETWORK_CHANGE_ANNOUNCE_TIME, -1L))
         assertEquals(announceTime, prefs.getLong(ServiceSettingsAccessor.KEY_LAST_AUTO_ANNOUNCE_TIME, -1L))
         assertTrue(accessor.getBlockUnknownSenders())
+    }
+
+    @Test
+    fun `the rooms line survives a service restart and clears`() {
+        accessor.saveLastRoomsStatus("connected to hub")
+        // A new accessor, as :reticulum has after Android restarts it.
+        assertEquals("connected to hub", ServiceSettingsAccessor(context).getLastRoomsStatus())
+        accessor.saveLastRoomsStatus("")
+        assertNull(ServiceSettingsAccessor(context).getLastRoomsStatus())
+        accessor.saveLastRoomsStatus("connected")
+        accessor.saveLastRoomsStatus(null)
+        assertNull(accessor.getLastRoomsStatus())
     }
 }

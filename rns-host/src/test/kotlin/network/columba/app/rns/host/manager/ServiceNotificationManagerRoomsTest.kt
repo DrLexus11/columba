@@ -68,4 +68,13 @@ class ServiceNotificationManagerRoomsTest {
         ShadowLooper.idleMainLooper()
         assertEquals(before, shadowOf(notificationManager).allNotifications.size)
     }
+
+    @Test
+    fun `RNode notes stay on the mesh line, not on the rooms line`() {
+        manager.updateRNodeStatus(false, "RNodeInterface[BLE]")
+        manager.updateRoomsStatus("connected")
+        ShadowLooper.idleMainLooper()
+        val roomsLine = detail().lines().single { it.startsWith("Rooms:") }
+        assertEquals("Rooms: connected", roomsLine)
+    }
 }

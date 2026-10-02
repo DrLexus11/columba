@@ -34,9 +34,13 @@ import java.io.File
  * Everything but start and stop is Eridanus's own: the identity, destination,
  * link, resource and transport factories are reused unchanged.
  *
- * Caches (known identities, paths) are kept in memory and relearned from
- * announces after a restart. rns-android would put them in a second Room
- * database; the shared-instance host, Columba, already persists the paths.
+ * Storage: reticulum-kt keeps its own small client store under [configDir] --
+ * `storage/` and `cache/` (known destinations, its path table) and a client
+ * transport identity -- loaded at start and written at stop. That is the
+ * library's file-backed default and is kept: it is the rooms client's own
+ * cache, apart from Columba's, in the app's private files. What is not added is
+ * rns-android's Room database of persistent stores; Columba, the host,
+ * persists the mesh's paths.
  *
  * Status lines Eridanus pushes ("Connected to hub ...") go to [statusSink],
  * which Columba points at its one notification.
@@ -91,6 +95,9 @@ class ColumbaRrcBackend(
         if (current() != null) runCatching { Reticulum.stop() }
         scope?.cancel()
         scope = null
+        // The empty line is the clear: a stopped rooms client must not leave its
+        // last "Rooms:" line standing in the notification.
+        statusSink("")
     }
 
     override val isRunning: Boolean

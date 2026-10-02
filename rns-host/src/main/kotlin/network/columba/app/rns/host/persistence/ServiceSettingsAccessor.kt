@@ -26,6 +26,7 @@ class ServiceSettingsAccessor(
         const val KEY_NETWORK_CHANGE_ANNOUNCE_TIME = "network_change_announce_time"
         const val KEY_LAST_AUTO_ANNOUNCE_TIME = "last_auto_announce_time"
         const val KEY_LAST_NETWORK_STATUS = "last_network_status"
+        const val KEY_LAST_ROOMS_STATUS = "last_rooms_status"
     }
 
     // Get fresh SharedPreferences each time to avoid caching issues across processes
@@ -119,4 +120,18 @@ class ServiceSettingsAccessor(
      * caller can fall back to its own default.
      */
     fun getLastNetworkStatus(): String? = getCrossProcessPrefs().getString(KEY_LAST_NETWORK_STATUS, null)
+
+    /**
+     * The rooms client's last status line, or null for none -- written by the app
+     * process, read back when Android restarts :reticulum, so a restarted
+     * notification keeps its "Rooms:" line instead of losing it until the rooms
+     * state next changes. commit(), for the same reason as network status.
+     */
+    fun saveLastRoomsStatus(status: String?) {
+        getCrossProcessPrefs().edit().apply {
+            if (status.isNullOrBlank()) remove(KEY_LAST_ROOMS_STATUS) else putString(KEY_LAST_ROOMS_STATUS, status)
+        }.commit()
+    }
+
+    fun getLastRoomsStatus(): String? = getCrossProcessPrefs().getString(KEY_LAST_ROOMS_STATUS, null)
 }

@@ -673,6 +673,9 @@ class ColumbaApplication :
      * same start-up window.
      */
     private fun updateRoomsStatus(line: String) {
+        // Persisted first, so a :reticulum restart restores it (ReticulumService
+        // onCreate); an empty line is the clear, and clears the stored one too.
+        runCatching { serviceSettingsAccessor.saveLastRoomsStatus(line) }
         try {
             val intent =
                 android.content.Intent(this, network.columba.app.rns.host.ReticulumService::class.java).apply {

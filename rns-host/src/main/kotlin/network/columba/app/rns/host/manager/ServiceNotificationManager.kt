@@ -553,9 +553,6 @@ class ServiceNotificationManager(
                 else -> statusText
             }
 
-        // Rooms, on a line of their own, state first.
-        roomsStatus?.let { detailText += "\nRooms: $it" }
-
         // Append RNode status when network is otherwise healthy
         if (networkStatus == "READY" && disconnectedRNodeInterfaces.isNotEmpty()) {
             detailText += " (RNode disconnected)"
@@ -566,6 +563,10 @@ class ServiceNotificationManager(
         if (networkStatus == "READY" && battery != null) {
             detailText += " (RNode battery ${battery}%)"
         }
+
+        // Rooms last, on a line of their own, after every mesh and RNode note --
+        // so those notes never read as part of the rooms line.
+        roomsStatus?.let { detailText += "\nRooms: $it" }
 
         return Pair(statusText, detailText)
     }
