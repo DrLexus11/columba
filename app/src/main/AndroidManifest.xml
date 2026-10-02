@@ -215,6 +215,17 @@
             </intent-filter>
         </activity>
 
+        <!-- Bound by :reticulum's foreground service (rns-host MainProcessAnchor)
+             so this process shares its priority. Not exported: only this app
+             binds it, by action within its own package. -->
+        <service
+            android:name=".service.MainProcessAnchorService"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="network.columba.app.ANCHOR_MAIN_PROCESS" />
+            </intent-filter>
+        </service>
+
         <!-- RNode Companion Device Service (Android 12+) -->
         <!-- Enables Android to recognize Columba as the companion app for RNode devices -->
         <!-- System binds this service when associated RNode is in range/connected -->

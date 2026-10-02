@@ -94,6 +94,9 @@ class ReticulumService : Service() {
     // Managers container (initialized in onCreate)
     private lateinit var managers: ServiceModule.ServiceManagers
 
+    /** Lends this service's foreground priority to the main process. */
+    private val mainProcessAnchor by lazy { MainProcessAnchor(applicationContext) }
+
     // Local binder returned from onBind() — liveness handle only, no protocol calls.
     // Retained internally so existing managers (BleCoordinator, NetworkChangeManager
     // callbacks below) can call binder.restartAutoInterface() / announceLxmfDestination() /
@@ -267,6 +270,10 @@ class ReticulumService : Service() {
         // before onStartCommand or onBind are called. This is the earliest safe point.
         managers.notificationManager.startForeground(this)
         Log.d(TAG, "Foreground service started in onCreate")
+
+        // Now that this process is foreground, lend that to the main process:
+        // the TAK endpoint and the mesh interface live there (MainProcessAnchor).
+        mainProcessAnchor.hold()
 
         // CRITICAL: Acquire wake lock early to prevent CPU sleep during initialization
         // Native stack manages multicast lock per-AutoInterface for battery savings.
@@ -511,6 +518,8 @@ class ReticulumService : Service() {
     override fun onDestroy() {
         super.onDestroy()
         Log.d(TAG, "Service destroyed")
+
+        mainProcessAnchor.release()
 
         // Clean up all resources (if initialized)
         if (::managers.isInitialized) {
