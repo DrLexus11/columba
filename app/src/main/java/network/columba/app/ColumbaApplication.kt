@@ -37,7 +37,12 @@ import javax.inject.Inject
  * Annotated with @HiltAndroidApp to enable Hilt dependency injection.
  */
 @HiltAndroidApp
-class ColumbaApplication : Application() {
+class ColumbaApplication :
+    Application(),
+    // Eridanus's screens reach their Reticulum backend through this
+    // (docs/EridanusMerge.md, step 4): rooms run as a client of this app's own
+    // shared instance, with no service or notification of their own.
+    tech.torlando.eridanus.RnsBackendHost {
     companion object {
         /** Timeout for IPC calls to prevent ANR during initialization */
         internal const val IPC_TIMEOUT_MS = 5000L
@@ -653,6 +658,35 @@ class ColumbaApplication : Application() {
             is network.columba.app.rns.api.model.NetworkStatus.SHUTDOWN -> "SHUTDOWN"
             is network.columba.app.rns.api.model.NetworkStatus.ERROR -> "ERROR:${status.message}"
         }
+
+    /**
+     * The rooms client's backend, created when a rooms screen first asks for
+     * it. Its status lines go into the one foreground notification.
+     */
+    override val rnsBackend: tech.torlando.eridanus.rns.RnsBackend by lazy {
+        network.columba.app.rooms.ColumbaRrcBackend(statusSink = ::updateRoomsStatus)
+    }
+
+    /**
+     * Put the rooms client's state into the foreground notification, as its own
+     * line -- the same route as [updateServiceNotification], so it survives the
+     * same start-up window.
+     */
+    private fun updateRoomsStatus(line: String) {
+        // Persisted first, so a :reticulum restart restores it (ReticulumService
+        // onCreate); an empty line is the clear, and clears the stored one too.
+        runCatching { serviceSettingsAccessor.saveLastRoomsStatus(line) }
+        try {
+            val intent =
+                android.content.Intent(this, network.columba.app.rns.host.ReticulumService::class.java).apply {
+                    action = network.columba.app.rns.host.ReticulumService.ACTION_UPDATE_ROOMS_STATUS
+                    putExtra(network.columba.app.rns.host.ReticulumService.EXTRA_ROOMS_STATUS, line)
+                }
+            androidx.core.content.ContextCompat.startForegroundService(this, intent)
+        } catch (e: Exception) {
+            android.util.Log.w("ColumbaApplication", "Failed to update rooms status: ${e.message}")
+        }
+    }
 
     /**
      * Send a network status update to the service process to refresh

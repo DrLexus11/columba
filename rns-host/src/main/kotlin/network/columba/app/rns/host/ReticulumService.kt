@@ -50,6 +50,14 @@ class ReticulumService : Service() {
         const val ACTION_UPDATE_NOTIFICATION = "network.columba.app.service.UPDATE_NOTIFICATION"
         const val EXTRA_NETWORK_STATUS = "network_status"
 
+        /**
+         * The rooms client's state, from the main process (docs/EridanusMerge.md,
+         * step 4): one line in this service's notification, so rooms never post
+         * a notification of their own. An empty extra clears the line.
+         */
+        const val ACTION_UPDATE_ROOMS_STATUS = "network.columba.app.service.UPDATE_ROOMS_STATUS"
+        const val EXTRA_ROOMS_STATUS = "rooms_status"
+
         // Grace window for treating ACTION_STOP as a stale redelivery during an
         // Apply & Restart. The original STOP intent travels at most a few seconds
         // (the time between :reticulum dying and Android auto-restarting the FGS),
@@ -257,6 +265,9 @@ class ReticulumService : Service() {
         managers.settingsAccessor.getLastNetworkStatus()?.let { status ->
             managers.state.networkStatus.set(status)
         }
+        // And the rooms line, which lives in the app process and would otherwise
+        // be missing until the rooms state next changed.
+        managers.notificationManager.updateRoomsStatus(managers.settingsAccessor.getLastRoomsStatus())
 
         // CRITICAL: Start foreground immediately in onCreate to prevent being killed
         // before onStartCommand or onBind are called. This is the earliest safe point.
@@ -444,6 +455,11 @@ class ReticulumService : Service() {
                     managers.state.networkStatus.set(status)
                     managers.notificationManager.updateNotification(status)
                 }
+            }
+            ACTION_UPDATE_ROOMS_STATUS -> {
+                managers.notificationManager.updateRoomsStatus(
+                    intent.getStringExtra(EXTRA_ROOMS_STATUS)?.takeIf { it.isNotBlank() },
+                )
             }
         }
 

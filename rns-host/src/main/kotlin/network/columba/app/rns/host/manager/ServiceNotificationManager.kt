@@ -149,6 +149,24 @@ class ServiceNotificationManager(
      *
      * @param networkStatus Current status: "SHUTDOWN", "INITIALIZING", "READY", or "ERROR:message"
      */
+    /**
+     * The rooms client's state, or null when there is none to report. Shown as
+     * its own line, "Rooms: ..." -- this is the only persistent notification
+     * the app posts, so rooms speak through it rather than beside it.
+     */
+    @Volatile private var roomsStatus: String? = null
+
+    fun updateRoomsStatus(status: String?) {
+        mainHandler.post {
+            if (roomsStatus == status) return@post
+            roomsStatus = status
+            if (currentSyncState in PropagationState.STATE_PATH_REQUESTED..PropagationState.STATE_RESPONSE_RECEIVED) {
+                return@post
+            }
+            repostNotification(createNotification(lastNetworkStatus))
+        }
+    }
+
     fun updateNotification(networkStatus: String) {
         mainHandler.post {
             lastNetworkStatus = networkStatus
@@ -545,6 +563,10 @@ class ServiceNotificationManager(
         if (networkStatus == "READY" && battery != null) {
             detailText += " (RNode battery ${battery}%)"
         }
+
+        // Rooms last, on a line of their own, after every mesh and RNode note --
+        // so those notes never read as part of the rooms line.
+        roomsStatus?.let { detailText += "\nRooms: $it" }
 
         return Pair(statusText, detailText)
     }

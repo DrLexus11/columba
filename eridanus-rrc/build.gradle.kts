@@ -42,6 +42,8 @@ android {
             // The flavor-neutral app code, plus the Kotlin-backend provider: the
             // Python flavor is not built here (docs/EridanusMerge.md, licences).
             kotlin.srcDirs(eridanusApp.resolve("main/kotlin"), eridanusApp.resolve("kotlin/kotlin"))
+            // Columba's own side of the merge (ColumbaRrcBackend and friends).
+            kotlin.srcDir("src/main/kotlin")
             // Not kotlin/res: it only renames the app for that flavor, and merged
             // into one source set it collides with main's app_name.
             res.srcDirs(eridanusApp.resolve("main/res"))
@@ -62,6 +64,11 @@ kotlin {
 dependencies {
     implementation(project(":eridanus-rns-api"))
     implementation(project(":eridanus-rns-backend-kt"))
+    // ColumbaRrcBackend starts reticulum-kt itself, as a client of Columba's
+    // shared instance -- the core and the local client interface only, not
+    // rns-android's service.
+    implementation(libs.rns.core)
+    implementation(libs.rns.interfaces)
 
     implementation(platform("androidx.compose:compose-bom:${libs.versions.composeBom.get()}"))
     implementation("androidx.compose.ui:ui")
