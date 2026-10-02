@@ -349,7 +349,7 @@ jobs:
             robolectric-
 
       - name: Run RNS, stats, data, and micron module tests
-        run: ./gradlew :rns-api:testDebugUnitTest :rns-ipc:testDebugUnitTest :rns-host:testKotlinBackendDebugUnitTest :rns-host:testPythonBackendDebugUnitTest :rns-backend-kt:testDebugUnitTest :rns-backend-py:testDebugUnitTest :rns-stats:testDebugUnitTest :data:testDebugUnitTest :micron:test --stacktrace --max-workers=4
+        run: ./gradlew :rns-api:testDebugUnitTest :rns-ipc:testDebugUnitTest :rns-host:testKotlinBackendDebugUnitTest :rns-host:testPythonBackendDebugUnitTest :rns-backend-kt:testDebugUnitTest :rns-backend-py:testDebugUnitTest :rns-stats:testDebugUnitTest :data:testDebugUnitTest :micron:test :eridanus-rrc:testDebugUnitTest --stacktrace --max-workers=4
 
       - name: Upload unit test results
         if: always()

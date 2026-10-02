@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Eridanus's app code as a library inside Columba (docs/EridanusMerge.md, step 3).
+     No application class and no launcher: Columba is the application, and its
+     navigation hosts Eridanus's screens (step 5). -->
+<manifest />
