@@ -288,6 +288,8 @@ android {
         compose = true
         buildConfig = true
         resValues = true
+        // The mesh interface ATAK binds (service/mesh, IColumbaMesh.aidl).
+        aidl = true
     }
 
     composeOptions {

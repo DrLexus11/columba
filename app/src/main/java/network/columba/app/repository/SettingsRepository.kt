@@ -85,6 +85,7 @@ class SettingsRepository
             val POSITION_GATEWAY_HASH = stringPreferencesKey("position_gateway_hash")
             val POSITION_REPORT_LAST = longPreferencesKey("position_report_last")
             val TAK_ENDPOINT_ENABLED = booleanPreferencesKey("tak_endpoint_enabled")
+            val TAK_ATAK_CONTROL = booleanPreferencesKey("tak_atak_control")
             val TAK_TEAM = stringPreferencesKey("tak_team")
             val TAK_FLEET_SECRET = stringPreferencesKey("tak_fleet_secret")
             val TAK_CALLSIGN = stringPreferencesKey("tak_callsign")
@@ -743,6 +744,26 @@ class SettingsRepository
         suspend fun saveTakEndpointEnabled(enabled: Boolean) {
             context.dataStore.edit { preferences ->
                 preferences[PreferencesKeys.TAK_ENDPOINT_ENABLED] = enabled
+            }
+        }
+
+        /**
+         * Whether ATAK may send commands through the mesh interface -- announce
+         * now, and later interfaces, propagation node and page fetches.
+         *
+         * Off by default. Any plugin loaded in an allowed ATAK can reach the
+         * interface, and a command can disrupt (reticulum-atak OpenDecisions 1),
+         * so commands wait for an operator or fleet provisioning to allow them.
+         * Reading the mesh needs no setting.
+         */
+        val takAtakControlFlow: Flow<Boolean> =
+            context.dataStore.data
+                .map { preferences -> preferences[PreferencesKeys.TAK_ATAK_CONTROL] ?: false }
+                .distinctUntilChanged()
+
+        suspend fun saveTakAtakControl(allowed: Boolean) {
+            context.dataStore.edit { preferences ->
+                preferences[PreferencesKeys.TAK_ATAK_CONTROL] = allowed
             }
         }
 

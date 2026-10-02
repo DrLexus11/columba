@@ -100,6 +100,11 @@
     <uses-permission android:name="android.permission.REQUEST_COMPANION_START_FOREGROUND_SERVICES_FROM_BACKGROUND" />
     <uses-permission android:name="android.permission.REQUEST_OBSERVE_COMPANION_DEVICE_PRESENCE" />
 
+    <!-- ATAK, whose signing certificate the mesh interface checks (MeshCallerGate). -->
+    <queries>
+        <package android:name="com.atakmap.app.civ" />
+    </queries>
+
     <application
         android:name=".ColumbaApplication"
         android:enableOnBackInvokedCallback="true"
@@ -179,6 +184,36 @@
 
         <!-- Reticulum Background Service is declared by :rns-host's AndroidManifest.xml.
              Manifest merger pulls it in here so the :reticulum process registers correctly. -->
+
+        <!-- The mesh interface the ATAK plugin binds (service/mesh). Exported with
+             no permission on purpose: a plugin runs in ATAK's process and cannot
+             add one to ATAK's manifest. Every call checks its caller's package and
+             signing certificate instead (MeshCallerGate). -->
+        <service
+            android:name=".service.mesh.MeshService"
+            android:exported="true"
+            tools:ignore="ExportedService">
+            <intent-filter>
+                <action android:name="network.columba.app.mesh.BIND" />
+            </intent-filter>
+        </service>
+
+        <!-- Puts Columba in ATAK's package visibility, so the bind above can find
+             it: ATAK queries for apps that open content:// files of any type.
+             One private type, so it never shows in anybody's "open with" list.
+             See MeshVisibilityActivity. -->
+        <activity
+            android:name=".service.mesh.MeshVisibilityActivity"
+            android:exported="true"
+            android:excludeFromRecents="true"
+            android:noHistory="true"
+            android:theme="@android:style/Theme.NoDisplay">
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:scheme="content" android:mimeType="application/vnd.network.columba.mesh" />
+            </intent-filter>
+        </activity>
 
         <!-- RNode Companion Device Service (Android 12+) -->
         <!-- Enables Android to recognize Columba as the companion app for RNode devices -->

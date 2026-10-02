@@ -1,0 +1,44 @@
+{
+  "comment": "Columba's mesh snapshot, version 1 (docs/ColumbaInterface.md). Copied byte for byte into Columba; both sides test against it. Hashes and callsigns are synthetic.",
+  "snapshots": [
+    {
+      "name": "full",
+      "snapshot": {
+        "v": 1,
+        "at": 1790000000000,
+        "node": {"uid": "urtn-00112233445566778899aabbccddeeff", "callsign": "ALPHA-1", "control": true, "running": true},
+        "propagation": {"hash": "0123456789abcdef0123456789abcdef", "name": "Command post", "path": true, "hops": 2, "carrier": "lora", "is_command_post": true, "last_sync": 1789999990000},
+        "peers": [
+          {"uid": "urtn-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "callsign": "HQ", "role": "HQ", "heard": 1789999950000, "path": true, "hops": 2, "carrier": "lora", "interface": "RNode LoRa"},
+          {"uid": "urtn-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "callsign": "BRAVO-2", "role": "Team Member", "heard": 1789999900000, "path": true, "hops": 1, "carrier": "ble", "interface": "BLE peer"},
+          {"uid": "urtn-cccccccccccccccccccccccccccccccc", "callsign": "CHARLIE-3", "role": "Medic", "heard": 1789990000000, "path": false, "hops": null, "carrier": null, "interface": null}
+        ]
+      },
+      "expect": {"peers": 3, "command_post_reachable": true, "command_post_hops": 2, "propagation_line": "Relay: Command post · 2 hops · LoRa", "command_post_line": "Command post: reachable · 2 hops · LoRa"}
+    },
+    {
+      "name": "no-propagation-no-paths",
+      "snapshot": {
+        "v": 1,
+        "at": 1790000000000,
+        "node": {"uid": "urtn-00112233445566778899aabbccddeeff", "callsign": "ALPHA-1", "control": false, "running": true},
+        "propagation": null,
+        "peers": [
+          {"uid": "urtn-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "callsign": "HQ", "role": "HQ", "heard": 1789000000000, "path": false, "hops": null, "carrier": null, "interface": null}
+        ]
+      },
+      "expect": {"peers": 1, "command_post_reachable": false, "command_post_hops": null, "propagation_line": "Relay: none", "command_post_line": "Command post: no path"}
+    },
+    {
+      "name": "nothing-known",
+      "snapshot": {
+        "v": 1,
+        "at": 1790000000000,
+        "node": {"uid": null, "callsign": null, "control": false, "running": false},
+        "propagation": null,
+        "peers": []
+      },
+      "expect": {"peers": 0, "command_post_reachable": false, "command_post_hops": null, "propagation_line": "Relay: none", "command_post_line": "Command post: not heard"}
+    }
+  ]
+}

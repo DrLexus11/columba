@@ -48,6 +48,14 @@ class InboxAnnouncer(
      */
     suspend fun announceIfDue(now: Long): Boolean {
         if (lastAnnounce != 0L && now - lastAnnounce < floorMs) return false
+        return announceNow(now)
+    }
+
+    /**
+     * Announce regardless of the floor, and restart it -- for an operator who
+     * asked, whose own rate is limited where they asked (service/mesh).
+     */
+    suspend fun announceNow(now: Long): Boolean {
         val displayName = identityRepository.getActiveIdentitySync()?.displayName ?: return false
         // The floor starts when an announce actually goes out, not when one is
         // attempted. Committing the timestamp first meant a backend that was
