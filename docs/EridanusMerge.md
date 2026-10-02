@@ -71,14 +71,15 @@ Each is its own pull request into Columba's `main`, tested on the bench phones.
 4. **Wire it to Columba -- one foreground service, one notification**
    (operator, 2026-10-02: "robust, not a jerry rig; disaster response demands
    clear, tactical messaging"). Three parts:
-   - **The main process shares `:reticulum`'s protection.** Columba's only
-     foreground service is `ReticulumService` in `:reticulum`; the main
-     process -- the TAK endpoint, the mesh service, and now the rooms client --
-     had none. On Lexus it sat at `oom_score_adj` 200 only because ATAK, through
-     the plugin, was bound to `MeshService`. `:reticulum` binds a small anchor
-     service in the main process with `BIND_IMPORTANT`, so the main process
-     inherits its foreground priority whether or not anything else is bound.
-     Its own pull request, before the rest: it fixes the TAK endpoint too.
+   - **The main process shares `:reticulum`'s protection, deliberately.**
+     Columba's only foreground service is `ReticulumService` in `:reticulum`;
+     the main process -- the TAK endpoint, the mesh service, and now the rooms
+     client -- has none. It is protected today by accident: `:reticulum` binds
+     Room's `MultiInstanceInvalidationService`, which lives in the main process
+     (Galaxy A54, 2026-10-02: process state 4, `oom_score_adj` 200). The anchor
+     (`MainProcessAnchor`, branch `feature/main-process-anchor`) binds a
+     do-nothing service there with `BIND_IMPORTANT`, so the protection no
+     longer rests on a database detail. Hardening, its own pull request.
    - **`ColumbaRrcBackend`**, on Columba's side, implements Eridanus's
      `RnsBackend` without rns-android's `ReticulumService`. Eridanus's
      `KtRnsBackend` starts that service -- a second foreground service with a
