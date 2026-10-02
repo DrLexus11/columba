@@ -32,6 +32,11 @@ allprojects {
 subprojects {
     // Skip detekt-rules module - it's a pure JVM module for detekt custom rules
     if (name == "detekt-rules") return@subprojects
+    // Eridanus's modules are imported code under its author's conventions
+    // (docs/EridanusMerge.md): Columba's style gates would force edits inside
+    // eridanus/, which is what keeps later subtree pulls clean. Lint's NewApi
+    // check, below, still applies to them.
+    if (name.startsWith("eridanus-")) return@subprojects
 
     apply(plugin = "jacoco")
     apply(plugin = "org.jlleitschuh.gradle.ktlint")
@@ -143,6 +148,18 @@ subprojects {
     }
     plugins.withType<com.android.build.gradle.LibraryPlugin> {
         extensions.configure<com.android.build.api.dsl.LibraryExtension> { lint(lintConfig) }
+    }
+}
+
+// Eridanus's modules declare minSdk 26; Columba's is 24. Lowered here, after
+// their own build files have run, rather than by editing eridanus/ -- the
+// NewApi check above then catches any call that really needs 26.
+subprojects {
+    if (!name.startsWith("eridanus-")) return@subprojects
+    plugins.withType<com.android.build.gradle.LibraryPlugin> {
+        extensions.configure<com.android.build.api.variant.LibraryAndroidComponentsExtension> {
+            finalizeDsl { android -> android.defaultConfig.minSdk = 24 }
+        }
     }
 }
 

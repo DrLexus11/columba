@@ -69,3 +69,11 @@ include(":rns-backend-py")
 include(":rns-stats")
 include(":detekt-rules")
 include(":screenshot-tests")
+
+// Eridanus, imported by git subtree into eridanus/ (docs/EridanusMerge.md). Its
+// modules keep their own names and files; only their location is given here,
+// so a later subtree pull applies without conflicts.
+include(":eridanus-rns-api")
+project(":eridanus-rns-api").projectDir = file("eridanus/eridanus-rns-api")
+include(":eridanus-rns-backend-kt")
+project(":eridanus-rns-backend-kt").projectDir = file("eridanus/eridanus-rns-backend-kt")
