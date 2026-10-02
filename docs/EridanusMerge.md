@@ -44,6 +44,20 @@ clean; adaptation lives in Columba-side modules that point at Eridanus's files.
    owns the Reticulum backend". `EridanusApp` implements it and the view model
    casts to it, so Columba's Application can host the backend too. Without it
    the view model casts to `EridanusApp` and crashes inside Columba.
+2. Identity import reads at most 65 bytes (review of #11): the import control
+   read the whole chosen file before checking its 64-byte size, so a large or
+   hostile file could exhaust the heap.
+
+**Known issues in the imported code** -- not patched here, because a fix is a
+sizeable change inside `eridanus/`; each must be fixed or kept out of reach
+before Columba exposes it:
+
+- `RrcHub`'s registries (sessions, rooms) are changed from Reticulum's
+  callback threads and read from the view model's coroutine with no common
+  lock (review of #11): a data race, or a `ConcurrentModificationException`,
+  while a phone is **hosting** a hub. In this design the boards host the hubs
+  and phones are clients, so hosting stays out of Columba's UI until the hub's
+  state is confined to one dispatcher.
 
 ## Steps
 

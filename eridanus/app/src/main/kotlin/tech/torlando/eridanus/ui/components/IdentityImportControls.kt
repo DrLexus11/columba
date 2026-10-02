@@ -72,8 +72,19 @@ internal fun IdentityImportControls(
         ActivityResultContracts.OpenDocument(),
     ) { uri ->
         if (uri == null) return@rememberLauncherForActivityResult
+        // At most 65 bytes: enough for the size check below to refuse anything
+        // that is not exactly 64, without reading a large file into memory.
         val bytes = try {
-            context.contentResolver.openInputStream(uri)?.use { it.readBytes() }
+            context.contentResolver.openInputStream(uri)?.use { input ->
+                val buffer = ByteArray(65)
+                var read = 0
+                while (read < buffer.size) {
+                    val n = input.read(buffer, read, buffer.size - read)
+                    if (n < 0) break
+                    read += n
+                }
+                buffer.copyOf(read)
+            }
         } catch (_: Exception) {
             null
         }
