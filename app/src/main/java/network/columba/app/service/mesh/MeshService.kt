@@ -143,13 +143,18 @@ class MeshService : Service() {
 
     private class Route(val path: Boolean, val hops: Int?, val iface: String?)
 
+    /**
+     * A failed query throws rather than answering "no path": during a backend
+     * restart that would tell every watcher the whole team had dropped off.
+     * The throw aborts this pass of [build], and [refreshLoop] keeps the last
+     * snapshot that was actually known.
+     */
     private suspend fun route(hash: ByteArray): Route {
-        val path = runCatching { rnsCore.hasPath(hash) }.getOrDefault(false)
-        if (!path) return Route(false, null, null)
+        if (!rnsCore.hasPath(hash)) return Route(false, null, null)
         return Route(
             path = true,
-            hops = runCatching { rnsCore.getHopCount(hash) }.getOrNull(),
-            iface = runCatching { rnsCore.getNextHopInterfaceName(hash) }.getOrNull(),
+            hops = rnsCore.getHopCount(hash),
+            iface = rnsCore.getNextHopInterfaceName(hash),
         )
     }
 

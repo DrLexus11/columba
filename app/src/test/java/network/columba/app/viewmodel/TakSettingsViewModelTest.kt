@@ -1,6 +1,7 @@
 package network.columba.app.viewmodel
 
 import io.mockk.coEvery
+import io.mockk.coVerify
 import io.mockk.every
 import io.mockk.mockk
 import kotlinx.coroutines.Dispatchers
@@ -32,15 +33,18 @@ class TakSettingsViewModelTest {
     @After
     fun tearDown() = Dispatchers.resetMain()
 
+    private lateinit var settings: SettingsRepository
+
     private fun viewModel(
         enabled: Boolean = false,
         team: String = "Cyan",
         secret: String? = null,
+        atakControl: Boolean = false,
     ): TakSettingsViewModel {
         // Strict: every flow the view model reads and every setter it can call
         // is stubbed below, so a new dependency shows up as a failing test
         // rather than as a silently defaulted value.
-        val settings =
+        settings =
             mockk<SettingsRepository> {
                 every { takEndpointEnabledFlow } returns flowOf(enabled)
                 every { takTeamFlow } returns flowOf(team)
@@ -48,6 +52,8 @@ class TakSettingsViewModelTest {
                 every { positionReportEnabledFlow } returns flowOf(false)
                 every { positionReportIntervalMinutesFlow } returns flowOf(1)
                 every { lastPositionReportTimeFlow } returns flowOf(null)
+                every { takAtakControlFlow } returns flowOf(atakControl)
+                coEvery { saveTakAtakControl(any()) } returns Unit
                 coEvery { saveTakEndpointEnabled(any()) } returns Unit
                 coEvery { saveTakTeam(any()) } returns Unit
                 coEvery { saveTakFleetSecret(any()) } returns Unit
@@ -121,5 +127,20 @@ class TakSettingsViewModelTest {
 
         assertTrue(model.state.value.endpointEnabled)
         assertEquals("Magenta", model.state.value.team)
+    }
+
+    @Test
+    fun `ATAK control reaches state and is saved`() = runTest(dispatcher) {
+        val off = viewModel(atakControl = false)
+        advanceUntilIdle()
+        assertFalse(off.state.value.atakControl)
+
+        val on = viewModel(atakControl = true)
+        advanceUntilIdle()
+        assertTrue(on.state.value.atakControl)
+
+        on.setAtakControl(false)
+        advanceUntilIdle()
+        coVerify { settings.saveTakAtakControl(false) }
     }
 }
