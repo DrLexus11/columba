@@ -77,3 +77,5 @@ include(":eridanus-rns-api")
 project(":eridanus-rns-api").projectDir = file("eridanus/eridanus-rns-api")
 include(":eridanus-rns-backend-kt")
 project(":eridanus-rns-backend-kt").projectDir = file("eridanus/eridanus-rns-backend-kt")
+// Eridanus's app code as a library (step 3); its own directory is Columba's.
+include(":eridanus-rrc")

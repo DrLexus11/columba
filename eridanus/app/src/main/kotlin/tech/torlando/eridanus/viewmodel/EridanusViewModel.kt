@@ -32,7 +32,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeoutOrNull
-import tech.torlando.eridanus.EridanusApp
+import tech.torlando.eridanus.RnsBackendHost
 import tech.torlando.eridanus.rns.RnsAnnounceHandler
 import tech.torlando.eridanus.rns.RnsAnnounceHandlerRegistration
 import tech.torlando.eridanus.rns.RnsBackend
@@ -137,7 +137,7 @@ class EridanusViewModel(application: Application) : AndroidViewModel(application
         private const val RECONNECT_SHARED_INSTANCE_MAX_WAIT_MS = 30_000L
     }
 
-    private val backend: RnsBackend = (application as EridanusApp).rnsBackend
+    private val backend: RnsBackend = (application as RnsBackendHost).rnsBackend
     /** "kotlin" or "python" — surfaces in the SharedInstanceBannerCard so
      * trust-skeptical users on the python flavor can confirm the reference
      * stack is what's running. */

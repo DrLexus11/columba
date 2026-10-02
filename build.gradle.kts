@@ -36,7 +36,7 @@ subprojects {
     // (docs/EridanusMerge.md): Columba's style gates would force edits inside
     // eridanus/, which is what keeps later subtree pulls clean. Lint's NewApi
     // check, below, still applies to them.
-    if (name.startsWith("eridanus-")) return@subprojects
+    if (name.startsWith("eridanus-")) return@subprojects   // incl. :eridanus-rrc
 
     apply(plugin = "jacoco")
     apply(plugin = "org.jlleitschuh.gradle.ktlint")

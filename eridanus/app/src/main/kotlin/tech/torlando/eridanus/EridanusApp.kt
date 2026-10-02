@@ -6,9 +6,9 @@ import android.app.Application
 import tech.torlando.eridanus.rns.RnsBackend
 import tech.torlando.eridanus.rns.provideRnsBackend
 
-class EridanusApp : Application() {
+class EridanusApp : Application(), RnsBackendHost {
 
-    lateinit var rnsBackend: RnsBackend
+    override lateinit var rnsBackend: RnsBackend
         private set
 
     override fun onCreate() {
