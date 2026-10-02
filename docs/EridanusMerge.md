@@ -68,15 +68,31 @@ Each is its own pull request into Columba's `main`, tested on the bench phones.
    Eridanus's own unit tests -- 91 -- run and pass in Columba's build, with
    its `isReturnDefaultValues` test option. Eridanus keeps its manual wiring,
    not Hilt.
-4. **Wire it to Columba.** `ColumbaApplication` implements `RnsBackendHost`.
-   The Reticulum client points at Columba's shared instance, and Columba turns
-   sharing on when rooms are in use. The identity is Columba's active identity,
-   handed over inside the APK -- never exported to a file; Eridanus's own
-   `IdentityStore` is the seam. **Open:** the Kotlin backend runs rns-android's
-   own `ReticulumService`, a foreground service with its own notification --
-   inside Columba that would be a second persistent notification beside
-   Columba's. Decide whether Columba's notification can carry it, or the
-   client can run without that service, when this step is built.
+4. **Wire it to Columba -- one foreground service, one notification**
+   (operator, 2026-10-02: "robust, not a jerry rig; disaster response demands
+   clear, tactical messaging"). Three parts:
+   - **The main process shares `:reticulum`'s protection.** Columba's only
+     foreground service is `ReticulumService` in `:reticulum`; the main
+     process -- the TAK endpoint, the mesh service, and now the rooms client --
+     had none. On Lexus it sat at `oom_score_adj` 200 only because ATAK, through
+     the plugin, was bound to `MeshService`. `:reticulum` binds a small anchor
+     service in the main process with `BIND_IMPORTANT`, so the main process
+     inherits its foreground priority whether or not anything else is bound.
+     Its own pull request, before the rest: it fixes the TAK endpoint too.
+   - **`ColumbaRrcBackend`**, on Columba's side, implements Eridanus's
+     `RnsBackend` without rns-android's `ReticulumService`. Eridanus's
+     `KtRnsBackend` starts that service -- a second foreground service with a
+     second persistent notification -- but only for start/stop; its
+     identity, destination, link, resource and transport factories are public
+     and use reticulum-kt alone, so they are reused unchanged. Start is
+     `Reticulum.start(...)` as a client of Columba's shared instance (37428).
+     `ColumbaApplication` implements `RnsBackendHost` with it.
+   - **One notification speaks for both.** Eridanus's
+     `setForegroundStatus(...)` lines ("Connected to hub ...") go into
+     Columba's notification as one short line, state first, beside the mesh
+     line; nothing else posts a persistent notification.
+   The identity is Columba's active identity, handed over inside the APK --
+   never exported to a file; Eridanus's `IdentityStore` is the seam.
 5. **Rooms in Columba's UI** -- Eridanus's screens as a destination in
    Columba's navigation.
 6. **Rooms for ATAK** -- the mesh interface gains rooms (version 2 of
