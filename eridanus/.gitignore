@@ -1,0 +1,25 @@
+*.iml
+.gradle
+/local.properties
+/.idea
+.DS_Store
+/build
+/app/build
+/eridanus-rns-api/build
+/eridanus-rns-backend-kt/build
+/eridanus-rns-backend-py/build
+
+# Python
+__pycache__/
+/captures
+.externalNativeBuild
+.cxx
+
+# Signing and credentials
+*.jks
+*.keystore
+*.pem
+*.p12
+*.env
+.env*
+google-services.json
