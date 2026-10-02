@@ -47,6 +47,8 @@ class TakSettingsViewModel
             val positionEnabled: Boolean = false,
             val positionIntervalMinutes: Int = 1,
             val lastPositionReportTime: Long? = null,
+            /** Whether ATAK may send commands through the mesh interface. */
+            val atakControl: Boolean = false,
         )
 
         private val _state = MutableStateFlow(State())
@@ -74,6 +76,15 @@ class TakSettingsViewModel
         init {
             observeEndpointSettings()
             observePositionSettings()
+            viewModelScope.launch {
+                settingsRepository.takAtakControlFlow.collect { allowed ->
+                    _state.value = _state.value.copy(atakControl = allowed)
+                }
+            }
+        }
+
+        fun setAtakControl(allowed: Boolean) {
+            viewModelScope.launch { settingsRepository.saveTakAtakControl(allowed) }
         }
 
         private fun observeEndpointSettings() {

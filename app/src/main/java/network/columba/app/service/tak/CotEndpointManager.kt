@@ -473,7 +473,7 @@ class CotEndpointManager
          * an HMAC of the team rather than its name, so announcing does not undo
          * what TakGroups goes to trouble to hide.
          */
-        private suspend fun announce(session: Session) {
+        private suspend fun announce(session: Session): Boolean {
             // Built here rather than once per session. The callsign in it is
             // read from ATAK, so it is not known when the session starts and
             // can change while it runs.
@@ -484,8 +484,9 @@ class CotEndpointManager
                     ?: session.rememberedCallsign
                     ?: Keys.FALLBACK_CALLSIGN,
             )
-            rnsCore.announceDestination(session.node, payload)
+            return rnsCore.announceDestination(session.node, payload)
                 .onFailure { Log.w(TAG, "Announce failed: ${it.message}") }
+                .isSuccess
         }
 
         private suspend fun learnMembers(session: Session) {
@@ -731,6 +732,43 @@ class CotEndpointManager
             if (atakIsReporting) return false
             val own = fix.copy(senderId = TakMembership.senderIdFor(session.node.hash))
             return fanOut(PositionCodec.encode(own), session) > 0
+        }
+
+        /** A team member as the ATAK plugin's mesh panel shows it. */
+        class MemberView(val destinationHash: ByteArray, val callsign: String, val role: String, val heard: Long)
+
+        /** This node and its team, for the mesh interface (service/mesh). */
+        class MeshView(val nodeHash: ByteArray, val callsign: String?, val members: List<MemberView>)
+
+        /**
+         * What the ATAK plugin's mesh panel reads. Null with no session: no
+         * node address and no member table yet, which the panel says rather
+         * than showing an empty team.
+         */
+        fun meshView(now: Long = System.currentTimeMillis()): MeshView? {
+            val session = live ?: return null
+            val members =
+                session.registry.members(now).mapNotNull { hash ->
+                    session.registry.describe(hash)?.let { MemberView(hash, it.callsign, it.role, it.heard) }
+                }
+            return MeshView(
+                nodeHash = session.node.hash,
+                callsign = session.pipeline.atakCallsign ?: session.rememberedCallsign,
+                members = members,
+            )
+        }
+
+        /**
+         * Announce this operator now, asked for from ATAK: the TAK node, which
+         * puts them on the team's map, and the inbox, which makes them
+         * messageable -- a peer needs both (see [InboxAnnouncer]). False with
+         * no session, or when neither went out. Rate is the caller's to limit.
+         */
+        suspend fun announceNow(): Boolean {
+            val session = live ?: return false
+            val node = announce(session)
+            val inbox = inboxAnnouncer.announceNow(System.currentTimeMillis())
+            return node || inbox
         }
 
         /**

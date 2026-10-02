@@ -63,6 +63,7 @@ fun TakSettingsScreen(
     var authorityExpanded by remember { mutableStateOf(false) }
     var tasksExpanded by remember { mutableStateOf(false) }
     var filesExpanded by remember { mutableStateOf(false) }
+    var controlExpanded by remember { mutableStateOf(false) }
 
     Scaffold(
         topBar = {
@@ -127,6 +128,12 @@ fun TakSettingsScreen(
                 onReportNow = viewModel::reportPositionNow,
             )
 
+            AtakControlCard(
+                isExpanded = controlExpanded,
+                onExpandedChange = { controlExpanded = it },
+                allowed = state.atakControl,
+                onToggle = viewModel::setAtakControl,
+            )
             HeldFilesCard(
                 isExpanded = filesExpanded,
                 onExpandedChange = { expanded ->
