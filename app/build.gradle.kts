@@ -463,6 +463,10 @@ dependencies {
     implementation(project(":rns-api"))
     implementation(project(":rns-host"))
     implementation(project(":micron"))
+    // Eridanus rooms (docs/EridanusMerge.md): its app code, and the interface
+    // layer ColumbaApplication implements RnsBackendHost against.
+    implementation(project(":eridanus-rrc"))
+    implementation(project(":eridanus-rns-api"))
 
     // Core
     implementation(libs.core.ktx)
