@@ -18,10 +18,16 @@ class MeshSnapshotTest {
         )
     private val cases = fixture.getJSONArray("snapshots")
 
+    private fun fixture(name: String): JSONArray =
+        JSONObject(
+            checkNotNull(javaClass.classLoader.getResourceAsStream(name)).bufferedReader().use { it.readText() },
+        ).getJSONArray("snapshots")
+
     @Test
-    fun `every fixture snapshot survives a round trip unchanged`() {
-        for (i in 0 until cases.length()) {
-            val case = cases.getJSONObject(i)
+    fun `every interfaces fixture snapshot survives a round trip unchanged`() {
+        val v2 = fixture("columba_mesh_interfaces.json")
+        for (i in 0 until v2.length()) {
+            val case = v2.getJSONObject(i)
             val expected = case.getJSONObject("snapshot")
             val parsed = MeshSnapshot.fromJson(expected)
             assertNotNull(case.getString("name"), parsed)
@@ -29,7 +35,28 @@ class MeshSnapshotTest {
                 "${case.getString("name")}: ${parsed!!.toJson()} != $expected",
                 sameJson(parsed.toJson(), expected),
             )
+            assertEquals(case.getJSONObject("expect").getInt("interfaces"), parsed.interfaces.size)
         }
+    }
+
+    @Test
+    fun `a snapshot without interface fields is read, and loses nothing written back`() {
+        for (i in 0 until cases.length()) {
+            val parsed = MeshSnapshot.fromJson(cases.getJSONObject(i).getJSONObject("snapshot"))
+            assertNotNull(parsed)
+            assertTrue(parsed!!.interfaces.isEmpty())
+            assertEquals(parsed, MeshSnapshot.fromJson(parsed.toJson()))
+        }
+    }
+
+    @Test
+    fun `configured interface types map to carriers`() {
+        assertEquals(MeshCarrier.TCP, MeshCarrier.ofConfigType("TCPClient"))
+        assertEquals(MeshCarrier.BLE, MeshCarrier.ofConfigType("AndroidBLE"))
+        assertEquals(MeshCarrier.LORA, MeshCarrier.ofConfigType("RNode"))
+        assertEquals(MeshCarrier.AUTO, MeshCarrier.ofConfigType("AutoInterface"))
+        assertEquals(MeshCarrier.UDP, MeshCarrier.ofConfigType("UDP"))
+        assertEquals(MeshCarrier.UNKNOWN, MeshCarrier.ofConfigType("I2P"))
     }
 
     /**

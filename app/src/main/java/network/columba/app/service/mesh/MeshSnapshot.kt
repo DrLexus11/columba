@@ -16,7 +16,29 @@ data class MeshSnapshot(
     val node: Node,
     val propagation: Propagation?,
     val peers: List<Peer>,
+    /** Interfaces capability: switches apply at once (Kotlin backend), or are staged (Python). */
+    val interfacesLive: Boolean = false,
+    /** Interfaces capability: a staged switch is waiting for applyInterfaces(). */
+    val interfacesPending: Boolean = false,
+    /** Interfaces capability: every configured interface, with its running state. */
+    val interfaces: List<Iface> = emptyList(),
 ) {
+    /** A configured interface joined with the running stack's state (ColumbaInterface.md, "Interfaces"). */
+    data class Iface(
+        val id: Long,
+        val name: String,
+        val type: String,
+        val carrier: String?,
+        val enabled: Boolean,
+        val online: Boolean,
+        val rxBytes: Long?,
+        val txBytes: Long?,
+        val reason: String?,
+        val carriesCommandPost: Boolean,
+        /** Staged and not yet in effect: wanted differs from what the stack was started with. */
+        val pending: Boolean = false,
+    )
+
     data class Node(
         val uid: String?,
         val callsign: String?,
@@ -61,6 +83,23 @@ data class MeshSnapshot(
                     .put("running", node.running),
             ).put("propagation", propagation?.toJson() ?: JSONObject.NULL)
             .put("peers", JSONArray().also { array -> peers.forEach { array.put(it.toJson()) } })
+            .put("interfaces_live", interfacesLive)
+            .put("interfaces_pending", interfacesPending)
+            .put("interfaces", JSONArray().also { array -> interfaces.forEach { array.put(it.toJson()) } })
+
+    private fun Iface.toJson(): JSONObject =
+        JSONObject()
+            .put("id", id)
+            .put("name", name)
+            .put("type", type)
+            .put("carrier", carrier.orNull())
+            .put("enabled", enabled)
+            .put("online", online)
+            .put("rx_bytes", rxBytes.orNull())
+            .put("tx_bytes", txBytes.orNull())
+            .put("reason", reason.orNull())
+            .put("carries_command_post", carriesCommandPost)
+            .put("pending", pending)
 
     private fun Propagation.toJson(): JSONObject =
         JSONObject()
@@ -84,7 +123,15 @@ data class MeshSnapshot(
             .put("interface", iface.orNull())
 
     companion object {
+        /**
+         * Version 1, still: the interface fields are optional additions a version
+         * 1 client ignores (ColumbaInterface.md, "Interfaces"). A breaking change
+         * is what would bump this.
+         */
         const val VERSION = 1
+
+        /** capabilities() bits. */
+        const val CAP_INTERFACES = 1
 
         /** ATAK's own role for a command post; set on that ATAK, no config here. */
         const val COMMAND_POST_ROLE = "HQ"
@@ -92,7 +139,7 @@ data class MeshSnapshot(
         // JSONObject.put(key, null) removes the key; the contract says null.
         private fun Any?.orNull(): Any = this ?: JSONObject.NULL
 
-        /** Parse a version 1 snapshot. Null for anything else. */
+        /** Parse a version 1 snapshot, interface fields included when present. Null for anything else. */
         fun fromJson(json: JSONObject): MeshSnapshot? {
             if (json.optInt("v", -1) != VERSION) return null
             val node = json.getJSONObject("node")
@@ -133,6 +180,27 @@ data class MeshSnapshot(
                             iface = peer.stringOrNull("interface"),
                         )
                     },
+                interfacesLive = json.optBoolean("interfaces_live", false),
+                interfacesPending = json.optBoolean("interfaces_pending", false),
+                interfaces =
+                    json.optJSONArray("interfaces")?.let { array ->
+                        (0 until array.length()).map { index ->
+                            val i = array.getJSONObject(index)
+                            Iface(
+                                id = i.getLong("id"),
+                                name = i.getString("name"),
+                                type = i.getString("type"),
+                                carrier = i.stringOrNull("carrier"),
+                                enabled = i.getBoolean("enabled"),
+                                online = i.getBoolean("online"),
+                                rxBytes = i.longOrNull("rx_bytes"),
+                                txBytes = i.longOrNull("tx_bytes"),
+                                reason = i.stringOrNull("reason"),
+                                carriesCommandPost = i.getBoolean("carries_command_post"),
+                                pending = i.optBoolean("pending", false),
+                            )
+                        }
+                    }.orEmpty(),
             )
         }
 
@@ -160,6 +228,23 @@ object MeshCarrier {
     const val AUTO = "auto"
     const val LOCAL = "local"
     const val UNKNOWN = "unknown"
+
+    /**
+     * The class of a *configured* interface, from Columba's type string
+     * ("TCPClient", "AndroidBLE", "RNode", "AutoInterface", ...), as against
+     * [of], which reads a running interface's name.
+     */
+    fun ofConfigType(type: String?): String? {
+        if (type.isNullOrBlank()) return null
+        return when {
+            type.contains("RNode") || type.contains("KISS") -> LORA
+            type.contains("BLE") -> BLE
+            type.startsWith("TCP") || type.startsWith("Backbone") -> TCP
+            type.startsWith("UDP") -> UDP
+            type.startsWith("Auto") -> AUTO
+            else -> UNKNOWN
+        }
+    }
 
     /** Null for no interface name at all; [UNKNOWN] for one this does not recognise. */
     fun of(interfaceName: String?): String? {

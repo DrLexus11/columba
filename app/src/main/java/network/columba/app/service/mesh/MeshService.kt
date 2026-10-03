@@ -19,10 +19,20 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeoutOrNull
+import network.columba.app.data.database.entity.InterfaceEntity
 import network.columba.app.mesh.IColumbaMesh
 import network.columba.app.mesh.IColumbaMeshWatcher
+import network.columba.app.repository.InterfaceRepository
 import network.columba.app.repository.SettingsRepository
+import network.columba.app.rns.api.RnsBackend
+import network.columba.app.rns.api.RnsTransportAdmin
+import network.columba.app.rns.host.manager.filterByTransport
+import network.columba.app.rns.host.persistence.ReticulumConfigSnapshot
+import network.columba.app.service.InterfaceConfigManager
+import network.columba.app.service.manager.InterfaceTransportObserver
 import network.columba.app.rns.api.RnsCore
 import network.columba.app.service.PropagationNodeManager
 import network.columba.app.service.tak.CotEndpointManager
@@ -53,7 +63,21 @@ class MeshService : Service() {
 
     @Inject lateinit var settings: SettingsRepository
 
+    // The interfaces capability: the same objects Columba's own interface screen uses.
+    @Inject lateinit var interfaceRepository: InterfaceRepository
+
+    @Inject lateinit var transportAdmin: RnsTransportAdmin
+
+    @Inject lateinit var transportObserver: InterfaceTransportObserver
+
+    @Inject lateinit var rnsBackend: RnsBackend
+
+    @Inject lateinit var configManager: InterfaceConfigManager
+
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+
+    /** Interface commands, one at a time (underCommandLock). */
+    private val commandLock = Mutex()
     private val gate = MeshCallerGate()
     private val watchers = RemoteCallbackList<IColumbaMeshWatcher>()
     private var refresher: Job? = null
@@ -99,6 +123,23 @@ class MeshService : Service() {
         val now = System.currentTimeMillis()
         val view = endpoint.meshView(now)
         val relay = propagation.currentRelay.value
+        val entities = interfaceRepository.allInterfaceEntities.first()
+        val configured = configuredOf(entities)
+        val peers =
+            view?.members.orEmpty().map { member ->
+                val route = route(member.destinationHash)
+                MeshSnapshot.Peer(
+                    uid = TakIdentity.uidFor(member.destinationHash),
+                    callsign = member.callsign.ifBlank { null },
+                    role = member.role.ifBlank { null },
+                    heard = member.heard,
+                    path = route.path,
+                    hops = route.hops,
+                    carrier = NextHop.carrier(route.iface, configured),
+                    iface = route.iface,
+                )
+            }
+        val ifaces = interfaces(peers, entities, configured)
         return MeshSnapshot(
             at = now,
             node =
@@ -116,7 +157,7 @@ class MeshService : Service() {
                         name = it.displayName.ifBlank { null },
                         path = route.path,
                         hops = route.hops,
-                        carrier = MeshCarrier.of(route.iface),
+                        carrier = NextHop.carrier(route.iface, configured),
                         // Not known yet: a command post's propagation node and
                         // its TAK node are different identities on the deck.
                         // Null rather than a guess (ColumbaInterface.md).
@@ -124,21 +165,79 @@ class MeshService : Service() {
                         lastSync = propagation.lastSyncTimestamp.value,
                     )
                 },
-            peers =
-                view?.members.orEmpty().map { member ->
-                    val route = route(member.destinationHash)
-                    MeshSnapshot.Peer(
-                        uid = TakIdentity.uidFor(member.destinationHash),
-                        callsign = member.callsign.ifBlank { null },
-                        role = member.role.ifBlank { null },
-                        heard = member.heard,
-                        path = route.path,
-                        hops = route.hops,
-                        carrier = MeshCarrier.of(route.iface),
-                        iface = route.iface,
-                    )
-                },
+            peers = peers,
+            interfacesLive = ifaces.live,
+            interfacesPending = ifaces.pending,
+            interfaces = ifaces.list,
         )
+    }
+
+    private class Ifaces(val live: Boolean, val pending: Boolean, val list: List<MeshSnapshot.Iface>)
+
+    private fun configuredOf(entities: List<InterfaceEntity>) = entities.map { NextHop.Configured(it.name, it.type) }
+
+    /**
+     * Every configured interface (Columba's database), joined by name -- as
+     * Columba's own interface screen joins them -- with the running stack's state.
+     * A failed read of that state throws: the snapshot pass is abandoned and the
+     * last known one kept, rather than calling every interface down.
+     */
+    @Suppress("UNCHECKED_CAST")
+    private suspend fun interfaces(
+        peers: List<MeshSnapshot.Peer>,
+        entities: List<InterfaceEntity>,
+        configured: List<NextHop.Configured>,
+    ): Ifaces {
+        val running =
+            ((transportAdmin.getDebugInfo()["interfaces"] as? List<*>) ?: emptyList<Any>())
+                .mapNotNull { it as? Map<String, Any?> }
+                .associateBy { it["name"] as? String }
+        val live = rnsBackend.capabilities.value.interfaces.hotReloadInterfaces
+        // The interfaces the command post's paths leave through (NextHop: the
+        // backends report a configured name, not "Type[name/address]").
+        val commandPostRoutes =
+            peers
+                .filter { it.role == MeshSnapshot.COMMAND_POST_ROLE && it.path }
+                .mapNotNull { peer -> NextHop.configured(peer.iface, configured)?.name }
+                .toSet()
+        val staged = stagedNames(live)
+        val list =
+            entities.map { entity ->
+                val run = running[entity.name]
+                MeshSnapshot.Iface(
+                    id = entity.id,
+                    name = entity.name,
+                    type = entity.type,
+                    carrier = MeshCarrier.ofConfigType(entity.type),
+                    enabled = entity.enabled,
+                    online = run?.get("online") as? Boolean ?: false,
+                    rxBytes = (run?.get("rx_bytes") as? Number)?.toLong(),
+                    txBytes = (run?.get("tx_bytes") as? Number)?.toLong(),
+                    reason = (run?.get("status_reason") as? String)?.takeIf { it.isNotBlank() },
+                    carriesCommandPost = entity.name in commandPostRoutes,
+                    pending = entity.name in staged,
+                )
+            }
+        return Ifaces(live, list.any { it.pending }, list)
+    }
+
+    /**
+     * Staged, where switches are not live: the interfaces whose wanted state
+     * differs from the configuration the stack was last started with
+     * (ReticulumConfigSnapshot, written on every start and Apply). Both are
+     * filtered for the current transport, so an interface the transport leaves
+     * out, or one that failed to come up, is not staged -- comparing with what
+     * is running called those pending for ever. Empty with no record to compare.
+     */
+    private suspend fun stagedNames(live: Boolean): Set<String> {
+        if (live) return emptySet()
+        val applied =
+            ReticulumConfigSnapshot.read(this)?.configWithoutKey?.enabledInterfaces?.mapTo(HashSet()) { it.name }
+                ?: return emptySet()
+        val wanted =
+            filterByTransport(interfaceRepository.enabledInterfaces.first(), transportObserver.snapshotTransport())
+                .mapTo(HashSet()) { it.name }
+        return (wanted - applied) + (applied - wanted)
     }
 
     private class Route(val path: Boolean, val hops: Int?, val iface: String?)
@@ -206,6 +305,25 @@ class MeshService : Service() {
                 Log.i(TAG, "announce from ${packages.joinToString()}: ${resultName(result)}")
                 return result
             }
+
+            override fun capabilities(): Int = if (allowed(callerPackages())) MeshSnapshot.CAP_INTERFACES else 0
+
+            override fun setInterfaceEnabled(
+                id: Long,
+                enabled: Boolean,
+            ): Int {
+                val packages = callerPackages()
+                val result = setInterfaceFor(packages, id, enabled)
+                Log.i(TAG, "setInterfaceEnabled($id, $enabled) from ${packages.joinToString()}: ${resultName(result)}")
+                return result
+            }
+
+            override fun applyInterfaces(): Int {
+                val packages = callerPackages()
+                val result = applyInterfacesFor(packages)
+                Log.i(TAG, "applyInterfaces from ${packages.joinToString()}: ${resultName(result)}")
+                return result
+            }
         }
 
     private fun announceFor(packages: List<String>): Int {
@@ -226,6 +344,71 @@ class MeshService : Service() {
     private fun announced(): Boolean =
         runBlocking(Dispatchers.IO) { withTimeoutOrNull(ANNOUNCE_TIMEOUT_MS) { endpoint.announceNow() } } == true // THREADING: allowed
 
+    private fun guardView(snapshot: MeshSnapshot) =
+        snapshot.interfaces.map { InterfaceGuard.Iface(it.id, it.enabled, it.online, it.carriesCommandPost) }
+
+    /**
+     * One interface command at a time, decided on a snapshot built inside the
+     * lock -- not the cached one, whose command post routes may be stale. Binder
+     * serves calls concurrently: two switches, each checked while the other's
+     * interface was still online, could together cut this phone off. Null when
+     * the state could not be read in time.
+     */
+    private fun <T> underCommandLock(block: suspend (MeshSnapshot) -> T): T? =
+        runBlocking(Dispatchers.IO) { // THREADING: allowed
+            withTimeoutOrNull(COMMAND_TIMEOUT_MS) {
+                commandLock.withLock { runCatching { build() }.getOrNull()?.let { block(it) } }
+            }
+        }
+
+    private fun setInterfaceFor(
+        packages: List<String>,
+        id: Long,
+        enabled: Boolean,
+    ): Int =
+        when {
+            !allowed(packages) -> ERR_CALLER
+            !controlAllowed() -> ERR_CONTROL_OFF
+            else -> underCommandLock { fresh -> switchInterface(fresh, id, enabled) } ?: ERR_NOT_READY
+        }
+
+    private suspend fun switchInterface(
+        fresh: MeshSnapshot,
+        id: Long,
+        enabled: Boolean,
+    ): Int =
+        when (InterfaceGuard.check(guardView(fresh), id, enabled)) {
+            InterfaceGuard.Verdict.UNKNOWN_INTERFACE -> ERR_UNKNOWN_INTERFACE
+            InterfaceGuard.Verdict.WOULD_ISOLATE -> ERR_WOULD_ISOLATE
+            InterfaceGuard.Verdict.OK -> {
+                interfaceRepository.toggleInterfaceEnabled(id, enabled)
+                if (fresh.interfacesLive) {
+                    // As Columba's own screen does on the Kotlin backend.
+                    val configs = interfaceRepository.enabledInterfaces.first()
+                    transportAdmin.reloadInterfaces(filterByTransport(configs, transportObserver.snapshotTransport()))
+                    OK
+                } else {
+                    OK_PENDING
+                }
+            }
+        }
+
+    private fun applyInterfacesFor(packages: List<String>): Int =
+        when {
+            !allowed(packages) -> ERR_CALLER
+            !controlAllowed() -> ERR_CONTROL_OFF
+            else -> underCommandLock { fresh -> applyStaged(fresh) } ?: ERR_NOT_READY
+        }
+
+    private fun applyStaged(fresh: MeshSnapshot): Int =
+        when {
+            fresh.interfacesLive || !fresh.interfacesPending -> OK
+            InterfaceGuard.checkApply(guardView(fresh)) == InterfaceGuard.Verdict.WOULD_ISOLATE -> ERR_WOULD_ISOLATE
+            // The same path as Columba's own "Apply & Restart": it takes seconds and
+            // restarts :reticulum, so it runs on its own; the reply says it started.
+            else -> OK.also { scope.launch { configManager.applyInterfaceChanges() } }
+        }
+
     companion object {
         private const val TAG = "MeshService"
 
@@ -233,12 +416,16 @@ class MeshService : Service() {
         const val REFRESH_MS = 2_000L
 
         private const val ANNOUNCE_TIMEOUT_MS = 10_000L
+        private const val COMMAND_TIMEOUT_MS = 10_000L
 
         const val OK = 0
         const val ERR_CALLER = 1
         const val ERR_CONTROL_OFF = 2
         const val ERR_NOT_READY = 3
         const val ERR_RATE_LIMITED = 4
+        const val ERR_WOULD_ISOLATE = 5
+        const val ERR_UNKNOWN_INTERFACE = 6
+        const val OK_PENDING = 7
 
         /** One floor for the process: a rebound service must not reset it. */
         private val floor = MeshAnnounceFloor()
@@ -250,6 +437,9 @@ class MeshService : Service() {
                 ERR_CONTROL_OFF -> "refused: control off"
                 ERR_NOT_READY -> "not ready"
                 ERR_RATE_LIMITED -> "rate limited"
+                ERR_WOULD_ISOLATE -> "refused: would isolate"
+                ERR_UNKNOWN_INTERFACE -> "unknown interface"
+                OK_PENDING -> "staged"
                 else -> "code $code"
             }
 
