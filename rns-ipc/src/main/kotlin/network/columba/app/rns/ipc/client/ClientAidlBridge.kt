@@ -15,7 +15,6 @@ import network.columba.app.rns.ipc.callback.IRnsIntCallback
 import network.columba.app.rns.ipc.callback.IRnsResultCallback
 import network.columba.app.rns.ipc.callback.IRnsStringCallback
 import network.columba.app.rns.ipc.callback.IRnsStringListCallback
-import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 
@@ -26,9 +25,9 @@ import kotlin.coroutines.resumeWithException
  *
  * Cancellation semantics: AIDL `oneway` calls don't carry a cancellation
  * signal across the wire, so cancellation here means "drop the result when
- * it arrives." An [AtomicBoolean] guards each callback so a late server
- * response after the caller cancelled is silently discarded rather than
- * resuming an already-resumed continuation.
+ * it arrives." A [ContinuationSlot] guards each callback: the first answer
+ * takes the continuation, and a late one, or one after the caller cancelled,
+ * finds the slot empty and is discarded.
  *
  * Binder exceptions ([DeadObjectException] from a crashed remote, plus the
  * broader [RemoteException]) are translated to
@@ -39,52 +38,42 @@ import kotlin.coroutines.resumeWithException
 internal suspend inline fun awaitResult(
     crossinline call: (IRnsResultCallback) -> Unit,
 ): Bundle = suspendCancellableCoroutine { cont ->
-    val delivered = AtomicBoolean(false)
+    val slot = ContinuationSlot(cont)
     val cb = object : IRnsResultCallback.Stub() {
         override fun onSuccess(resultPayload: Bundle?) {
-            if (delivered.compareAndSet(false, true)) {
-                cont.resume(resultPayload ?: Bundle.EMPTY)
-            }
+            slot.take()?.resume(resultPayload ?: Bundle.EMPTY)
         }
 
         override fun onError(error: RnsError?) {
-            if (delivered.compareAndSet(false, true)) {
-                cont.resumeWithException(RnsException(error ?: genericIpcFailure("onError with null error")))
-            }
+            slot.take()?.resumeWithException(RnsException(error ?: genericIpcFailure("onError with null error")))
         }
     }
     try {
         call(cb)
     } catch (e: RemoteException) {
-        if (delivered.compareAndSet(false, true)) {
-            cont.resumeWithException(remoteToRnsException(e))
-        }
+        slot.take()?.resumeWithException(remoteToRnsException(e))
     }
-    // No invokeOnCancellation hook — we cannot recall a oneway AIDL call; the
-    // AtomicBoolean simply drops the late server response.
+    // A oneway AIDL call cannot be recalled: on cancellation the slot is
+    // emptied, and the late server response finds nothing to resume.
 }
 
 internal suspend inline fun awaitBool(
     crossinline call: (IRnsBoolCallback) -> Unit,
 ): Boolean = suspendCancellableCoroutine { cont ->
-    val delivered = AtomicBoolean(false)
+    val slot = ContinuationSlot(cont)
     val cb = object : IRnsBoolCallback.Stub() {
         override fun onSuccess(value: Boolean) {
-            if (delivered.compareAndSet(false, true)) cont.resume(value)
+            slot.take()?.resume(value)
         }
 
         override fun onError(error: RnsError?) {
-            if (delivered.compareAndSet(false, true)) {
-                cont.resumeWithException(RnsException(error ?: genericIpcFailure("onError with null error")))
-            }
+            slot.take()?.resumeWithException(RnsException(error ?: genericIpcFailure("onError with null error")))
         }
     }
     try {
         call(cb)
     } catch (e: RemoteException) {
-        if (delivered.compareAndSet(false, true)) {
-            cont.resumeWithException(remoteToRnsException(e))
-        }
+        slot.take()?.resumeWithException(remoteToRnsException(e))
     }
 }
 
@@ -95,124 +84,100 @@ internal suspend inline fun awaitBool(
 internal suspend inline fun awaitNullableInt(
     crossinline call: (IRnsIntCallback) -> Unit,
 ): Int? = suspendCancellableCoroutine { cont ->
-    val delivered = AtomicBoolean(false)
+    val slot = ContinuationSlot(cont)
     val cb = object : IRnsIntCallback.Stub() {
         override fun onSuccess(value: Int, hasValue: Boolean) {
-            if (delivered.compareAndSet(false, true)) {
-                cont.resume(if (hasValue) value else null)
-            }
+            slot.take()?.resume(if (hasValue) value else null)
         }
 
         override fun onError(error: RnsError?) {
-            if (delivered.compareAndSet(false, true)) {
-                cont.resumeWithException(RnsException(error ?: genericIpcFailure("onError with null error")))
-            }
+            slot.take()?.resumeWithException(RnsException(error ?: genericIpcFailure("onError with null error")))
         }
     }
     try {
         call(cb)
     } catch (e: RemoteException) {
-        if (delivered.compareAndSet(false, true)) {
-            cont.resumeWithException(remoteToRnsException(e))
-        }
+        slot.take()?.resumeWithException(remoteToRnsException(e))
     }
 }
 
 internal suspend inline fun awaitNullableString(
     crossinline call: (IRnsStringCallback) -> Unit,
 ): String? = suspendCancellableCoroutine { cont ->
-    val delivered = AtomicBoolean(false)
+    val slot = ContinuationSlot(cont)
     val cb = object : IRnsStringCallback.Stub() {
         override fun onSuccess(value: String?) {
-            if (delivered.compareAndSet(false, true)) cont.resume(value)
+            slot.take()?.resume(value)
         }
 
         override fun onError(error: RnsError?) {
-            if (delivered.compareAndSet(false, true)) {
-                cont.resumeWithException(RnsException(error ?: genericIpcFailure("onError with null error")))
-            }
+            slot.take()?.resumeWithException(RnsException(error ?: genericIpcFailure("onError with null error")))
         }
     }
     try {
         call(cb)
     } catch (e: RemoteException) {
-        if (delivered.compareAndSet(false, true)) {
-            cont.resumeWithException(remoteToRnsException(e))
-        }
+        slot.take()?.resumeWithException(remoteToRnsException(e))
     }
 }
 
 internal suspend inline fun awaitFloat(
     crossinline call: (IRnsFloatCallback) -> Unit,
 ): Float = suspendCancellableCoroutine { cont ->
-    val delivered = AtomicBoolean(false)
+    val slot = ContinuationSlot(cont)
     val cb = object : IRnsFloatCallback.Stub() {
         override fun onSuccess(value: Float) {
-            if (delivered.compareAndSet(false, true)) cont.resume(value)
+            slot.take()?.resume(value)
         }
 
         override fun onError(error: RnsError?) {
-            if (delivered.compareAndSet(false, true)) {
-                cont.resumeWithException(RnsException(error ?: genericIpcFailure("onError with null error")))
-            }
+            slot.take()?.resumeWithException(RnsException(error ?: genericIpcFailure("onError with null error")))
         }
     }
     try {
         call(cb)
     } catch (e: RemoteException) {
-        if (delivered.compareAndSet(false, true)) {
-            cont.resumeWithException(remoteToRnsException(e))
-        }
+        slot.take()?.resumeWithException(remoteToRnsException(e))
     }
 }
 
 internal suspend inline fun awaitStringList(
     crossinline call: (IRnsStringListCallback) -> Unit,
 ): List<String> = suspendCancellableCoroutine { cont ->
-    val delivered = AtomicBoolean(false)
+    val slot = ContinuationSlot(cont)
     val cb = object : IRnsStringListCallback.Stub() {
         override fun onSuccess(values: MutableList<String>?) {
-            if (delivered.compareAndSet(false, true)) {
-                cont.resume(values?.toList() ?: emptyList())
-            }
+            slot.take()?.resume(values?.toList() ?: emptyList())
         }
 
         override fun onError(error: RnsError?) {
-            if (delivered.compareAndSet(false, true)) {
-                cont.resumeWithException(RnsException(error ?: genericIpcFailure("onError with null error")))
-            }
+            slot.take()?.resumeWithException(RnsException(error ?: genericIpcFailure("onError with null error")))
         }
     }
     try {
         call(cb)
     } catch (e: RemoteException) {
-        if (delivered.compareAndSet(false, true)) {
-            cont.resumeWithException(remoteToRnsException(e))
-        }
+        slot.take()?.resumeWithException(remoteToRnsException(e))
     }
 }
 
 internal suspend inline fun awaitNullableByteArray(
     crossinline call: (IRnsByteArrayCallback) -> Unit,
 ): ByteArray? = suspendCancellableCoroutine { cont ->
-    val delivered = AtomicBoolean(false)
+    val slot = ContinuationSlot(cont)
     val cb = object : IRnsByteArrayCallback.Stub() {
         override fun onSuccess(data: ByteArray?) {
-            if (delivered.compareAndSet(false, true)) cont.resume(data)
+            slot.take()?.resume(data)
         }
 
         override fun onError(error: RnsError?) {
-            if (delivered.compareAndSet(false, true)) {
-                cont.resumeWithException(RnsException(error ?: genericIpcFailure("onError with null error")))
-            }
+            slot.take()?.resumeWithException(RnsException(error ?: genericIpcFailure("onError with null error")))
         }
     }
     try {
         call(cb)
     } catch (e: RemoteException) {
-        if (delivered.compareAndSet(false, true)) {
-            cont.resumeWithException(remoteToRnsException(e))
-        }
+        slot.take()?.resumeWithException(remoteToRnsException(e))
     }
 }
 

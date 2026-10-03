@@ -90,6 +90,7 @@ class MeshService : Service() {
     }
 
     override fun onDestroy() {
+        binder.detach()
         scope.cancel()
         watchers.kill()
         super.onDestroy()
@@ -278,53 +279,73 @@ class MeshService : Service() {
             signatures.orEmpty().map { sha256(it.toByteArray()) }
         }.getOrDefault(emptyList())
 
-    private val binder =
-        object : IColumbaMesh.Stub() {
-            override fun version(): Int = if (allowed(callerPackages())) MeshSnapshot.VERSION else -1
+    private val binder = MeshBinder(this)
 
-            override fun snapshot(): String {
-                if (!allowed(callerPackages())) return ""
-                val snapshot = current ?: runBlocking { runCatching { build() }.getOrNull() } ?: return "" // THREADING: allowed
-                return snapshot.toJson().toString()
-            }
+    /**
+     * The binder ATAK holds. Not an inner object of the service: the caller's
+     * process keeps a binder reachable until its own garbage collection, and
+     * an inner object kept the destroyed service with it -- LeakCanary caught
+     * one per ATAK restart (2026-10-03). The service is let go in onDestroy;
+     * a call after that is answered as "not ready", never with an exception,
+     * which would reach ATAK as an unchecked one.
+     */
+    private class MeshBinder(
+        service: MeshService,
+    ) : IColumbaMesh.Stub() {
+        @Volatile private var service: MeshService? = service
 
-            override fun watch(watcher: IColumbaMeshWatcher?) {
-                if (watcher == null || !allowed(callerPackages())) return
-                watchers.register(watcher)
-                current?.let { runCatching { watcher.changed(it.toJson().toString()) } }
-            }
-
-            override fun unwatch(watcher: IColumbaMeshWatcher?) {
-                if (watcher != null) watchers.unregister(watcher)
-            }
-
-            override fun announce(): Int {
-                val packages = callerPackages()
-                val result = announceFor(packages)
-                // Every command, with its caller and outcome (OpenDecisions 1).
-                Log.i(TAG, "announce from ${packages.joinToString()}: ${resultName(result)}")
-                return result
-            }
-
-            override fun capabilities(): Int = if (allowed(callerPackages())) MeshSnapshot.CAP_INTERFACES else 0
-
-            override fun setInterfaceEnabled(
-                id: Long,
-                enabled: Boolean,
-            ): Int {
-                val packages = callerPackages()
-                val result = setInterfaceFor(packages, id, enabled)
-                Log.i(TAG, "setInterfaceEnabled($id, $enabled) from ${packages.joinToString()}: ${resultName(result)}")
-                return result
-            }
-
-            override fun applyInterfaces(): Int {
-                val packages = callerPackages()
-                val result = applyInterfacesFor(packages)
-                Log.i(TAG, "applyInterfaces from ${packages.joinToString()}: ${resultName(result)}")
-                return result
-            }
+        fun detach() {
+            service = null
         }
+
+        override fun version(): Int {
+            val s = service ?: return MeshSnapshot.VERSION
+            return if (s.allowed(s.callerPackages())) MeshSnapshot.VERSION else -1
+        }
+
+        override fun snapshot(): String {
+            val s = service?.takeIf { it.allowed(it.callerPackages()) } ?: return ""
+            val snapshot = s.current ?: runBlocking { runCatching { s.build() }.getOrNull() } ?: return "" // THREADING: allowed
+            return snapshot.toJson().toString()
+        }
+
+        override fun watch(watcher: IColumbaMeshWatcher?) {
+            val s = service ?: return
+            if (watcher == null || !s.allowed(s.callerPackages())) return
+            s.watchers.register(watcher)
+            s.current?.let { runCatching { watcher.changed(it.toJson().toString()) } }
+        }
+
+        override fun unwatch(watcher: IColumbaMeshWatcher?) {
+            if (watcher != null) service?.watchers?.unregister(watcher)
+        }
+
+        override fun capabilities(): Int {
+            val s = service ?: return 0
+            return if (s.allowed(s.callerPackages())) MeshSnapshot.CAP_INTERFACES else 0
+        }
+
+        override fun announce(): Int = command("announce") { s, packages -> s.announceFor(packages) }
+
+        override fun setInterfaceEnabled(
+            id: Long,
+            enabled: Boolean,
+        ): Int = command("setInterfaceEnabled($id, $enabled)") { s, packages -> s.setInterfaceFor(packages, id, enabled) }
+
+        override fun applyInterfaces(): Int = command("applyInterfaces") { s, packages -> s.applyInterfacesFor(packages) }
+
+        /** A command, logged with its caller and outcome (OpenDecisions 1). */
+        private fun command(
+            name: String,
+            run: (MeshService, List<String>) -> Int,
+        ): Int {
+            val s = service ?: return ERR_NOT_READY
+            val packages = s.callerPackages()
+            val result = run(s, packages)
+            Log.i(TAG, "$name from ${packages.joinToString()}: ${resultName(result)}")
+            return result
+        }
+    }
 
     private fun announceFor(packages: List<String>): Int {
         val now = System.currentTimeMillis()
