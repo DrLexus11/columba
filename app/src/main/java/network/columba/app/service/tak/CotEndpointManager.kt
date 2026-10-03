@@ -552,8 +552,10 @@ class CotEndpointManager
                 // member, not with the greeting: it is the member who announced
                 // that needs it.
                 val member = announceEvent.destinationHash
-                session.ownPosition.answerTo(TakIdentity.uidFor(member), System.currentTimeMillis())?.let { frame ->
-                    sendTo(member, frame)
+                val memberUid = TakIdentity.uidFor(member)
+                val answeredAt = System.currentTimeMillis()
+                session.ownPosition.offerFor(memberUid, answeredAt)?.let { frame ->
+                    if (sendTo(member, frame)) session.ownPosition.answered(memberUid, answeredAt)
                 }
             }
         }
@@ -716,7 +718,7 @@ class CotEndpointManager
             val interval = session.atakCadence.statedIntervalMinutes()
             val frame = PositionCodec.encode(fix.copy(intervalMin = interval))
             fanOut(frame, session)
-            session.ownPosition.record(frame, interval, now)
+            session.ownPosition.record(frame, interval, fixTimeMs(fix, now), now)
             return true
         }
 
@@ -752,9 +754,16 @@ class CotEndpointManager
             if (atakIsReporting) return false
             val own = fix.copy(senderId = TakMembership.senderIdFor(session.node.hash))
             val frame = PositionCodec.encode(own)
-            session.ownPosition.record(frame, own.intervalMin, System.currentTimeMillis())
+            val now = System.currentTimeMillis()
+            session.ownPosition.record(frame, own.intervalMin, fixTimeMs(own, now), now)
             return fanOut(frame, session) > 0
         }
+
+        /** When [fix] was taken, or [nowMs] if it does not say. */
+        private fun fixTimeMs(
+            fix: PositionCodec.Fix,
+            nowMs: Long,
+        ): Long = if (fix.fixUnixSeconds > 0) fix.fixUnixSeconds * 1000 else nowMs
 
         /** A team member as the ATAK plugin's mesh panel shows it. */
         class MemberView(val destinationHash: ByteArray, val callsign: String, val role: String, val heard: Long)
