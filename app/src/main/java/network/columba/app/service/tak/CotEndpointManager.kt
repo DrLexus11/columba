@@ -546,6 +546,15 @@ class CotEndpointManager
                     announce(session)
                     inboxAnnouncer.announceIfDue(System.currentTimeMillis())
                 }
+                // And where we are, to that member alone: a phone that
+                // restarted has forgotten it, and a node that is not moving may
+                // not report again for minutes (OwnPosition). Limited per
+                // member, not with the greeting: it is the member who announced
+                // that needs it.
+                val member = announceEvent.destinationHash
+                session.ownPosition.answerTo(TakIdentity.uidFor(member), System.currentTimeMillis())?.let { frame ->
+                    sendTo(member, frame)
+                }
             }
         }
 
@@ -562,9 +571,15 @@ class CotEndpointManager
             // This is what makes ATAK as reliable as Columba when both are
             // running -- Columba keeps a message because LXMF persists it, and
             // until now ATAK kept nothing at all.
-            val missed = session.replay.pending(System.currentTimeMillis())
+            val now = System.currentTimeMillis()
+            // Then where every peer was last drawn: a restarted ATAK has
+            // forgotten them all, and a peer that is not moving may not report
+            // for minutes (LastPositions). As drawn, so an old one arrives stale.
+            val missed =
+                session.replay.pending(now) +
+                    session.renderer.lastPositions.forReplay(now).map { it.toByteArray(Charsets.UTF_8) }
             if (missed.isNotEmpty()) {
-                Log.i(TAG, "Replaying ${missed.size} held event(s) to a new client")
+                Log.i(TAG, "Replaying ${missed.size} held event(s) and positions to a new client")
                 withContext(Dispatchers.IO) {
                     for (payload in missed) {
                         try {
@@ -696,8 +711,12 @@ class CotEndpointManager
             // Before the gate: ATAK reporting at all is what lets this handset
             // stand by, whether or not this particular report goes on the air.
             session.atakCadence.reported()
-            if (!session.gate.allows(fix, System.currentTimeMillis())) return true
-            fanOut(PositionCodec.encode(fix.copy(intervalMin = session.atakCadence.statedIntervalMinutes())), session)
+            val now = System.currentTimeMillis()
+            if (!session.gate.allows(fix, now)) return true
+            val interval = session.atakCadence.statedIntervalMinutes()
+            val frame = PositionCodec.encode(fix.copy(intervalMin = interval))
+            fanOut(frame, session)
+            session.ownPosition.record(frame, interval, now)
             return true
         }
 
@@ -732,7 +751,9 @@ class CotEndpointManager
             val session = live ?: return false
             if (atakIsReporting) return false
             val own = fix.copy(senderId = TakMembership.senderIdFor(session.node.hash))
-            return fanOut(PositionCodec.encode(own), session) > 0
+            val frame = PositionCodec.encode(own)
+            session.ownPosition.record(frame, own.intervalMin, System.currentTimeMillis())
+            return fanOut(frame, session) > 0
         }
 
         /** A team member as the ATAK plugin's mesh panel shows it. */
@@ -1116,6 +1137,9 @@ class CotEndpointManager
 
             /** When ATAK reports its own position, and how long a silence means it has stopped. */
             val atakCadence = AtakCadence()
+
+            /** The last position this node reported, for a member that has just announced. */
+            val ownPosition = OwnPosition()
 
             /**
              * Sent messages whose delivery proof will draw their tick.

@@ -29,6 +29,9 @@ class CotRenderer(
     private val positionStaleMs: Long,
     private val chatStaleMs: Long,
 ) {
+    /** Each peer's latest drawn position, replayed to an ATAK that attaches (LastPositions). */
+    val lastPositions = LastPositions()
+
     /** What a frame turned out to be. */
     sealed interface Rendered {
         /** CoT to write to every connected client. */
@@ -119,15 +122,12 @@ class CotRenderer(
         // hash, so a peer's track carries the same UID as everything else that
         // node sends rather than a track of its own.
         val sender = registry.resolveSenderId(fix.senderId, now) ?: return Rendered.Handled
-        return Rendered.Cot(
-            CotPosition.buildCot(
-                fix,
-                TakIdentity.uidFor(sender),
-                callsignOf(sender),
-                staleFor(fix),
-                team = team,
-            ),
-        )
+        val uid = TakIdentity.uidFor(sender)
+        val staleMs = staleFor(fix)
+        val xml = CotPosition.buildCot(fix, uid, callsignOf(sender), staleMs, receivedAtMs = now, team = team)
+        // Kept for an ATAK that attaches later (LastPositions).
+        lastPositions.remember(uid, xml, now + staleMs)
+        return Rendered.Cot(xml)
     }
 
     /**
