@@ -1,6 +1,7 @@
 // Columba's mesh interface, version 1, with the interfaces capability: the contract with the ATAK plugin.
 // Defined in reticulum-atak's docs/ColumbaInterface.md; this file and the
-// plugin's copy must stay identical, and a change to either is a version bump.
+// plugin's copy must stay identical. A breaking change bumps the version; an
+// additive one appends methods behind a capability bit (capabilities()).
 package network.columba.app.mesh;
 
 import network.columba.app.mesh.IColumbaMeshWatcher;
