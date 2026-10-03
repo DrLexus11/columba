@@ -38,7 +38,8 @@
             "rx_bytes": 123456,
             "tx_bytes": 65432,
             "reason": null,
-            "carries_command_post": true
+            "carries_command_post": true,
+            "pending": false
           },
           {
             "id": 2,
@@ -50,7 +51,8 @@
             "rx_bytes": null,
             "tx_bytes": null,
             "reason": "Bluetooth is off",
-            "carries_command_post": false
+            "carries_command_post": false,
+            "pending": false
           },
           {
             "id": 3,
@@ -62,7 +64,8 @@
             "rx_bytes": 2048,
             "tx_bytes": 1024,
             "reason": null,
-            "carries_command_post": false
+            "carries_command_post": false,
+            "pending": true
           }
         ]
       },
@@ -102,7 +105,8 @@
             "rx_bytes": 1,
             "tx_bytes": 2,
             "reason": null,
-            "carries_command_post": false
+            "carries_command_post": false,
+            "pending": false
           }
         ]
       },
@@ -111,6 +115,59 @@
         "pending_line": "Interfaces: switches apply at once",
         "rows": [
           "RNode · LoRa · up"
+        ]
+      }
+    },
+    {
+      "name": "staged-on-beside-one-not-running",
+      "snapshot": {
+        "v": 1,
+        "at": 1790000000000,
+        "node": {
+          "uid": "urtn-00112233445566778899aabbccddeeff",
+          "callsign": "ALPHA-1",
+          "control": true,
+          "running": true
+        },
+        "propagation": null,
+        "peers": [],
+        "interfaces_live": false,
+        "interfaces_pending": true,
+        "interfaces": [
+          {
+            "id": 1,
+            "name": "Board TCP",
+            "type": "TCPClient",
+            "carrier": "tcp",
+            "enabled": true,
+            "online": false,
+            "rx_bytes": null,
+            "tx_bytes": null,
+            "reason": null,
+            "carries_command_post": false,
+            "pending": true
+          },
+          {
+            "id": 4,
+            "name": "Hotspot TCP",
+            "type": "TCPClient",
+            "carrier": "tcp",
+            "enabled": true,
+            "online": false,
+            "rx_bytes": null,
+            "tx_bytes": null,
+            "reason": null,
+            "carries_command_post": false,
+            "pending": false
+          }
+        ]
+      },
+      "expect": {
+        "interfaces": 2,
+        "pending_line": "Interfaces: 1 change pending · Apply restarts the mesh here",
+        "rows": [
+          "Board TCP · TCP · on (pending)",
+          "Hotspot TCP · TCP · down"
         ]
       }
     }

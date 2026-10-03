@@ -68,6 +68,7 @@ import dagger.hilt.android.qualifiers.ApplicationContext
  * routes.
  */
 @Singleton
+@Suppress("TooManyFunctions") // The endpoint: session, ATAK clients, mesh forwarding, and the mesh interface
 class CotEndpointManager
     @Inject
     constructor(

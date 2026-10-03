@@ -35,6 +35,8 @@ data class MeshSnapshot(
         val txBytes: Long?,
         val reason: String?,
         val carriesCommandPost: Boolean,
+        /** Staged and not yet in effect: wanted differs from what the stack was started with. */
+        val pending: Boolean = false,
     )
 
     data class Node(
@@ -97,6 +99,7 @@ data class MeshSnapshot(
             .put("tx_bytes", txBytes.orNull())
             .put("reason", reason.orNull())
             .put("carries_command_post", carriesCommandPost)
+            .put("pending", pending)
 
     private fun Propagation.toJson(): JSONObject =
         JSONObject()
@@ -194,6 +197,7 @@ data class MeshSnapshot(
                                 txBytes = i.longOrNull("tx_bytes"),
                                 reason = i.stringOrNull("reason"),
                                 carriesCommandPost = i.getBoolean("carries_command_post"),
+                                pending = i.optBoolean("pending", false),
                             )
                         }
                     }.orEmpty(),

@@ -24,13 +24,16 @@ object InterfaceGuard {
         id: Long,
         enable: Boolean,
     ): Verdict {
-        val target = ifaces.find { it.id == id } ?: return Verdict.UNKNOWN_INTERFACE
-        if (enable) return Verdict.OK
-        if (target.carriesCommandPost) return Verdict.WOULD_ISOLATE
+        val target = ifaces.find { it.id == id }
         // What would still carry traffic: enabled and actually online now. An
         // interface enabled but not yet up does not count -- it may never come up.
         val remaining = ifaces.count { it.id != id && it.enabled && it.online }
-        return if (remaining == 0) Verdict.WOULD_ISOLATE else Verdict.OK
+        return when {
+            target == null -> Verdict.UNKNOWN_INTERFACE
+            enable -> Verdict.OK
+            target.carriesCommandPost || remaining == 0 -> Verdict.WOULD_ISOLATE
+            else -> Verdict.OK
+        }
     }
 
     /**

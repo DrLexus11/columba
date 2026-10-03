@@ -19,6 +19,8 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeoutOrNull
 import network.columba.app.data.database.entity.InterfaceEntity
 import network.columba.app.mesh.IColumbaMesh
@@ -28,6 +30,7 @@ import network.columba.app.repository.SettingsRepository
 import network.columba.app.rns.api.RnsBackend
 import network.columba.app.rns.api.RnsTransportAdmin
 import network.columba.app.rns.host.manager.filterByTransport
+import network.columba.app.rns.host.persistence.ReticulumConfigSnapshot
 import network.columba.app.service.InterfaceConfigManager
 import network.columba.app.service.manager.InterfaceTransportObserver
 import network.columba.app.rns.api.RnsCore
@@ -72,6 +75,9 @@ class MeshService : Service() {
     @Inject lateinit var configManager: InterfaceConfigManager
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+
+    /** Interface commands, one at a time (underCommandLock). */
+    private val commandLock = Mutex()
     private val gate = MeshCallerGate()
     private val watchers = RemoteCallbackList<IColumbaMeshWatcher>()
     private var refresher: Job? = null
@@ -168,6 +174,8 @@ class MeshService : Service() {
 
     private class Ifaces(val live: Boolean, val pending: Boolean, val list: List<MeshSnapshot.Iface>)
 
+    private fun configuredOf(entities: List<InterfaceEntity>) = entities.map { NextHop.Configured(it.name, it.type) }
+
     /**
      * Every configured interface (Columba's database), joined by name -- as
      * Columba's own interface screen joins them -- with the running stack's state.
@@ -175,14 +183,6 @@ class MeshService : Service() {
      * last known one kept, rather than calling every interface down.
      */
     @Suppress("UNCHECKED_CAST")
-    private fun configuredOf(entities: List<InterfaceEntity>) = entities.map { NextHop.Configured(it.name, it.type) }
-
-    /** For the commands: the guard decides on the interfaces as they are now. */
-    private suspend fun interfaces(peers: List<MeshSnapshot.Peer>): Ifaces {
-        val entities = interfaceRepository.allInterfaceEntities.first()
-        return interfaces(peers, entities, configuredOf(entities))
-    }
-
     private suspend fun interfaces(
         peers: List<MeshSnapshot.Peer>,
         entities: List<InterfaceEntity>,
@@ -200,6 +200,7 @@ class MeshService : Service() {
                 .filter { it.role == MeshSnapshot.COMMAND_POST_ROLE && it.path }
                 .mapNotNull { peer -> NextHop.configured(peer.iface, configured)?.name }
                 .toSet()
+        val staged = stagedNames(live)
         val list =
             entities.map { entity ->
                 val run = running[entity.name]
@@ -214,12 +215,29 @@ class MeshService : Service() {
                     txBytes = (run?.get("tx_bytes") as? Number)?.toLong(),
                     reason = (run?.get("status_reason") as? String)?.takeIf { it.isNotBlank() },
                     carriesCommandPost = entity.name in commandPostRoutes,
+                    pending = entity.name in staged,
                 )
             }
-        // Staged: where switches are not live, a configured state the stack does
-        // not run yet -- enabled but not running, or disabled but still running.
-        val pending = !live && entities.any { it.enabled != running.containsKey(it.name) }
-        return Ifaces(live, pending, list)
+        return Ifaces(live, list.any { it.pending }, list)
+    }
+
+    /**
+     * Staged, where switches are not live: the interfaces whose wanted state
+     * differs from the configuration the stack was last started with
+     * (ReticulumConfigSnapshot, written on every start and Apply). Both are
+     * filtered for the current transport, so an interface the transport leaves
+     * out, or one that failed to come up, is not staged -- comparing with what
+     * is running called those pending for ever. Empty with no record to compare.
+     */
+    private suspend fun stagedNames(live: Boolean): Set<String> {
+        if (live) return emptySet()
+        val applied =
+            ReticulumConfigSnapshot.read(this)?.configWithoutKey?.enabledInterfaces?.mapTo(HashSet()) { it.name }
+                ?: return emptySet()
+        val wanted =
+            filterByTransport(interfaceRepository.enabledInterfaces.first(), transportObserver.snapshotTransport())
+                .mapTo(HashSet()) { it.name }
+        return (wanted - applied) + (applied - wanted)
     }
 
     private class Route(val path: Boolean, val hops: Int?, val iface: String?)
@@ -266,7 +284,7 @@ class MeshService : Service() {
 
             override fun snapshot(): String {
                 if (!allowed(callerPackages())) return ""
-                val snapshot = current ?: runBlocking { runCatching { build() }.getOrNull() } ?: return ""
+                val snapshot = current ?: runBlocking { runCatching { build() }.getOrNull() } ?: return "" // THREADING: allowed
                 return snapshot.toJson().toString()
             }
 
@@ -309,62 +327,87 @@ class MeshService : Service() {
         }
 
     private fun announceFor(packages: List<String>): Int {
-        if (!allowed(packages)) return ERR_CALLER
-        if (!runBlocking { settings.takAtakControlFlow.first() }) return ERR_CONTROL_OFF
         val now = System.currentTimeMillis()
-        if (floor.remaining(now) > 0) return ERR_RATE_LIMITED
-        val sent = runBlocking(Dispatchers.IO) { withTimeoutOrNull(ANNOUNCE_TIMEOUT_MS) { endpoint.announceNow() } }
-        if (sent != true) return ERR_NOT_READY
-        floor.sent(now)
-        return OK
+        return when {
+            !allowed(packages) -> ERR_CALLER
+            !controlAllowed() -> ERR_CONTROL_OFF
+            floor.remaining(now) > 0 -> ERR_RATE_LIMITED
+            !announced() -> ERR_NOT_READY
+            else -> OK.also { floor.sent(now) }
+        }
     }
 
-    private fun guardView(view: Ifaces) = view.list.map { InterfaceGuard.Iface(it.id, it.enabled, it.online, it.carriesCommandPost) }
+    // The commands run on binder threads, never the main one: blocking there is
+    // what a synchronous AIDL call is.
+    private fun controlAllowed(): Boolean = runBlocking { settings.takAtakControlFlow.first() } // THREADING: allowed
+
+    private fun announced(): Boolean =
+        runBlocking(Dispatchers.IO) { withTimeoutOrNull(ANNOUNCE_TIMEOUT_MS) { endpoint.announceNow() } } == true // THREADING: allowed
+
+    private fun guardView(snapshot: MeshSnapshot) =
+        snapshot.interfaces.map { InterfaceGuard.Iface(it.id, it.enabled, it.online, it.carriesCommandPost) }
+
+    /**
+     * One interface command at a time, decided on a snapshot built inside the
+     * lock -- not the cached one, whose command post routes may be stale. Binder
+     * serves calls concurrently: two switches, each checked while the other's
+     * interface was still online, could together cut this phone off. Null when
+     * the state could not be read in time.
+     */
+    private fun <T> underCommandLock(block: suspend (MeshSnapshot) -> T): T? =
+        runBlocking(Dispatchers.IO) { // THREADING: allowed
+            withTimeoutOrNull(COMMAND_TIMEOUT_MS) {
+                commandLock.withLock { runCatching { build() }.getOrNull()?.let { block(it) } }
+            }
+        }
 
     private fun setInterfaceFor(
         packages: List<String>,
         id: Long,
         enabled: Boolean,
-    ): Int {
-        if (!allowed(packages)) return ERR_CALLER
-        if (!runBlocking { settings.takAtakControlFlow.first() }) return ERR_CONTROL_OFF
-        val snapshot = current ?: return ERR_NOT_READY
-        return runBlocking(Dispatchers.IO) {
-            withTimeoutOrNull(COMMAND_TIMEOUT_MS) {
-                val view = interfaces(snapshot.peers)
-                when (InterfaceGuard.check(guardView(view), id, enabled)) {
-                    InterfaceGuard.Verdict.UNKNOWN_INTERFACE -> ERR_UNKNOWN_INTERFACE
-                    InterfaceGuard.Verdict.WOULD_ISOLATE -> ERR_WOULD_ISOLATE
-                    InterfaceGuard.Verdict.OK -> {
-                        interfaceRepository.toggleInterfaceEnabled(id, enabled)
-                        if (view.live) {
-                            // As Columba's own screen does on the Kotlin backend.
-                            val configs = interfaceRepository.enabledInterfaces.first()
-                            transportAdmin.reloadInterfaces(filterByTransport(configs, transportObserver.snapshotTransport()))
-                            OK
-                        } else {
-                            OK_PENDING
-                        }
-                    }
-                }
-            } ?: ERR_NOT_READY
+    ): Int =
+        when {
+            !allowed(packages) -> ERR_CALLER
+            !controlAllowed() -> ERR_CONTROL_OFF
+            else -> underCommandLock { fresh -> switchInterface(fresh, id, enabled) } ?: ERR_NOT_READY
         }
-    }
 
-    private fun applyInterfacesFor(packages: List<String>): Int {
-        if (!allowed(packages)) return ERR_CALLER
-        if (!runBlocking { settings.takAtakControlFlow.first() }) return ERR_CONTROL_OFF
-        val snapshot = current ?: return ERR_NOT_READY
-        val view =
-            runBlocking(Dispatchers.IO) { withTimeoutOrNull(COMMAND_TIMEOUT_MS) { interfaces(snapshot.peers) } }
-                ?: return ERR_NOT_READY
-        if (view.live || !view.pending) return OK
-        if (InterfaceGuard.checkApply(guardView(view)) == InterfaceGuard.Verdict.WOULD_ISOLATE) return ERR_WOULD_ISOLATE
-        // The same path as Columba's own "Apply & Restart": it takes seconds and
-        // restarts :reticulum, so it runs on its own; the reply says it started.
-        scope.launch { configManager.applyInterfaceChanges() }
-        return OK
-    }
+    private suspend fun switchInterface(
+        fresh: MeshSnapshot,
+        id: Long,
+        enabled: Boolean,
+    ): Int =
+        when (InterfaceGuard.check(guardView(fresh), id, enabled)) {
+            InterfaceGuard.Verdict.UNKNOWN_INTERFACE -> ERR_UNKNOWN_INTERFACE
+            InterfaceGuard.Verdict.WOULD_ISOLATE -> ERR_WOULD_ISOLATE
+            InterfaceGuard.Verdict.OK -> {
+                interfaceRepository.toggleInterfaceEnabled(id, enabled)
+                if (fresh.interfacesLive) {
+                    // As Columba's own screen does on the Kotlin backend.
+                    val configs = interfaceRepository.enabledInterfaces.first()
+                    transportAdmin.reloadInterfaces(filterByTransport(configs, transportObserver.snapshotTransport()))
+                    OK
+                } else {
+                    OK_PENDING
+                }
+            }
+        }
+
+    private fun applyInterfacesFor(packages: List<String>): Int =
+        when {
+            !allowed(packages) -> ERR_CALLER
+            !controlAllowed() -> ERR_CONTROL_OFF
+            else -> underCommandLock { fresh -> applyStaged(fresh) } ?: ERR_NOT_READY
+        }
+
+    private fun applyStaged(fresh: MeshSnapshot): Int =
+        when {
+            fresh.interfacesLive || !fresh.interfacesPending -> OK
+            InterfaceGuard.checkApply(guardView(fresh)) == InterfaceGuard.Verdict.WOULD_ISOLATE -> ERR_WOULD_ISOLATE
+            // The same path as Columba's own "Apply & Restart": it takes seconds and
+            // restarts :reticulum, so it runs on its own; the reply says it started.
+            else -> OK.also { scope.launch { configManager.applyInterfaceChanges() } }
+        }
 
     companion object {
         private const val TAG = "MeshService"

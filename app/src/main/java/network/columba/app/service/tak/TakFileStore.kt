@@ -1,9 +1,7 @@
 package network.columba.app.service.tak
 
 import java.io.File
-import java.nio.file.AtomicMoveNotSupportedException
-import java.nio.file.Files
-import java.nio.file.StandardCopyOption
+import java.io.IOException
 import java.util.concurrent.ConcurrentHashMap
 
 /**
@@ -81,15 +79,15 @@ class TakFileStore(private val root: File) {
      * offered a file whose payload was still on disk -- and a concurrent
      * [mayFetch] could read the same half-written state. A rename within one
      * directory is atomic, so the file is written beside its target and moved
-     * over it.
+     * over it -- with File.renameTo, which is rename(2) and replaces the target;
+     * java.nio.file needs API 26 and Columba runs from 24.
      */
     private fun replaceAtomically(target: File, text: String) {
         val temp = File(root, "${target.name}.tmp")
         temp.writeText(text)
-        try {
-            Files.move(temp.toPath(), target.toPath(), StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING)
-        } catch (_: AtomicMoveNotSupportedException) {
-            Files.move(temp.toPath(), target.toPath(), StandardCopyOption.REPLACE_EXISTING)
+        if (!temp.renameTo(target)) {
+            temp.delete()
+            throw IOException("could not replace ${target.name}")
         }
     }
 

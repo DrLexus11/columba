@@ -22,15 +22,10 @@ object NextHop {
         interfaces: List<Configured>,
     ): Configured? {
         if (nextHop.isNullOrBlank()) return null
-        interfaces.firstOrNull { it.name == nextHop }?.let { return it }
-        if ('[' in nextHop) {
-            val inner = nextHop.substringAfter('[').substringBefore(']').substringBefore('/')
-            interfaces.firstOrNull { it.name == inner }?.let { return it }
-        }
-        if (nextHop.startsWith("AutoInterface")) {
-            return interfaces.filter { it.type.startsWith("Auto") }.singleOrNull()
-        }
-        return null
+        val inner = nextHop.substringAfter('[', "").substringBefore(']').substringBefore('/')
+        return interfaces.firstOrNull { it.name == nextHop }
+            ?: interfaces.firstOrNull { inner.isNotEmpty() && it.name == inner }
+            ?: interfaces.filter { it.type.startsWith("Auto") }.singleOrNull()?.takeIf { nextHop.startsWith("AutoInterface") }
     }
 
     /** The configured interface's carrier when it resolves; otherwise read from the name. */
