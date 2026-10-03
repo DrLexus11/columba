@@ -1,0 +1,118 @@
+{
+  "comment": "Columba's mesh snapshot with the interfaces capability (docs/ColumbaInterface.md, 'Interfaces'): version 1 plus optional interface fields. Copied byte for byte into Columba; both sides test against it. Names and hashes are synthetic.",
+  "snapshots": [
+    {
+      "name": "staged-with-command-post-path",
+      "snapshot": {
+        "v": 1,
+        "at": 1790000000000,
+        "node": {
+          "uid": "urtn-00112233445566778899aabbccddeeff",
+          "callsign": "ALPHA-1",
+          "control": true,
+          "running": true
+        },
+        "propagation": null,
+        "peers": [
+          {
+            "uid": "urtn-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "callsign": "HQ",
+            "role": "HQ",
+            "heard": 1789999950000,
+            "path": true,
+            "hops": 2,
+            "carrier": "tcp",
+            "interface": "TCPClientInterface[Board TCP/10.0.0.2:4242]"
+          }
+        ],
+        "interfaces_live": false,
+        "interfaces_pending": true,
+        "interfaces": [
+          {
+            "id": 1,
+            "name": "Board TCP",
+            "type": "TCPClient",
+            "carrier": "tcp",
+            "enabled": true,
+            "online": true,
+            "rx_bytes": 123456,
+            "tx_bytes": 65432,
+            "reason": null,
+            "carries_command_post": true
+          },
+          {
+            "id": 2,
+            "name": "BLE peer",
+            "type": "AndroidBLE",
+            "carrier": "ble",
+            "enabled": true,
+            "online": false,
+            "rx_bytes": null,
+            "tx_bytes": null,
+            "reason": "Bluetooth is off",
+            "carries_command_post": false
+          },
+          {
+            "id": 3,
+            "name": "Local network",
+            "type": "AutoInterface",
+            "carrier": "auto",
+            "enabled": false,
+            "online": true,
+            "rx_bytes": 2048,
+            "tx_bytes": 1024,
+            "reason": null,
+            "carries_command_post": false
+          }
+        ]
+      },
+      "expect": {
+        "interfaces": 3,
+        "pending_line": "Interfaces: 1 change pending · Apply restarts the mesh here",
+        "rows": [
+          "Board TCP · TCP · up · carries command post",
+          "BLE peer · BLE · down: Bluetooth is off",
+          "Local network · Auto · off (pending)"
+        ]
+      }
+    },
+    {
+      "name": "live-nothing-pending",
+      "snapshot": {
+        "v": 1,
+        "at": 1790000000000,
+        "node": {
+          "uid": "urtn-00112233445566778899aabbccddeeff",
+          "callsign": "ALPHA-1",
+          "control": false,
+          "running": true
+        },
+        "propagation": null,
+        "peers": [],
+        "interfaces_live": true,
+        "interfaces_pending": false,
+        "interfaces": [
+          {
+            "id": 7,
+            "name": "RNode",
+            "type": "RNode",
+            "carrier": "lora",
+            "enabled": true,
+            "online": true,
+            "rx_bytes": 1,
+            "tx_bytes": 2,
+            "reason": null,
+            "carries_command_post": false
+          }
+        ]
+      },
+      "expect": {
+        "interfaces": 1,
+        "pending_line": "Interfaces: switches apply at once",
+        "rows": [
+          "RNode · LoRa · up"
+        ]
+      }
+    }
+  ]
+}

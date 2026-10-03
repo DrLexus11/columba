@@ -22,7 +22,13 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeoutOrNull
 import network.columba.app.mesh.IColumbaMesh
 import network.columba.app.mesh.IColumbaMeshWatcher
+import network.columba.app.repository.InterfaceRepository
 import network.columba.app.repository.SettingsRepository
+import network.columba.app.rns.api.RnsBackend
+import network.columba.app.rns.api.RnsTransportAdmin
+import network.columba.app.rns.host.manager.filterByTransport
+import network.columba.app.service.InterfaceConfigManager
+import network.columba.app.service.manager.InterfaceTransportObserver
 import network.columba.app.rns.api.RnsCore
 import network.columba.app.service.PropagationNodeManager
 import network.columba.app.service.tak.CotEndpointManager
@@ -52,6 +58,17 @@ class MeshService : Service() {
     @Inject lateinit var rnsCore: RnsCore
 
     @Inject lateinit var settings: SettingsRepository
+
+    // The interfaces capability: the same objects Columba's own interface screen uses.
+    @Inject lateinit var interfaceRepository: InterfaceRepository
+
+    @Inject lateinit var transportAdmin: RnsTransportAdmin
+
+    @Inject lateinit var transportObserver: InterfaceTransportObserver
+
+    @Inject lateinit var rnsBackend: RnsBackend
+
+    @Inject lateinit var configManager: InterfaceConfigManager
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private val gate = MeshCallerGate()
@@ -99,6 +116,21 @@ class MeshService : Service() {
         val now = System.currentTimeMillis()
         val view = endpoint.meshView(now)
         val relay = propagation.currentRelay.value
+        val peers =
+            view?.members.orEmpty().map { member ->
+                val route = route(member.destinationHash)
+                MeshSnapshot.Peer(
+                    uid = TakIdentity.uidFor(member.destinationHash),
+                    callsign = member.callsign.ifBlank { null },
+                    role = member.role.ifBlank { null },
+                    heard = member.heard,
+                    path = route.path,
+                    hops = route.hops,
+                    carrier = MeshCarrier.of(route.iface),
+                    iface = route.iface,
+                )
+            }
+        val ifaces = interfaces(peers)
         return MeshSnapshot(
             at = now,
             node =
@@ -124,21 +156,56 @@ class MeshService : Service() {
                         lastSync = propagation.lastSyncTimestamp.value,
                     )
                 },
-            peers =
-                view?.members.orEmpty().map { member ->
-                    val route = route(member.destinationHash)
-                    MeshSnapshot.Peer(
-                        uid = TakIdentity.uidFor(member.destinationHash),
-                        callsign = member.callsign.ifBlank { null },
-                        role = member.role.ifBlank { null },
-                        heard = member.heard,
-                        path = route.path,
-                        hops = route.hops,
-                        carrier = MeshCarrier.of(route.iface),
-                        iface = route.iface,
-                    )
-                },
+            peers = peers,
+            interfacesLive = ifaces.live,
+            interfacesPending = ifaces.pending,
+            interfaces = ifaces.list,
         )
+    }
+
+    private class Ifaces(val live: Boolean, val pending: Boolean, val list: List<MeshSnapshot.Iface>)
+
+    /**
+     * Every configured interface (Columba's database), joined by name -- as
+     * Columba's own interface screen joins them -- with the running stack's state.
+     * A failed read of that state throws: the snapshot pass is abandoned and the
+     * last known one kept, rather than calling every interface down.
+     */
+    @Suppress("UNCHECKED_CAST")
+    private suspend fun interfaces(peers: List<MeshSnapshot.Peer>): Ifaces {
+        val entities = interfaceRepository.allInterfaceEntities.first()
+        val running =
+            ((transportAdmin.getDebugInfo()["interfaces"] as? List<*>) ?: emptyList<Any>())
+                .mapNotNull { it as? Map<String, Any?> }
+                .associateBy { it["name"] as? String }
+        val live = rnsBackend.capabilities.value.interfaces.hotReloadInterfaces
+        // The interfaces the command post's paths leave through: a running
+        // interface's name is "Type[Configured name/address]".
+        val commandPostRoutes =
+            peers
+                .filter { it.role == MeshSnapshot.COMMAND_POST_ROLE && it.path }
+                .mapNotNull { peer -> peer.iface?.substringAfter('[', "")?.substringBefore(']')?.substringBefore('/') }
+                .toSet()
+        val list =
+            entities.map { entity ->
+                val run = running[entity.name]
+                MeshSnapshot.Iface(
+                    id = entity.id,
+                    name = entity.name,
+                    type = entity.type,
+                    carrier = MeshCarrier.ofConfigType(entity.type),
+                    enabled = entity.enabled,
+                    online = run?.get("online") as? Boolean ?: false,
+                    rxBytes = (run?.get("rx_bytes") as? Number)?.toLong(),
+                    txBytes = (run?.get("tx_bytes") as? Number)?.toLong(),
+                    reason = (run?.get("status_reason") as? String)?.takeIf { it.isNotBlank() },
+                    carriesCommandPost = entity.name in commandPostRoutes,
+                )
+            }
+        // Staged: where switches are not live, a configured state the stack does
+        // not run yet -- enabled but not running, or disabled but still running.
+        val pending = !live && entities.any { it.enabled != running.containsKey(it.name) }
+        return Ifaces(live, pending, list)
     }
 
     private class Route(val path: Boolean, val hops: Int?, val iface: String?)
@@ -206,6 +273,25 @@ class MeshService : Service() {
                 Log.i(TAG, "announce from ${packages.joinToString()}: ${resultName(result)}")
                 return result
             }
+
+            override fun capabilities(): Int = if (allowed(callerPackages())) MeshSnapshot.CAP_INTERFACES else 0
+
+            override fun setInterfaceEnabled(
+                id: Long,
+                enabled: Boolean,
+            ): Int {
+                val packages = callerPackages()
+                val result = setInterfaceFor(packages, id, enabled)
+                Log.i(TAG, "setInterfaceEnabled($id, $enabled) from ${packages.joinToString()}: ${resultName(result)}")
+                return result
+            }
+
+            override fun applyInterfaces(): Int {
+                val packages = callerPackages()
+                val result = applyInterfacesFor(packages)
+                Log.i(TAG, "applyInterfaces from ${packages.joinToString()}: ${resultName(result)}")
+                return result
+            }
         }
 
     private fun announceFor(packages: List<String>): Int {
@@ -219,6 +305,53 @@ class MeshService : Service() {
         return OK
     }
 
+    private fun guardView(view: Ifaces) = view.list.map { InterfaceGuard.Iface(it.id, it.enabled, it.online, it.carriesCommandPost) }
+
+    private fun setInterfaceFor(
+        packages: List<String>,
+        id: Long,
+        enabled: Boolean,
+    ): Int {
+        if (!allowed(packages)) return ERR_CALLER
+        if (!runBlocking { settings.takAtakControlFlow.first() }) return ERR_CONTROL_OFF
+        val snapshot = current ?: return ERR_NOT_READY
+        return runBlocking(Dispatchers.IO) {
+            withTimeoutOrNull(COMMAND_TIMEOUT_MS) {
+                val view = interfaces(snapshot.peers)
+                when (InterfaceGuard.check(guardView(view), id, enabled)) {
+                    InterfaceGuard.Verdict.UNKNOWN_INTERFACE -> ERR_UNKNOWN_INTERFACE
+                    InterfaceGuard.Verdict.WOULD_ISOLATE -> ERR_WOULD_ISOLATE
+                    InterfaceGuard.Verdict.OK -> {
+                        interfaceRepository.toggleInterfaceEnabled(id, enabled)
+                        if (view.live) {
+                            // As Columba's own screen does on the Kotlin backend.
+                            val configs = interfaceRepository.enabledInterfaces.first()
+                            transportAdmin.reloadInterfaces(filterByTransport(configs, transportObserver.snapshotTransport()))
+                            OK
+                        } else {
+                            OK_PENDING
+                        }
+                    }
+                }
+            } ?: ERR_NOT_READY
+        }
+    }
+
+    private fun applyInterfacesFor(packages: List<String>): Int {
+        if (!allowed(packages)) return ERR_CALLER
+        if (!runBlocking { settings.takAtakControlFlow.first() }) return ERR_CONTROL_OFF
+        val snapshot = current ?: return ERR_NOT_READY
+        val view =
+            runBlocking(Dispatchers.IO) { withTimeoutOrNull(COMMAND_TIMEOUT_MS) { interfaces(snapshot.peers) } }
+                ?: return ERR_NOT_READY
+        if (view.live || !view.pending) return OK
+        if (InterfaceGuard.checkApply(guardView(view)) == InterfaceGuard.Verdict.WOULD_ISOLATE) return ERR_WOULD_ISOLATE
+        // The same path as Columba's own "Apply & Restart": it takes seconds and
+        // restarts :reticulum, so it runs on its own; the reply says it started.
+        scope.launch { configManager.applyInterfaceChanges() }
+        return OK
+    }
+
     companion object {
         private const val TAG = "MeshService"
 
@@ -226,12 +359,16 @@ class MeshService : Service() {
         const val REFRESH_MS = 2_000L
 
         private const val ANNOUNCE_TIMEOUT_MS = 10_000L
+        private const val COMMAND_TIMEOUT_MS = 10_000L
 
         const val OK = 0
         const val ERR_CALLER = 1
         const val ERR_CONTROL_OFF = 2
         const val ERR_NOT_READY = 3
         const val ERR_RATE_LIMITED = 4
+        const val ERR_WOULD_ISOLATE = 5
+        const val ERR_UNKNOWN_INTERFACE = 6
+        const val OK_PENDING = 7
 
         /** One floor for the process: a rebound service must not reset it. */
         private val floor = MeshAnnounceFloor()
@@ -243,6 +380,9 @@ class MeshService : Service() {
                 ERR_CONTROL_OFF -> "refused: control off"
                 ERR_NOT_READY -> "not ready"
                 ERR_RATE_LIMITED -> "rate limited"
+                ERR_WOULD_ISOLATE -> "refused: would isolate"
+                ERR_UNKNOWN_INTERFACE -> "unknown interface"
+                OK_PENDING -> "staged"
                 else -> "code $code"
             }
 
