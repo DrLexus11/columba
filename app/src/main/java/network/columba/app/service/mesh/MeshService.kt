@@ -20,6 +20,7 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeoutOrNull
+import network.columba.app.data.database.entity.InterfaceEntity
 import network.columba.app.mesh.IColumbaMesh
 import network.columba.app.mesh.IColumbaMeshWatcher
 import network.columba.app.repository.InterfaceRepository
@@ -116,6 +117,8 @@ class MeshService : Service() {
         val now = System.currentTimeMillis()
         val view = endpoint.meshView(now)
         val relay = propagation.currentRelay.value
+        val entities = interfaceRepository.allInterfaceEntities.first()
+        val configured = configuredOf(entities)
         val peers =
             view?.members.orEmpty().map { member ->
                 val route = route(member.destinationHash)
@@ -126,11 +129,11 @@ class MeshService : Service() {
                     heard = member.heard,
                     path = route.path,
                     hops = route.hops,
-                    carrier = MeshCarrier.of(route.iface),
+                    carrier = NextHop.carrier(route.iface, configured),
                     iface = route.iface,
                 )
             }
-        val ifaces = interfaces(peers)
+        val ifaces = interfaces(peers, entities, configured)
         return MeshSnapshot(
             at = now,
             node =
@@ -148,7 +151,7 @@ class MeshService : Service() {
                         name = it.displayName.ifBlank { null },
                         path = route.path,
                         hops = route.hops,
-                        carrier = MeshCarrier.of(route.iface),
+                        carrier = NextHop.carrier(route.iface, configured),
                         // Not known yet: a command post's propagation node and
                         // its TAK node are different identities on the deck.
                         // Null rather than a guess (ColumbaInterface.md).
@@ -172,19 +175,30 @@ class MeshService : Service() {
      * last known one kept, rather than calling every interface down.
      */
     @Suppress("UNCHECKED_CAST")
+    private fun configuredOf(entities: List<InterfaceEntity>) = entities.map { NextHop.Configured(it.name, it.type) }
+
+    /** For the commands: the guard decides on the interfaces as they are now. */
     private suspend fun interfaces(peers: List<MeshSnapshot.Peer>): Ifaces {
         val entities = interfaceRepository.allInterfaceEntities.first()
+        return interfaces(peers, entities, configuredOf(entities))
+    }
+
+    private suspend fun interfaces(
+        peers: List<MeshSnapshot.Peer>,
+        entities: List<InterfaceEntity>,
+        configured: List<NextHop.Configured>,
+    ): Ifaces {
         val running =
             ((transportAdmin.getDebugInfo()["interfaces"] as? List<*>) ?: emptyList<Any>())
                 .mapNotNull { it as? Map<String, Any?> }
                 .associateBy { it["name"] as? String }
         val live = rnsBackend.capabilities.value.interfaces.hotReloadInterfaces
-        // The interfaces the command post's paths leave through: a running
-        // interface's name is "Type[Configured name/address]".
+        // The interfaces the command post's paths leave through (NextHop: the
+        // backends report a configured name, not "Type[name/address]").
         val commandPostRoutes =
             peers
                 .filter { it.role == MeshSnapshot.COMMAND_POST_ROLE && it.path }
-                .mapNotNull { peer -> peer.iface?.substringAfter('[', "")?.substringBefore(']')?.substringBefore('/') }
+                .mapNotNull { peer -> NextHop.configured(peer.iface, configured)?.name }
                 .toSet()
         val list =
             entities.map { entity ->
