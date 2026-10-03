@@ -20,7 +20,8 @@ import kotlinx.coroutines.sync.withLock
  * fresher one is seconds away, and replaying a ten-minute-old fix as though it
  * were current puts somebody on the map where they are not, which is worse than
  * showing nothing. The tiering in `TAKNative.md` already drew that line; this
- * applies it at the socket.
+ * applies it at the socket. Each peer's latest position is replayed separately,
+ * as it was drawn, stale stamp and all ([LastPositions]).
  */
 class CotReplay(
     private val maxEvents: Int = MAX_EVENTS,
