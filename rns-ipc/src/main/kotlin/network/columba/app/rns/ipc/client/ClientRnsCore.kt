@@ -380,17 +380,15 @@ internal class ClientRnsCore(
 private suspend inline fun awaitNetworkStatus(
     crossinline call: (IRnsNetworkStatusCallback) -> Unit,
 ): NetworkStatus? = kotlinx.coroutines.suspendCancellableCoroutine { cont ->
-    val delivered = java.util.concurrent.atomic.AtomicBoolean(false)
+    val slot = ContinuationSlot(cont)
     val cb = object : IRnsNetworkStatusCallback.Stub() {
         override fun onStatus(status: NetworkStatus?) {
-            if (delivered.compareAndSet(false, true)) {
-                cont.resumeWith(Result.success(status))
-            }
+            slot.take()?.resumeWith(Result.success(status))
         }
     }
     try {
         call(cb)
     } catch (e: android.os.RemoteException) {
-        if (delivered.compareAndSet(false, true)) cont.resumeWith(Result.success(null))
+        slot.take()?.resumeWith(Result.success(null))
     }
 }
