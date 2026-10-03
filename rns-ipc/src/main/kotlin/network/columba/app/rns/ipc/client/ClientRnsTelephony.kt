@@ -20,6 +20,7 @@ import network.columba.app.rns.ipc.IRnsTelephony
 import network.columba.app.rns.ipc.callback.IRnsBoolEventCallback
 import network.columba.app.rns.ipc.callback.IRnsCallStateCallback
 import network.columba.app.rns.ipc.callback.IRnsNullableStringEventCallback
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.coroutines.resume
 
 /**
@@ -193,16 +194,16 @@ internal class ClientRnsTelephony(
 private suspend inline fun awaitCallState(
     crossinline call: (IRnsCallStateCallback) -> Unit,
 ): CallState? = suspendCancellableCoroutine { cont ->
-    val slot = ContinuationSlot(cont)
+    val delivered = AtomicBoolean(false)
     val cb = object : IRnsCallStateCallback.Stub() {
         override fun onState(state: CallState?) {
-            slot.take()?.resume(state)
+            if (delivered.compareAndSet(false, true)) cont.resume(state)
         }
     }
     try {
         call(cb)
     } catch (e: android.os.RemoteException) {
-        slot.take()?.resume(null)
+        if (delivered.compareAndSet(false, true)) cont.resume(null)
     }
 }
 
@@ -210,16 +211,16 @@ private suspend inline fun awaitCallState(
 private suspend inline fun awaitBoolEvent(
     crossinline call: (IRnsBoolEventCallback) -> Unit,
 ): Boolean = suspendCancellableCoroutine { cont ->
-    val slot = ContinuationSlot(cont)
+    val delivered = AtomicBoolean(false)
     val cb = object : IRnsBoolEventCallback.Stub() {
         override fun onBool(value: Boolean) {
-            slot.take()?.resume(value)
+            if (delivered.compareAndSet(false, true)) cont.resume(value)
         }
     }
     try {
         call(cb)
     } catch (e: android.os.RemoteException) {
-        slot.take()?.resume(false)
+        if (delivered.compareAndSet(false, true)) cont.resume(false)
     }
 }
 
@@ -227,15 +228,15 @@ private suspend inline fun awaitBoolEvent(
 private suspend inline fun awaitNullableStringEvent(
     crossinline call: (IRnsNullableStringEventCallback) -> Unit,
 ): String? = suspendCancellableCoroutine { cont ->
-    val slot = ContinuationSlot(cont)
+    val delivered = AtomicBoolean(false)
     val cb = object : IRnsNullableStringEventCallback.Stub() {
         override fun onString(value: String?) {
-            slot.take()?.resume(value)
+            if (delivered.compareAndSet(false, true)) cont.resume(value)
         }
     }
     try {
         call(cb)
     } catch (e: android.os.RemoteException) {
-        slot.take()?.resume(null)
+        if (delivered.compareAndSet(false, true)) cont.resume(null)
     }
 }
