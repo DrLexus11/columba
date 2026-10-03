@@ -380,71 +380,7 @@ class ReticulumService : Service() {
                 // Reinforce foreground service with notification (may already be started in onCreate)
                 managers.notificationManager.startForeground(this)
             }
-            ACTION_STOP -> {
-                // Apply-in-progress gate: when the UI is mid-apply, the ACTION_STOP we
-                // ourselves sent in InterfaceConfigManager.applyInterfaceChanges Step 4
-                // targets the OLD :reticulum pid. Android, however, has no way to drop
-                // an in-flight startForegroundService intent if the receiver dies first
-                // — the intent gets requeued onto whichever :reticulum process spawns
-                // next (via START_STICKY auto-restart of the crashed service). That
-                // stale STOP then System.exits the freshly-spawned process before it
-                // can bind for the UI's pending initialize(), surfacing as the
-                // "Failed to initialize Reticulum: Backend not ready" toast in the
-                // Apply & Restart dialog (punch-list item 10).
-                //
-                // The fix: when is_applying_config is set on a NEWLY-spawned service
-                // (process is younger than the stale STOP could possibly target), treat
-                // ACTION_STOP as a redelivery and consume the startId without exiting.
-                // The UI driving the apply will send its own ACTION_START + initialize()
-                // shortly. The genuine non-apply STOP path (user-initiated shutdown,
-                // user-toggled service kill) is unaffected because is_applying_config
-                // is false in those scenarios.
-                val isApplyingConfig =
-                    getSharedPreferences("columba_prefs", MODE_PRIVATE)
-                        .getBoolean("is_applying_config", false)
-                val processAgeMs = android.os.SystemClock.elapsedRealtime() - processStartElapsedRealtimeMs
-                if (isApplyingConfig && processAgeMs < STALE_STOP_GRACE_MS) {
-                    Log.w(
-                        TAG,
-                        "Ignoring ACTION_STOP: apply-in-progress and process is only " +
-                            "${processAgeMs}ms old (likely a redelivery of the STOP that " +
-                            "killed the prior :reticulum pid during Apply & Restart)",
-                    )
-                    // Consume the startId so Android doesn't see an outstanding start
-                    // request when we eventually do exit. We deliberately do NOT call
-                    // System.exit — the snapshot self-init in onCreate is already in
-                    // flight and the UI will follow up with its own initialize.
-                    return START_STICKY
-                }
-
-                // Shutdown and stop service
-                Log.d(TAG, "Received ACTION_STOP - forcing process exit")
-
-                // Remove notification before anything else so System.exit(0) can't leave a
-                // lingering entry in the shade.
-                stopForeground(STOP_FOREGROUND_REMOVE)
-                stopSelf()
-
-                // Stop BLE immediately on the Main thread before process exit, since
-                // System.exit(0) will kill the process before any async cleanup runs.
-                if (::managers.isInitialized) {
-                    try {
-                        managers.bleCoordinator.stopImmediate()
-                    } catch (e: Exception) {
-                        Log.w(TAG, "Error during BLE immediate shutdown", e)
-                    }
-                }
-
-                try {
-                    binder.shutdown()
-                } catch (e: Exception) {
-                    Log.w(TAG, "Error during shutdown cleanup (process exiting anyway)", e)
-                }
-
-                // Force process exit to ensure service truly stops even with active bindings
-                // This is safe because we're in a separate :reticulum process
-                System.exit(0)
-            }
+            ACTION_STOP -> return handleStop()
             ACTION_RESTART_BLE -> {
                 // Restart BLE interface after permissions granted
                 handleRestartBle(intent)
@@ -463,6 +399,78 @@ class ReticulumService : Service() {
             }
         }
 
+        return START_STICKY
+    }
+
+    /**
+     * ACTION_STOP: exit the process -- unless it is the stale STOP of an Apply &
+     * Restart redelivered to a newly spawned process. Its own function for
+     * detekt's complexity limit, as the battery poller was.
+     */
+    private fun handleStop(): Int {
+        // Apply-in-progress gate: when the UI is mid-apply, the ACTION_STOP we
+        // ourselves sent in InterfaceConfigManager.applyInterfaceChanges Step 4
+        // targets the OLD :reticulum pid. Android, however, has no way to drop
+        // an in-flight startForegroundService intent if the receiver dies first
+        // — the intent gets requeued onto whichever :reticulum process spawns
+        // next (via START_STICKY auto-restart of the crashed service). That
+        // stale STOP then System.exits the freshly-spawned process before it
+        // can bind for the UI's pending initialize(), surfacing as the
+        // "Failed to initialize Reticulum: Backend not ready" toast in the
+        // Apply & Restart dialog (punch-list item 10).
+        //
+        // The fix: when is_applying_config is set on a NEWLY-spawned service
+        // (process is younger than the stale STOP could possibly target), treat
+        // ACTION_STOP as a redelivery and consume the startId without exiting.
+        // The UI driving the apply will send its own ACTION_START + initialize()
+        // shortly. The genuine non-apply STOP path (user-initiated shutdown,
+        // user-toggled service kill) is unaffected because is_applying_config
+        // is false in those scenarios.
+        val isApplyingConfig =
+            getSharedPreferences("columba_prefs", MODE_PRIVATE)
+                .getBoolean("is_applying_config", false)
+        val processAgeMs = android.os.SystemClock.elapsedRealtime() - processStartElapsedRealtimeMs
+        if (isApplyingConfig && processAgeMs < STALE_STOP_GRACE_MS) {
+            Log.w(
+                TAG,
+                "Ignoring ACTION_STOP: apply-in-progress and process is only " +
+                    "${processAgeMs}ms old (likely a redelivery of the STOP that " +
+                    "killed the prior :reticulum pid during Apply & Restart)",
+            )
+            // Consume the startId so Android doesn't see an outstanding start
+            // request when we eventually do exit. We deliberately do NOT call
+            // System.exit — the snapshot self-init in onCreate is already in
+            // flight and the UI will follow up with its own initialize.
+            return START_STICKY
+        }
+
+        // Shutdown and stop service
+        Log.d(TAG, "Received ACTION_STOP - forcing process exit")
+
+        // Remove notification before anything else so System.exit(0) can't leave a
+        // lingering entry in the shade.
+        stopForeground(STOP_FOREGROUND_REMOVE)
+        stopSelf()
+
+        // Stop BLE immediately on the Main thread before process exit, since
+        // System.exit(0) will kill the process before any async cleanup runs.
+        if (::managers.isInitialized) {
+            try {
+                managers.bleCoordinator.stopImmediate()
+            } catch (e: Exception) {
+                Log.w(TAG, "Error during BLE immediate shutdown", e)
+            }
+        }
+
+        try {
+            binder.shutdown()
+        } catch (e: Exception) {
+            Log.w(TAG, "Error during shutdown cleanup (process exiting anyway)", e)
+        }
+
+        // Force process exit to ensure service truly stops even with active bindings
+        // This is safe because we're in a separate :reticulum process
+        System.exit(0)
         return START_STICKY
     }
 

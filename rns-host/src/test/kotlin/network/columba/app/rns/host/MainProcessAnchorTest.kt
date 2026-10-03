@@ -6,9 +6,7 @@ import android.content.ServiceConnection
 import io.mockk.every
 import io.mockk.mockk
 import io.mockk.slot
-import io.mockk.verify
 import org.junit.Assert.assertEquals
-import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
@@ -36,23 +34,35 @@ class MainProcessAnchorTest {
         assertEquals("network.columba.app.debug", intent.captured.`package`)
     }
 
+    private var binds = 0
+    private var unbinds = 0
+
+    private fun countCalls(bindResult: Boolean) {
+        every { context.bindService(any<Intent>(), any<ServiceConnection>(), any<Int>()) } answers {
+            binds++
+            bindResult
+        }
+        every { context.unbindService(any()) } answers { unbinds++ }
+    }
+
     @Test
     fun `holding twice binds once, releasing unbinds once`() {
+        countCalls(bindResult = true)
         val anchor = MainProcessAnchor(context)
         anchor.hold()
         anchor.hold()
-        verify(exactly = 1) { context.bindService(any<Intent>(), any<ServiceConnection>(), any<Int>()) }
+        assertEquals(1, binds)
         anchor.release()
         anchor.release()
-        verify(exactly = 1) { context.unbindService(any()) }
+        assertEquals(1, unbinds)
     }
 
     @Test
     fun `a missing anchor service is released, not left half-bound`() {
-        every { context.bindService(any<Intent>(), any<ServiceConnection>(), any<Int>()) } returns false
+        countCalls(bindResult = false)
         MainProcessAnchor(context).hold()
         // A failed bind still holds the connection until released.
-        verify(exactly = 1) { context.unbindService(any()) }
-        assertTrue(true)
+        assertEquals(1, binds)
+        assertEquals(1, unbinds)
     }
 }

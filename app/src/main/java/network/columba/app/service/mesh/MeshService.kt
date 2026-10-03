@@ -185,7 +185,7 @@ class MeshService : Service() {
 
             override fun snapshot(): String {
                 if (!allowed(callerPackages())) return ""
-                val snapshot = current ?: runBlocking { runCatching { build() }.getOrNull() } ?: return ""
+                val snapshot = current ?: runBlocking { runCatching { build() }.getOrNull() } ?: return "" // THREADING: allowed
                 return snapshot.toJson().toString()
             }
 
@@ -209,15 +209,22 @@ class MeshService : Service() {
         }
 
     private fun announceFor(packages: List<String>): Int {
-        if (!allowed(packages)) return ERR_CALLER
-        if (!runBlocking { settings.takAtakControlFlow.first() }) return ERR_CONTROL_OFF
         val now = System.currentTimeMillis()
-        if (floor.remaining(now) > 0) return ERR_RATE_LIMITED
-        val sent = runBlocking(Dispatchers.IO) { withTimeoutOrNull(ANNOUNCE_TIMEOUT_MS) { endpoint.announceNow() } }
-        if (sent != true) return ERR_NOT_READY
-        floor.sent(now)
-        return OK
+        return when {
+            !allowed(packages) -> ERR_CALLER
+            !controlAllowed() -> ERR_CONTROL_OFF
+            floor.remaining(now) > 0 -> ERR_RATE_LIMITED
+            !announced() -> ERR_NOT_READY
+            else -> OK.also { floor.sent(now) }
+        }
     }
+
+    // The commands run on binder threads, never the main one: blocking there is
+    // what a synchronous AIDL call is.
+    private fun controlAllowed(): Boolean = runBlocking { settings.takAtakControlFlow.first() } // THREADING: allowed
+
+    private fun announced(): Boolean =
+        runBlocking(Dispatchers.IO) { withTimeoutOrNull(ANNOUNCE_TIMEOUT_MS) { endpoint.announceNow() } } == true // THREADING: allowed
 
     companion object {
         private const val TAG = "MeshService"
