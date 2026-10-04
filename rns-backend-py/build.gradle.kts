@@ -107,17 +107,17 @@ chaquopy {
             // v0.10.x `patches/RNS/` tree is
             // intentionally NOT restored (its runtime patch-deployer lived in
             // the deleted reticulum_wrapper.py — see PINNED_VERSIONS.md).
-            install("git+https://github.com/torlando-tech/Reticulum@5b3a6ee4f25e2925cf84d4a2b108e6a708fbd395")
+            install("git+https://github.com/DrLexus11/Reticulum@5b3a6ee4f25e2925cf84d4a2b108e6a708fbd395")
 
             // Upstream LXMF 1.1.0 — torlando-tech fork (external stamp generator
             // plus validated/cancellable native stamping and opportunistic
             // receiving-interface and hop capture). Pinned to
             // the versioned successor branch's commit SHA for reproducibility.
-            install("git+https://github.com/torlando-tech/LXMF@8912186e48b482a76bf04e2ac4b6c8940991aecc")
+            install("git+https://github.com/DrLexus11/LXMF@8912186e48b482a76bf04e2ac4b6c8940991aecc")
 
             // ble-reticulum — RNS.Interface subclass for the Android BLE bridge.
             // Pinned to the commit SHA at the tip of main for reproducibility.
-            install("git+https://github.com/torlando-tech/ble-reticulum.git@07d941304c9a1dc3a8e58087b3b974ff3d229e56")
+            install("git+https://github.com/DrLexus11/ble-reticulum.git@07d941304c9a1dc3a8e58087b3b974ff3d229e56")
 
             install("cryptography>=42.0.0")
 
